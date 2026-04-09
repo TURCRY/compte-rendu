@@ -1,0 +1,133 @@
+
+
+docker exec -it cr-pipeline pwsh /pipeline/powershell/cr_reunion_pipeline_fulljson.ps1 \
+  -CsvPath "/data/jobs/test1/J53 PdS 2025 10 17_mono16_16000Hz(wav).csv" \
+  -OutDir "/data/jobs/test1/out" \
+  -Provider openai \
+  -ApiBase "http://openai-adapter:5055" \
+  -Model "annoter_segments_local" \
+  -ApiKey "*CRpy#VrWz#5zh&F%ww6zY24U" \
+  -Preset equilibre
+
+docker exec -it cr-pipeline pwsh /pipeline/powershell/cr_reunion_point_mumerotes_pipeline_json.ps1 \
+  -CsvPath "/data/jobs/J38 Blau Castel - Guernes  03 07 2025/J38 Blau Castel - Guernes  03 07 2025_mono16_16000Hz(wav).csv" \
+  -OutDir "/data/jobs/J38 Blau Castel - Guernes  03 07 2025/out" \
+  -ContextJsonPath "/data/jobs/J38 Blau Castel - Guernes  03 07 2025/contexte_general.json" \
+  -SujetsPath "/data/jobs/J38 Blau Castel - Guernes  03 07 2025/Sujets.xlsx" \
+  -ParticipantsPath "/data/jobs/J38 Blau Castel - Guernes  03 07 2025/Participants.xlsx" \
+  -Provider openai \
+  -ApiBase "http://openai-adapter:5055" \
+  -ModelPass1 "annoter_segments_remote" \
+  -ModelPass2 "annoter_segments_remote" \
+  -ModelPass3 "annoter_segments_remote_alt" \
+  -ApiKey '*CRpy#VrWz#5zh&F%ww6zY24U' \
+  -Preset equilibre \
+  -Force
+
+docker exec -it cr-pipeline pwsh /pipeline/powershell/cr_reunion_pipeline_fulljson.ps1 \
+  -CsvPath "/data/jobs/J29 Heavydan - Malakoff 06 06 2025/J29 Heavydan - Malakoff 06 06 2025_mono16_16000Hz(wav).csv" \
+  -OutDir "/data/jobs/J29 Heavydan - Malakoff 06 06 2025/out" \
+  -ContextJsonPath "/data/jobs/J29 Heavydan - Malakoff 06 06 2025/contexte_general.json" \
+  -Provider openai \
+  -ApiBase "http://openai-adapter:5055" \
+  -ModelPass1 "annoter_segments_remote" \
+  -ModelPass2 "annoter_segments_remote" \
+  -ModelPass3 "annoter_segments_remote_alt" \
+  -ApiKey '*CRpy#VrWz#5zh&F%ww6zY24U' \
+  -Preset equilibre \
+  -Force
+
+docker exec -it cr-pipeline pwsh /pipeline/powershell/cr_reunion_pipeline_fulljson.ps1 \
+  -CsvPath "/data/jobs/J29 Heavydan - Malakoff 06 06 2025/J29 Heavydan - Malakoff 06 06 2025_mono16_16000Hz(wav).csv" \
+  -OutDir "/data/jobs/J29 Heavydan - Malakoff 06 06 2025/out" \
+  -ContextJsonPath "/data/jobs/J29 Heavydan - Malakoff 06 06 2025/contexte_general.json" \
+  -Provider openai \
+  -ApiBase "http://openai-adapter:5055" \
+  -ModelPass1 "annoter_segments_remote" \
+  -ModelPass2 "annoter_segments_remote" \
+  -ModelPass3 "annoter_segments_remote_alt" \
+  -ApiKey '*CRpy#VrWz#5zh&F%ww6zY24U' \
+  -Preset equilibre \
+  -Force
+
+
+
+
+\\192.168.1.20\Home\Docker\compte-rendu\cr-pipeline\data\jobs\J29 Heavydan - Malakoff 06 06 2025\out
+\\192.168.1.20\Home\Docker\compte-rendu\cr-pipeline\data\jobs\J04 Vallée Sud Clamart 03 07 2025
+
+pour générer le Word depuis votre NAS, vous pouvez simplement faire (en dehors de Docker pour tester)
+curl -X POST "http://192.168.1.20:8081/render?format=docx" \
+     -H "Content-Type: application/json" \
+     --data-binary "@/volume1/home/nicolas/Docker/compte-rendu/cr-pipeline/data/jobs/J29 Heavydan - Malakoff 06 06 2025/out/global_final_base.json" \
+     -o "/volume1/home/nicolas/Docker/compte-rendu/cr-pipeline/data/jobs/J29 Heavydan - Malakoff 06 06 2025/out/compte_rendu_base.docx"
+
+pour générer le PDF depuis votre NAS, vous pouvez simplement faire (en dehors de Docker pour tester)
+curl -X POST "http://192.168.1.20:8081/render?format=pdf" \
+     -H "Content-Type: application/json" \
+     --data-binary @/volume1/home/nicolas/Docker/compte-rendu/cr-pipeline/data/jobs/test1/out/global_final.json \
+     -o /volume1/home/nicolas/Docker/compte-rendu/cr-pipeline/data/jobs/test1/out/compte_rendu.pdf
+
+
+\\192.168.1.20\Home\Docker\compte-rendu\cr-pipeline\data\jobs\test1\out
+
+Dans cr-pipeline (dans le conteneur), après écriture de /data/jobs/test1/out/global_final.json, vous pouvez faire :
+curl -X POST "http://cr-render:8080/render?format=docx" \
+     -H "Content-Type: application/json" \
+     --data-binary @/data/jobs/test1/out/global_final.json \
+     -o /data/jobs/test1/out/compte_rendu.docx
+
+/data/jobs/J39 Pharaon - PdS 03 06 2025/
+
+
+docker exec -it cr-pipeline pwsh -Command '$ErrorActionPreference="Stop"; try { /pipeline/powershell/cr_reunion_pipeline_fulljson.ps1 -CsvPath "/data/jobs/test1/J53 PdS 2025 10 17_mono16_16000Hz(wav).csv" -OutDir "/data/jobs/test1/out" -Provider openai -ApiBase "http://openai-adapter:5055" -Model "annoter" -ApiKey "*CRpy#VrWz#5zh&F%ww6zY24U" -Preset equilibre } catch { Write-Host "----- ERREUR DÉTAILLÉE -----" -ForegroundColor Red; Write-Host $_.InvocationInfo.PositionMessage -ForegroundColor Yellow; Write-Host $_.ScriptStackTrace -ForegroundColor Cyan }'
+
+
+
+docker exec -it cr-pipeline pwsh -Command "
+  \$ErrorActionPreference='Stop';
+  try {
+    /pipeline/powershell/cr_reunion_pipeline_fulljson.ps1 `
+      -CsvPath '/data/jobs/test1/J53 PdS 2025 10 17_mono16_16000Hz(wav).csv' `
+      -OutDir '/data/jobs/test1/out' `
+      -Provider openai `
+      -ApiBase 'http://openai-adapter:5055' `
+      -Model 'annoter' `
+      -ApiKey '*CRpy#VrWz#5zh&F%ww6zY24U' `
+      -Preset equilibre
+  } catch {
+      Write-Host '----- ERREUR DÉTAILLÉE -----' -ForegroundColor Red
+      Write-Host \$_.InvocationInfo.PositionMessage -ForegroundColor Yellow
+      Write-Host \$_.ScriptStackTrace -ForegroundColor Cyan
+  }
+"
+
+
+docker exec -it cr-pipeline ls -R /data/jobs/test1/out
+docker exec -it cr-pipeline ls /data/jobs/test1/out/segments
+docker exec -it cr-pipeline cat /data/jobs/test1/out/logs/run_*.log
+
+
+cd /volume1/home/nicolas/Docker/compte-rendu
+docker compose down
+docker rmi rendu-cr-render:latest
+docker rmi rendu-cr-pipeline:latest
+docker build -t rendu-cr-pipeline:latest ./cr-pipeline
+docker build -t rendu-cr-render:latest ./cr-render
+docker compose up -d cr-pipeline cr-render
+curl http://192.168.1.20:8090/ping
+curl http://192.168.1.20:8081/ping
+
+
+
+docker exec -it cr-pipeline env | grep PIPELINE_
+
+
+chmod +x build_all.sh
+./build_all.sh
+
+
+
+
+
+f

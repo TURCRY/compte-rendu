@@ -1,0 +1,20 @@
+Lancement réel (sans tout refaire)
+
+Vous pouvez maintenant exécuter sans --dry-run :
+
+./run_compte_rendu_avec_sujets.sh \
+"/volume1/Affaires/2025-J37/AF_Expert_ASR/transcriptions/accedit-2025-09-02/infos_projet.json"
+
+Si vous devez ré-écraser volontairement
+
+Uniquement si nécessaire :
+
+./run_compte_rendu_avec_sujets.sh \
+"/volume1/Affaires/2025-J37/AF_Expert_ASR/transcriptions/accedit-2025-09-02/infos_projet.json" \
+--force
+
+Pour contrôler le log pendant l’exécution
+tail -f /volume1/Affaires/2025-J37/AF_Expert_ASR/transcriptions/accedit-2025-09-02/out/logs/run_20260209_185822.log
+
+
+Si l’exécution réelle plante, collez simplement la fin du log (tail -n 80 …) et on corrigera précisément (sans relancer tout le pipeline inutilement).

@@ -1,0 +1,28 @@
+# données pipeline
+cr-pipeline/data/jobs/
+
+# sorties générées
+cr-pipeline/data/**/out/
+cr-pipeline/data/**/logs/
+cr-pipeline/data/**/segments/
+
+# fichiers temporaires / prompts
+*.raw.txt
+*.prompt.txt
+*.prompt_effective.txt
+*.system.txt
+
+# environnement
+.env
+.env.*
+
+~$*.docx
+~$*.dotx
+~$*
+
+# python
+__pycache__/
+*.pyc
+
+# logs
+*.log

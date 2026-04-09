@@ -1,0 +1,58 @@
+networks:
+  data-net:
+    external: true
+
+services:
+
+  cr-pipeline:
+    image: rendu-cr-pipeline:latest
+    container_name: cr-pipeline
+    restart: unless-stopped
+    networks: [data-net]
+
+    environment:
+      TZ: Europe/Paris
+      PORT: "8090"
+
+      PIPELINE_DATA_DIR: "/data/jobs"
+      PIPELINE_SCRIPT: "/pipeline/powershell/cr_reunion_pipeline_fulljson.ps1"
+
+      PIPELINE_PROVIDER: "openai"
+      PIPELINE_API_BASE: "http://openai-adapter:5055"
+      PIPELINE_API_KEY: "${ADAPTER_API_KEY}"
+      PIPELINE_MODEL: "annoter"
+      PIPELINE_PRESET: "equilibre"
+
+    ports:
+      - "8090:8090"
+
+    volumes:
+      - ./cr-pipeline/data/jobs:/data/jobs
+      - ./cr-pipeline/pipeline:/pipeline
+      - /volume1/Affaires:/data/Affaires
+      # ⚠️ LIGNE SUPPRIMÉE :
+      # - ./cr-pipeline/app:/app
+
+  
+
+
+  cr-render:
+    container_name: cr-render
+    build:
+      context: ./cr-render
+      dockerfile: Dockerfile
+    image: rendu-cr-render:latest
+    restart: unless-stopped
+    networks: [data-net]
+
+    environment:
+      TZ: Europe/Paris
+      PORT: "8080"
+      DOCX_TEMPLATE: "/app/app/templates/Modele word rapport ver 15 05 2025.docx"
+
+    ports:
+      - "8081:8080"
+
+    volumes:
+      - ./cr-render/app:/app/app
+      - /volume1/Affaires:/data/Affaires
