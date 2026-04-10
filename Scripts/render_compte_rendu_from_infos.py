@@ -1,0 +1,267 @@
+﻿import argparse
+import json
+import os
+import re
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+import requests
+
+DEFAULT_RENDER_URL = "http://192.168.1.20:8081/render?format=docx"
+DEFAULT_CONTAINER = "cr-pipeline"
+DEFAULT_PIPELINE_SCRIPT = "/pipeline/powershell/cr_reunion_point_mumerotes_pipeline_json.ps1"
+DEFAULT_PROVIDER = "openai"
+DEFAULT_API_BASE = "http://openai-adapter:5055"
+DEFAULT_MODEL_PASS1 = "annoter_segments_remote"
+DEFAULT_MODEL_PASS2 = "annoter_segments_remote"
+DEFAULT_MODEL_PASS3 = "annoter_segments_remote_alt"
+DEFAULT_PRESET = "equilibre"
+DEFAULT_API_KEY = os.environ.get("CR_PIPELINE_API_KEY", "*CRpy#VrWz#5zh&F%ww6zY24U")
+FALLBACK_ROOT_AFFAIRES = r"\\192.168.0.155\Affaires"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Orchestre le pipeline compte-rendu reel a partir d'un infos_projet.json."
+    )
+    parser.add_argument("--infos", required=True, help="Chemin vers infos_projet.json.")
+    parser.add_argument("--render-url", default=DEFAULT_RENDER_URL, help="URL HTTP de cr-render.")
+    parser.add_argument("--container", default=DEFAULT_CONTAINER, help="Nom du conteneur Docker cr-pipeline.")
+    parser.add_argument("--pipeline-script", default=DEFAULT_PIPELINE_SCRIPT, help="Chemin du script PowerShell dans le conteneur.")
+    parser.add_argument("--csv", default="", help="Override explicite pour le CSV de transcription.")
+    parser.add_argument("--context", default="", help="Override explicite pour le JSON de contexte.")
+    parser.add_argument("--sujets", default="", help="Override explicite pour Sujets.xlsx.")
+    parser.add_argument("--participants", default="", help="Override explicite pour Participants.xlsx.")
+    parser.add_argument("--provider", default="", help="Override du provider pipeline.")
+    parser.add_argument("--api-base", default="", help="Override de l'API base pipeline.")
+    parser.add_argument("--model-pass1", default="", help="Override ModelPass1.")
+    parser.add_argument("--model-pass2", default="", help="Override ModelPass2.")
+    parser.add_argument("--model-pass3", default="", help="Override ModelPass3.")
+    parser.add_argument("--preset", default="", help="Override preset pipeline.")
+    parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="API key transmise au script PowerShell.")
+    parser.add_argument("--force", action="store_true", help="Ajoute -Force a la commande pipeline.")
+    return parser.parse_args()
+
+
+def resolve_path_like(value: str, *, base_dir: Path) -> Path:
+    path = Path(str(value or "").strip())
+    if not str(path):
+        return path
+    if path.is_absolute():
+        return path
+    return (base_dir / path).resolve()
+
+
+def load_infos(infos_path: Path) -> dict:
+    with open(infos_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def choose_first_existing(candidates: list[Path]) -> Path | None:
+    for candidate in candidates:
+        if candidate and candidate.exists():
+            return candidate
+    return None
+
+
+def resolve_output_root(infos: dict) -> Path:
+    pcfixe = infos.get("pcfixe") or {}
+    root_affaires = str(pcfixe.get("root_affaires") or "").strip()
+    if not root_affaires.startswith("\\\\"):
+        root_affaires = FALLBACK_ROOT_AFFAIRES
+    return Path(root_affaires)
+
+
+def resolve_output_dir(infos: dict) -> Path:
+    id_affaire = str(infos.get("id_affaire") or "").strip()
+    id_captation = str(infos.get("id_captation") or "").strip()
+    if not id_affaire or not id_captation:
+        raise RuntimeError("id_affaire ou id_captation manquant dans infos_projet.json.")
+
+    root_affaires = resolve_output_root(infos)
+    output_dir = root_affaires / id_affaire / "BE_Traitements_captations" / id_captation
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def resolve_csv_path(infos: dict, infos_path: Path, override: str) -> Path:
+    candidates = []
+    if override:
+        candidates.append(resolve_path_like(override, base_dir=infos_path.parent))
+    for raw in (
+        infos.get("fichier_transcription"),
+        (infos.get("pcfixe") or {}).get("fichier_transcription"),
+    ):
+        if raw:
+            candidates.append(resolve_path_like(str(raw), base_dir=infos_path.parent))
+
+    csv_path = choose_first_existing(candidates)
+    if not csv_path:
+        raise FileNotFoundError("CSV de transcription introuvable depuis infos_projet.json.")
+    return csv_path
+
+
+def resolve_context_path(infos: dict, infos_path: Path, csv_path: Path, override: str) -> Path:
+    candidates: list[Path] = []
+    if override:
+        candidates.append(resolve_path_like(override, base_dir=infos_path.parent))
+    for raw in (
+        infos.get("fichier_contexte_general"),
+        (infos.get("pcfixe") or {}).get("fichier_contexte_general"),
+    ):
+        if raw:
+            candidates.append(resolve_path_like(str(raw), base_dir=infos_path.parent))
+
+    csv_dir = csv_path.parent
+    candidates.append(csv_dir / "contexte_general_compte_rendu.json")
+    candidates.append(csv_dir / "contexte_general.json")
+
+    context_path = choose_first_existing(candidates)
+    if not context_path:
+        raise FileNotFoundError("Contexte JSON introuvable (override, infos_projet.json ou dossier du CSV).")
+    return context_path
+
+
+def resolve_excel_path(infos: dict, infos_path: Path, csv_path: Path, override: str, keys: tuple[str, ...], fallback_name: str) -> Path:
+    candidates: list[Path] = []
+    if override:
+        candidates.append(resolve_path_like(override, base_dir=infos_path.parent))
+
+    pcfixe = infos.get("pcfixe") or {}
+    for key in keys:
+        raw = infos.get(key)
+        if raw:
+            candidates.append(resolve_path_like(str(raw), base_dir=infos_path.parent))
+        raw_pc = pcfixe.get(key)
+        if raw_pc:
+            candidates.append(resolve_path_like(str(raw_pc), base_dir=infos_path.parent))
+
+    candidates.append(csv_path.parent / fallback_name)
+
+    resolved = choose_first_existing(candidates)
+    if not resolved:
+        raise FileNotFoundError(f"Fichier {fallback_name} introuvable (override, infos_projet.json ou dossier du CSV).")
+    return resolved
+
+
+def win_to_container_affaires_path(host_path: Path, root_affaires: Path) -> str:
+    host_str = str(host_path)
+    root_str = str(root_affaires)
+
+    if host_str.startswith(root_str.rstrip("\\/")):
+        rel = host_str[len(root_str.rstrip("\\/")):].lstrip("\\/")
+        return "/data/Affaires/" + rel.replace("\\", "/")
+
+    patterns = [
+        re.compile(r"^[A-Za-z]:\\Affaires\\(?P<rel>.+)$", re.I),
+        re.compile(r"^\\\\192\.168\.0\.155\\Affaires\\(?P<rel>.+)$", re.I),
+        re.compile(r"^\\\\192\.168\.1\.20\\Affaires\\(?P<rel>.+)$", re.I),
+    ]
+    for pattern in patterns:
+        match = pattern.match(host_str)
+        if match:
+            return "/data/Affaires/" + match.group("rel").replace("\\", "/")
+
+    raise RuntimeError(
+        "Chemin non convertible vers /data/Affaires pour Docker : "
+        f"{host_path}"
+    )
+
+
+def build_pipeline_command(args: argparse.Namespace, infos: dict, csv_path: Path, context_path: Path, sujets_path: Path, participants_path: Path, out_dir_host: Path) -> list[str]:
+    root_affaires = resolve_output_root(infos)
+    out_dir_host.mkdir(parents=True, exist_ok=True)
+
+    provider = args.provider or str(infos.get("provider") or "").strip() or DEFAULT_PROVIDER
+    api_base = args.api_base or str(infos.get("api_base") or "").strip() or DEFAULT_API_BASE
+    model_pass1 = args.model_pass1 or str(infos.get("model_pass1") or "").strip() or DEFAULT_MODEL_PASS1
+    model_pass2 = args.model_pass2 or str(infos.get("model_pass2") or "").strip() or DEFAULT_MODEL_PASS2
+    model_pass3 = args.model_pass3 or str(infos.get("model_pass3") or "").strip() or DEFAULT_MODEL_PASS3
+    preset = args.preset or str(infos.get("preset") or "").strip() or DEFAULT_PRESET
+
+    cmd = [
+        "docker", "exec", args.container,
+        "pwsh", args.pipeline_script,
+        "-CsvPath", win_to_container_affaires_path(csv_path, root_affaires),
+        "-OutDir", win_to_container_affaires_path(out_dir_host, root_affaires),
+        "-ContextJsonPath", win_to_container_affaires_path(context_path, root_affaires),
+        "-SujetsPath", win_to_container_affaires_path(sujets_path, root_affaires),
+        "-ApiKey", args.api_key,
+        "-ParticipantsPath", win_to_container_affaires_path(participants_path, root_affaires),
+        "-Provider", provider,
+        "-ApiBase", api_base,
+        "-ModelPass1", model_pass1,
+        "-ModelPass2", model_pass2,
+        "-ModelPass3", model_pass3,
+        "-Preset", preset,
+    ]
+    if args.force:
+        cmd.append("-Force")
+    return cmd
+
+
+def build_docx_name(infos: dict) -> str:
+    id_affaire = str(infos.get("id_affaire") or "").strip()
+    id_captation = str(infos.get("id_captation") or "").strip()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"compte_rendu_{id_affaire}_{id_captation}_V_{ts}.docx"
+
+
+def main() -> int:
+    args = parse_args()
+    infos_path = resolve_path_like(args.infos, base_dir=Path.cwd())
+    if not infos_path.exists():
+        raise FileNotFoundError(f"infos_projet.json introuvable : {infos_path}")
+
+    infos = load_infos(infos_path)
+    id_affaire = str(infos.get("id_affaire") or "").strip()
+    id_captation = str(infos.get("id_captation") or "").strip()
+    if not id_affaire or not id_captation:
+        raise RuntimeError("id_affaire ou id_captation manquant dans infos_projet.json.")
+
+    csv_path = resolve_csv_path(infos, infos_path, args.csv)
+    context_path = resolve_context_path(infos, infos_path, csv_path, args.context)
+    sujets_path = resolve_excel_path(infos, infos_path, csv_path, args.sujets, ("fichier_sujets", "sujets_path"), "Sujets.xlsx")
+    participants_path = resolve_excel_path(infos, infos_path, csv_path, args.participants, ("fichier_participants", "participants_path"), "Participants.xlsx")
+
+    final_output_dir = resolve_output_dir(infos)
+    job_tag = datetime.now().strftime("job_%Y%m%d_%H%M%S")
+    pipeline_out_dir = final_output_dir / "out" / job_tag
+    pipeline_command = build_pipeline_command(args, infos, csv_path, context_path, sujets_path, participants_path, pipeline_out_dir)
+
+    print("[CR] Commande pipeline executee :")
+    print(subprocess.list2cmdline(pipeline_command))
+
+    completed = subprocess.run(pipeline_command, capture_output=True, text=True)
+    if completed.stdout:
+        print(completed.stdout)
+    if completed.stderr:
+        print(completed.stderr)
+    if completed.returncode != 0:
+        raise RuntimeError(f"Echec pipeline (code {completed.returncode}).")
+
+    global_final_path = pipeline_out_dir / "global_final.json"
+    if not global_final_path.exists():
+        raise FileNotFoundError(f"global_final.json introuvable : {global_final_path}")
+
+    print(f"[CR] global_final.json : {global_final_path}")
+
+    payload_text = global_final_path.read_text(encoding="utf-8")
+    payload_json = json.loads(payload_text)
+
+    render_response = requests.post(
+        args.render_url,
+        json=payload_json,
+        timeout=1800,
+    )
+    render_response.raise_for_status()
+
+    docx_path = final_output_dir / build_docx_name(infos)
+    docx_path.write_bytes(render_response.content)
+    print(f"[CR] DOCX final : {docx_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
