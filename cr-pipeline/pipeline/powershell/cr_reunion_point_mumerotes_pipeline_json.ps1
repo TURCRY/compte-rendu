@@ -101,6 +101,13 @@ if ($SujetsPath) {
             Description  = ($_.Description  | ForEach-Object { $_ })
         }
     }
+
+    $sujetsTotal = @($Sujets).Count
+    $Sujets = @($Sujets | Where-Object { $null -ne $_ -and [int]$_.Numero -gt 0 })
+    $sujetsRetires = $sujetsTotal - @($Sujets).Count
+    if ($sujetsRetires -gt 0) {
+      Write-Warn ("R?f?rentiel sujets: {0} entr?e(s) <= 0 ignor?e(s) (sujet 0 supprim? en amont)." -f $sujetsRetires)
+    }
 }
 
 # Map Numero -> Titre (référentiel)
@@ -118,11 +125,16 @@ if ($ParticipantsPath) {
     # colonnes possibles : NomCanonique, Role, Alias1, Alias2...
 }
 
-# Ajustement intelligent de Pass2BatchSize si l'utilisateur ne l'a pas fixé
-if ($Provider -ieq "openai" -and ($ModelPass2 -like "*remote*")) {
-    $Pass2BatchSize = 4
-} else {
-    $Pass2BatchSize = 2
+# Ajustement initial de Pass2BatchSize (les batches tronqu?s seront relanc?s s?lectivement)
+if (-not $PSBoundParameters.ContainsKey('Pass2BatchSize')) {
+    if ($Provider -ieq "openai" -and ($ModelPass2 -like "*remote*")) {
+        $Pass2BatchSize = 4
+    } else {
+        $Pass2BatchSize = 2
+    }
+}
+if ($Pass2BatchSize -lt 1) {
+    $Pass2BatchSize = 1
 }
 
 
@@ -242,6 +254,10 @@ function Get-ContextBudget {
         "annoter_segments_remote" { return @{ NCtx=120000; MaxTok=4000; Margin=2000 } }
         "annoter_segments_remote_alt" { return @{ NCtx=120000; MaxTok=4000; Margin=2000 } }
         "annoter_segments_remote_alt2" { return @{ NCtx=120000; MaxTok=4000; Margin=2000 } }
+
+        "report_remote" { return @{ NCtx=120000; MaxTok=4000; Margin=2000 } }
+        "report_remote_alt" { return @{ NCtx=120000; MaxTok=4000; Margin=2000 } }
+        "report_remote_alt2" { return @{ NCtx=120000; MaxTok=4000; Margin=2000 } }
 
         "pass3_remote"      { return @{ NCtx=32768; MaxTok=2000; Margin=800 } }
         "pass3_remote_alt"  { return @{ NCtx=32768; MaxTok=2000; Margin=800 } }
@@ -3080,6 +3096,195 @@ function Merge-ListUnique {
 
   return ,$acc.ToArray()
 }
+function Merge-MeetingBatchObjects {
+  param([object[]]$MeetingObjs)
+
+  $allBatchObjs = @($MeetingObjs | Where-Object { $null -ne $_ })
+  if (-not $allBatchObjs -or $allBatchObjs.Count -eq 0) {
+    return Normalize-MeetingBatchObj $null
+  }
+
+  $resumes = @($allBatchObjs | ForEach-Object { $_.resume_global } | Where-Object { $_ -and $_.Trim() -ne "" })
+  $resumeBest = ""
+  if ($resumes.Count -gt 0) {
+    $resumeBest = ($resumes | Sort-Object Length -Descending | Select-Object -First 1)
+  }
+
+  return [pscustomobject]@{
+    resume_global              = $resumeBest
+    themes                     = Merge-ListUnique ($allBatchObjs | ForEach-Object { $_.themes })
+    themes_abordes             = Merge-ListUnique ($allBatchObjs | ForEach-Object { $_.themes_abordes })
+    actions                    = Merge-ListUnique ($allBatchObjs | ForEach-Object { $_.actions })
+    perspectives               = Merge-ListUnique ($allBatchObjs | ForEach-Object { $_.perspectives })
+    demandes_documents_globales= Merge-ListUnique ($allBatchObjs | ForEach-Object { $_.demandes_documents_globales })
+    problems                   = Merge-ListUnique ($allBatchObjs | ForEach-Object { $_.problems })
+  }
+}
+
+function Invoke-Pass2BBatchAttempt {
+  param(
+    [int] $BatchIndex,
+    [string] $AttemptId,
+    [object[]] $BatchSeg,
+    [string] $BatchBase,
+    [string] $Pass2BDir,
+    [string] $LogFile,
+    [string] $ApiBase,
+    [string] $ModelReport,
+    [string] $Pass2BSystem,
+    [string] $Pass2BUserTemplate,
+    [bool] $DebugHttp = $false
+  )
+
+  $safeAttemptId = if ([string]::IsNullOrWhiteSpace($AttemptId)) { "main" } else { $AttemptId }
+  $attemptBase = if ($safeAttemptId -eq "main") { $BatchBase } else { "${BatchBase}_${safeAttemptId}" }
+  $attemptOut = if ($safeAttemptId -eq "main") { "${BatchBase}.json" } else { "${attemptBase}.json" }
+  $promptPath = "${attemptBase}_prompt.txt"
+  $systemPath = "${attemptBase}_system.txt"
+  $rawPath    = "${attemptBase}_raw.txt"
+  $metaPath   = "${attemptBase}_meta.json"
+  $errorPath  = "${attemptBase}_error.txt"
+
+  $batchSegJson = $BatchSeg | ConvertTo-Json -Depth 50 -Compress
+  $pass2BUser   = $Pass2BUserTemplate.Replace("{SEGMENTS_JSON}", $batchSegJson)
+  $pass2BUser_Effective = Enforce-ContextLimit `
+    -SystemPrompt $Pass2BSystem `
+    -UserPrompt   $pass2BUser `
+    -Label        ("Pass2B batch {0:D2} [{1}]" -f $BatchIndex, $safeAttemptId) `
+    -LogFile      $LogFile `
+    -ModelName    $ModelReport
+
+  $wasTruncated = ($pass2BUser_Effective -ne $pass2BUser)
+
+  [System.IO.File]::WriteAllText($promptPath, $pass2BUser_Effective, [System.Text.Encoding]::UTF8)
+  [System.IO.File]::WriteAllText($systemPath, $Pass2BSystem, [System.Text.Encoding]::UTF8)
+
+  $meta = [pscustomobject]@{
+    batch          = $BatchIndex
+    attempt        = $safeAttemptId
+    segment_count  = @($BatchSeg).Count
+    model          = $ModelReport
+    apiBase        = $ApiBase
+    was_truncated  = $wasTruncated
+    timestamp      = (Get-Date).ToString("o")
+  }
+  [System.IO.File]::WriteAllText($metaPath, ($meta | ConvertTo-Json -Depth 10), [System.Text.Encoding]::UTF8)
+
+  $batchObj = $null
+  $raw = $null
+
+  try {
+    $raw = Invoke-LLM -system $Pass2BSystem -user $pass2BUser_Effective -model $ModelReport -DebugHttp:$DebugHttp
+    if (-not $raw -or $raw.Trim().Length -eq 0) { throw "R?ponse LLM vide" }
+    [IO.File]::WriteAllText($rawPath, $raw, [Text.Encoding]::UTF8)
+  }
+  catch {
+    $errTxt = ($_ | Out-String)
+    [IO.File]::WriteAllText($errorPath, $errTxt, [Text.Encoding]::UTF8)
+    [IO.File]::WriteAllText($rawPath, $errTxt, [Text.Encoding]::UTF8)
+    Write-Warn ("Pass2B batch {0:D2} [{1}]: ?chec Invoke-LLM (voir {2})." -f $BatchIndex, $safeAttemptId, $errorPath)
+    $raw = $null
+  }
+
+  if ($raw) {
+    try {
+      $batchObj = Parse-LlmJsonStrict -RawText $raw -Label ("Pass2B batch {0:D2} [{1}]" -f $BatchIndex, $safeAttemptId) -LogFile $LogFile
+    }
+    catch {
+      $errTxt = ($_ | Out-String)
+      [IO.File]::WriteAllText($errorPath, $errTxt, [Text.Encoding]::UTF8)
+      Write-Warn ("Pass2B batch {0:D2} [{1}]: JSON non parsable (voir {2})." -f $BatchIndex, $safeAttemptId, $errorPath)
+      $batchObj = $null
+    }
+  }
+
+  $batchObj = Normalize-MeetingBatchObj $batchObj
+  [System.IO.File]::WriteAllText($attemptOut, ($batchObj | ConvertTo-Json -Depth 50), [System.Text.Encoding]::UTF8)
+
+  return [pscustomobject]@{
+    BatchObj      = $batchObj
+    WasTruncated  = $wasTruncated
+    SegmentCount  = @($BatchSeg).Count
+    AttemptId     = $safeAttemptId
+    OutputPath    = $attemptOut
+  }
+}
+
+function Invoke-Pass2BAdaptiveBatch {
+  param(
+    [int] $BatchIndex,
+    [object[]] $BatchSeg,
+    [int] $RequestedSize,
+    [string] $BatchBase,
+    [string] $Pass2BDir,
+    [string] $LogFile,
+    [string] $ApiBase,
+    [string] $ModelReport,
+    [string] $Pass2BSystem,
+    [string] $Pass2BUserTemplate,
+    [bool] $DebugHttp = $false,
+    [string] $AttemptId = "main"
+  )
+
+  $attempt = Invoke-Pass2BBatchAttempt `
+    -BatchIndex $BatchIndex `
+    -AttemptId $AttemptId `
+    -BatchSeg $BatchSeg `
+    -BatchBase $BatchBase `
+    -Pass2BDir $Pass2BDir `
+    -LogFile $LogFile `
+    -ApiBase $ApiBase `
+    -ModelReport $ModelReport `
+    -Pass2BSystem $Pass2BSystem `
+    -Pass2BUserTemplate $Pass2BUserTemplate `
+    -DebugHttp:$DebugHttp
+
+  if ((-not $attempt.WasTruncated) -or (@($BatchSeg).Count -le 1)) {
+    return $attempt.BatchObj
+  }
+
+  $nextSize = 1
+  if ($RequestedSize -gt 2) {
+    $nextSize = 2
+  } elseif ($RequestedSize -gt 1) {
+    $nextSize = 1
+  }
+
+  if ($nextSize -ge @($BatchSeg).Count) {
+    $nextSize = @($BatchSeg).Count - 1
+  }
+  if ($nextSize -lt 1) {
+    return $attempt.BatchObj
+  }
+
+  Write-Warn ("Pass2B batch {0:D2}: prompt tronqu? d?tect?, relance s?lective en sous-batches de {1}." -f $BatchIndex, $nextSize)
+
+  $subObjs = New-Object System.Collections.Generic.List[object]
+  $subCount = [math]::Ceiling(@($BatchSeg).Count / [double]$nextSize)
+  for ($sub = 0; $sub -lt $subCount; $sub++) {
+    $subFrom = $sub * $nextSize
+    $subTo = [math]::Min($subFrom + $nextSize - 1, @($BatchSeg).Count - 1)
+    $subSeg = @($BatchSeg[$subFrom..$subTo])
+    $subAttemptId = "retry_s{0}_{1:D2}" -f $nextSize, ($sub + 1)
+    $subObj = Invoke-Pass2BAdaptiveBatch `
+      -BatchIndex $BatchIndex `
+      -BatchSeg $subSeg `
+      -RequestedSize $nextSize `
+      -BatchBase $BatchBase `
+      -Pass2BDir $Pass2BDir `
+      -LogFile $LogFile `
+      -ApiBase $ApiBase `
+      -ModelReport $ModelReport `
+      -Pass2BSystem $Pass2BSystem `
+      -Pass2BUserTemplate $Pass2BUserTemplate `
+      -DebugHttp:$DebugHttp `
+      -AttemptId $subAttemptId
+    $subObjs.Add($subObj) | Out-Null
+  }
+
+  return (Merge-MeetingBatchObjects $subObjs.ToArray())
+}
+
 function Convert-DebriefToMeetingGlobal {
   param([object] $DebriefObj)
 
@@ -3422,60 +3627,21 @@ else {
 
     Write-Info ("Pass2B → Batch {0:D2}/{1} (segments {2}..{3})" -f $batchIndex, $batchCount, ($from+1), ($to+1))
 
-    $batchSeg     = $segmentObjs[$from..$to]
-    $batchSegJson = $batchSeg | ConvertTo-Json -Depth 50 -Compress
-    $pass2BUser   = $Pass2B_User_Template.Replace("{SEGMENTS_JSON}", $batchSegJson)
+    $batchSeg = @($segmentObjs[$from..$to])
+    $batchObj = Invoke-Pass2BAdaptiveBatch `
+      -BatchIndex $batchIndex `
+      -BatchSeg $batchSeg `
+      -RequestedSize $Pass2BatchSize `
+      -BatchBase $batchBase `
+      -Pass2BDir $pass2BDir `
+      -LogFile $logFile `
+      -ApiBase $ApiBase `
+      -ModelReport $ModelReport `
+      -Pass2BSystem $Pass2B_System `
+      -Pass2BUserTemplate $Pass2B_User_Template `
+      -DebugHttp:$DebugHttp
 
-    $pass2BUser_Effective = Enforce-ContextLimit `
-      -SystemPrompt $Pass2B_System `
-      -UserPrompt   $pass2BUser `
-      -Label        ("Pass2B batch {0:D2}" -f $batchIndex) `
-      -LogFile      $logFile `
-      -ModelName    $ModelReport
-
-    [System.IO.File]::WriteAllText($promptPath, $pass2BUser_Effective, [System.Text.Encoding]::UTF8)
-    [System.IO.File]::WriteAllText($systemPath, $Pass2B_System,       [System.Text.Encoding]::UTF8)
-
-    $meta = [pscustomobject]@{
-      batch     = $batchIndex
-      segments  = "{0}..{1}" -f ($from+1), ($to+1)
-      model     = $ModelReport
-      apiBase   = $ApiBase
-      timestamp = (Get-Date).ToString("o")
-    }
-    [System.IO.File]::WriteAllText($metaPath, ($meta | ConvertTo-Json -Depth 10), [System.Text.Encoding]::UTF8)
-
-    $batchObj = $null
-    $raw      = $null
-
-    try {
-      $raw = Invoke-LLM -system $Pass2B_System -user $pass2BUser_Effective -model $ModelReport -DebugHttp:$DebugHttp
-      if (-not $raw -or $raw.Trim().Length -eq 0) { throw "Réponse LLM vide" }
-      [IO.File]::WriteAllText($rawPath, $raw, [Text.Encoding]::UTF8)
-    }
-    catch {
-      $errTxt = ($_ | Out-String)
-      [IO.File]::WriteAllText($errorPath, $errTxt, [Text.Encoding]::UTF8)
-      [IO.File]::WriteAllText($rawPath,   $errTxt, [Text.Encoding]::UTF8)  # trace dans raw
-      Write-Warn "Pass2B batch ${batchIndex}: échec Invoke-LLM (voir ${errorPath})."
-      $raw = $null
-    }
-
-    if ($raw) {
-      try {
-        $batchObj = Parse-LlmJsonStrict -RawText $raw -Label ("Pass2B batch {0:D2}" -f $batchIndex) -LogFile $logFile
-      }
-      catch {
-        $errTxt = ($_ | Out-String)
-        [IO.File]::WriteAllText($errorPath, $errTxt, [Text.Encoding]::UTF8)
-        Write-Warn "Pass2B batch ${batchIndex}: JSON non parsable (voir ${errorPath})."
-        $batchObj = $null
-      }
-    }
-
-    # Tolérance maximale : une seule rubrique suffit
     $batchObj = Normalize-MeetingBatchObj $batchObj
-
     $json = $batchObj | ConvertTo-Json -Depth 50
     [System.IO.File]::WriteAllText($batchOut, $json, [System.Text.Encoding]::UTF8)
     $batchPaths.Add($batchOut) | Out-Null
@@ -3494,22 +3660,7 @@ else {
     }
   }
 
-  # resume_global : choisir le plus long non vide
-  $resumes = @($allBatchObjs | ForEach-Object { $_.resume_global } | Where-Object { $_ -and $_.Trim() -ne "" })
-  $resumeBest = ""
-  if ($resumes.Count -gt 0) {
-    $resumeBest = ($resumes | Sort-Object Length -Descending | Select-Object -First 1)
-  }
-
-  $globalMeetingObj = [pscustomobject]@{
-    resume_global              = $resumeBest
-    themes                     = Merge-ListUnique ($allBatchObjs | ForEach-Object { $_.themes })
-    themes_abordes             = Merge-ListUnique ($allBatchObjs | ForEach-Object { $_.themes_abordes })
-    actions                    = Merge-ListUnique ($allBatchObjs | ForEach-Object { $_.actions })
-    perspectives               = Merge-ListUnique ($allBatchObjs | ForEach-Object { $_.perspectives })
-    demandes_documents_globales= Merge-ListUnique ($allBatchObjs | ForEach-Object { $_.demandes_documents_globales })
-    problems                   = Merge-ListUnique ($allBatchObjs | ForEach-Object { $_.problems })
-  }
+  $globalMeetingObj = Merge-MeetingBatchObjects $allBatchObjs
 }
 
 # ---- 5) Sauvegarde global_meeting.json
@@ -4464,6 +4615,10 @@ else {
 
 
 
+    $agg.sujets = @($agg.sujets | Where-Object {
+      $null -ne $_ -and $_.PSObject.Properties['numero'] -and [int]$_.numero -gt 0
+    })
+
     $expected = @($Sujets | ForEach-Object { [int]$_.Numero })
     $got = @($agg.sujets | ForEach-Object { [int]$_.numero })
     $missing = $expected | Where-Object { $got -notcontains $_ }
@@ -4583,6 +4738,15 @@ foreach ($sj in $Sujets) {
 
 # (2) Replaquer les titres sur la sortie LLM
 if ($finalObj -and $finalObj.sujets) {
+  $sujetsAvantFiltreFinal = @($finalObj.sujets).Count
+  $finalObj.sujets = @($finalObj.sujets | Where-Object {
+    $null -ne $_ -and $_.PSObject.Properties['numero'] -and [int]$_.numero -gt 0
+  })
+  $sujetsRetiresFinal = $sujetsAvantFiltreFinal - @($finalObj.sujets).Count
+  if ($sujetsRetiresFinal -gt 0) {
+    Write-Warn ("Assemblage final: {0} sujet(s) numero=0 ou invalide supprime(s) avant global_final.json." -f $sujetsRetiresFinal)
+  }
+
   foreach ($s in $finalObj.sujets) {
     if (-not $s.PSObject.Properties['numero']) { continue }
 

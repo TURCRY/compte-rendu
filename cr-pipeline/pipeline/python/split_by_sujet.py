@@ -119,10 +119,15 @@ def main() -> int:
     sujets_ref = as_list(load_json(sujets_ref_path))
 
     subjects: Dict[str, Dict[str, Any]] = {}
+    skipped_non_positive = 0
     for sj in sujets_ref:
-        num = str(int(sj["Numero"]))
+        numero = int(sj["Numero"])
+        if numero <= 0:
+            skipped_non_positive += 1
+            continue
+        num = str(numero)
         subjects[num] = {
-            "numero": int(sj["Numero"]),
+            "numero": numero,
             "titre": (sj.get("Titre") or "").strip(),
             "localisation": sj.get("Localisation", ""),
             "description": sj.get("Description", ""),
@@ -216,6 +221,7 @@ def main() -> int:
         "count_sujets": len(index_items),
         "target_kb": int(args.target_kb),
         "dedup": bool(args.dedup),
+        "skipped_non_positive_subjects": skipped_non_positive,
     })
 
     return 0
