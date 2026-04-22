@@ -26,3 +26,11 @@ __pycache__/
 
 # logs
 *.log
+
+# Windows
+Thumbs.db
+
+# Données locales pipeline CR
+Scripts/manifest_*.json
+Scripts/merge_test_*/
+Scripts/*.docx
