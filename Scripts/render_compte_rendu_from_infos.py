@@ -2,7 +2,9 @@
 import json
 import os
 import re
+import shutil
 import subprocess
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -13,12 +15,25 @@ DEFAULT_CONTAINER = "cr-pipeline"
 DEFAULT_PIPELINE_SCRIPT = "/pipeline/powershell/cr_reunion_point_mumerotes_pipeline_json.ps1"
 DEFAULT_PROVIDER = "openai"
 DEFAULT_API_BASE = "http://openai-adapter:5055"
+DEFAULT_PSEUDO_API_BASE = ""
+DEFAULT_PSEUDO_API_KEY = os.environ.get("LOCAL_LLM_API_KEY", "").strip()
 DEFAULT_MODEL_PASS1 = "annoter_segments_remote"
 DEFAULT_MODEL_PASS2 = "annoter_segments_remote"
 DEFAULT_MODEL_PASS3 = "annoter_segments_remote_alt"
 DEFAULT_PRESET = "equilibre"
 DEFAULT_API_KEY = os.environ.get("CR_PIPELINE_API_KEY", "*CRpy#VrWz#5zh&F%ww6zY24U")
-FALLBACK_ROOT_AFFAIRES = r"\\192.168.0.155\Affaires"
+FINAL_JSON_FILENAMES = (
+    "global.json",
+    "global_meeting.json",
+    "global_by_sujet.json",
+    "global_final.json",
+)
+
+
+def pipeline_uses_remote_llm(provider: str, *models: str) -> bool:
+    if (provider or "").strip().lower() != "openai":
+        return False
+    return any("remote" in (model or "").strip().lower() for model in models)
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,7 +55,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-pass3", default="", help="Override ModelPass3.")
     parser.add_argument("--preset", default="", help="Override preset pipeline.")
     parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="API key transmise au script PowerShell.")
+    parser.add_argument("--pseudo-api-base", default="", help="Base URL du service Flask de pseudonymisation.")
+    parser.add_argument("--pseudo-api-key", default=DEFAULT_PSEUDO_API_KEY, help="Cle API transmise au service Flask de pseudonymisation.")
+    parser.add_argument("--pseudo-job-id", default="", help="Job ID de pseudonymisation a reutiliser en mode rendu seul.")
+    parser.add_argument("--global-final", default="", help="Chemin vers un global_final.json deja produit. Si renseigne, le pipeline n'est pas relance.")
+    parser.add_argument("--pseudonymize-remote", dest="pseudonymize_remote", action="store_true", help="Active la pseudonymisation pour les flux distants compte-rendu.")
+    parser.add_argument("--no-pseudonymize-remote", dest="pseudonymize_remote", action="store_false", help="Desactive la pseudonymisation pour les flux distants compte-rendu.")
     parser.add_argument("--force", action="store_true", help="Ajoute -Force a la commande pipeline.")
+    parser.set_defaults(pseudonymize_remote=True)
     return parser.parse_args()
 
 
@@ -58,6 +80,31 @@ def load_infos(infos_path: Path) -> dict:
         return json.load(f)
 
 
+def resolve_compte_rendu_config(infos: dict) -> dict:
+    compte_rendu = infos.get("compte_rendu")
+    return compte_rendu if isinstance(compte_rendu, dict) else {}
+
+
+def depseudonymize_final_payload(payload_text: str, *, pseudo_api_base: str, pseudo_api_key: str, job_id: str) -> dict:
+    response = requests.post(
+        pseudo_api_base.rstrip("/") + "/depseudonymize",
+        json={
+            "text": payload_text,
+            "job_id": job_id,
+            "mode": "compte_rendu_final",
+        },
+        headers={"x-api-key": pseudo_api_key},
+        timeout=1800,
+    )
+    response.raise_for_status()
+    data = response.json() or {}
+    clear_text = data.get("text_depseudonymized") or data.get("text") or payload_text
+    clear_text = (clear_text or "").lstrip("\ufeff").strip()
+    return json.loads(clear_text)
+
+
+
+
 def choose_first_existing(candidates: list[Path]) -> Path | None:
     for candidate in candidates:
         if candidate and candidate.exists():
@@ -65,22 +112,71 @@ def choose_first_existing(candidates: list[Path]) -> Path | None:
     return None
 
 
-def resolve_output_root(infos: dict) -> Path:
+def choose_first_non_empty(values: list[str]) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _find_affaires_root_from_path(candidate: Path | str) -> Path | None:
+    raw = str(candidate or "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    parts = path.parts
+    for idx, part in enumerate(parts):
+        if str(part).lower() == "affaires":
+            return Path(*parts[: idx + 1])
+    return None
+
+
+def resolve_pseudo_api_base(args: argparse.Namespace, compte_rendu_cfg: dict) -> str:
+    return choose_first_non_empty([
+        args.pseudo_api_base,
+        compte_rendu_cfg.get("pseudo_api_base", ""),
+        os.environ.get("CR_PSEUDO_API_BASE", ""),
+        os.environ.get("PSEUDO_API_BASE", ""),
+    ])
+
+
+def resolve_output_root(infos: dict, infos_path: Path, csv_path: Path | None = None) -> Path:
     pcfixe = infos.get("pcfixe") or {}
-    root_affaires = str(pcfixe.get("root_affaires") or "").strip()
-    if not root_affaires.startswith("\\\\"):
-        root_affaires = FALLBACK_ROOT_AFFAIRES
-    return Path(root_affaires)
+    configured = choose_first_non_empty([
+        os.environ.get("CR_ROOT_AFFAIRES", ""),
+        os.environ.get("AFFAIRES_ROOT", ""),
+        pcfixe.get("root_affaires", ""),
+        infos.get("root_affaires", ""),
+    ])
+    if configured:
+        return Path(configured)
+
+    candidates = [
+        infos_path,
+        csv_path,
+        resolve_path_like(str(pcfixe.get("fichier_transcription") or ""), base_dir=infos_path.parent) if pcfixe.get("fichier_transcription") else None,
+        resolve_path_like(str(infos.get("fichier_transcription") or ""), base_dir=infos_path.parent) if infos.get("fichier_transcription") else None,
+    ]
+    for candidate in candidates:
+        root = _find_affaires_root_from_path(candidate)
+        if root is not None:
+            return root
+
+    raise RuntimeError(
+        "Racine Affaires introuvable. Renseignez CR_ROOT_AFFAIRES/AFFAIRES_ROOT "
+        "ou pcfixe.root_affaires dans infos_projet.json."
+    )
 
 
-def resolve_output_dir(infos: dict) -> Path:
+def resolve_output_dir(infos: dict, infos_path: Path, csv_path: Path | None = None) -> Path:
     id_affaire = str(infos.get("id_affaire") or "").strip()
     id_captation = str(infos.get("id_captation") or "").strip()
     if not id_affaire or not id_captation:
         raise RuntimeError("id_affaire ou id_captation manquant dans infos_projet.json.")
 
-    root_affaires = resolve_output_root(infos)
-    output_dir = root_affaires / id_affaire / "BE_Traitements_captations" / id_captation
+    root_affaires = resolve_output_root(infos, infos_path, csv_path)
+    output_dir = root_affaires / id_affaire / "BE_Traitement_captations" / id_captation / "compte_rendu_LLM"
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
@@ -169,8 +265,8 @@ def win_to_container_affaires_path(host_path: Path, root_affaires: Path) -> str:
     )
 
 
-def build_pipeline_command(args: argparse.Namespace, infos: dict, csv_path: Path, context_path: Path, sujets_path: Path, participants_path: Path, out_dir_host: Path) -> list[str]:
-    root_affaires = resolve_output_root(infos)
+def build_pipeline_command(args: argparse.Namespace, infos: dict, csv_path: Path, context_path: Path, sujets_path: Path, participants_path: Path, out_dir_host: Path, pseudo_job_id: str) -> list[str]:
+    root_affaires = resolve_output_root(infos, Path(args.infos).resolve(), csv_path)
     out_dir_host.mkdir(parents=True, exist_ok=True)
 
     provider = args.provider or str(infos.get("provider") or "").strip() or DEFAULT_PROVIDER
@@ -196,6 +292,18 @@ def build_pipeline_command(args: argparse.Namespace, infos: dict, csv_path: Path
         "-ModelPass3", model_pass3,
         "-Preset", preset,
     ]
+    if args.pseudonymize_remote and pipeline_uses_remote_llm(provider, model_pass1, model_pass2, model_pass3):
+        if not args.pseudo_api_base.strip():
+            raise RuntimeError("Pseudonymisation distante activee mais pseudo_api_base est vide.")
+        if not args.pseudo_api_key.strip():
+            raise RuntimeError("Pseudonymisation distante activee mais LOCAL_LLM_API_KEY / --pseudo-api-key est absent.")
+        cmd.extend([
+            "-PseudonymizeRemote",
+            "-PseudoApiBase", args.pseudo_api_base,
+            "-PseudoApiKey", args.pseudo_api_key,
+            "-PseudoJobId", pseudo_job_id,
+            "-PseudoParticipantsPath", str(participants_path),
+        ])
     if args.force:
         cmd.append("-Force")
     return cmd
@@ -208,6 +316,19 @@ def build_docx_name(infos: dict) -> str:
     return f"compte_rendu_{id_affaire}_{id_captation}_V_{ts}.docx"
 
 
+def build_unique_job_id(prefix: str = "job") -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return f"{prefix}_{ts}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+
+
+def promote_final_jsons(run_output_dir: Path, final_output_dir: Path) -> None:
+    for filename in FINAL_JSON_FILENAMES:
+        source = run_output_dir / filename
+        if not source.exists():
+            raise FileNotFoundError(f"Artefact final introuvable : {source}")
+        shutil.copy2(source, final_output_dir / filename)
+
+
 def main() -> int:
     args = parse_args()
     infos_path = resolve_path_like(args.infos, base_dir=Path.cwd())
@@ -215,40 +336,85 @@ def main() -> int:
         raise FileNotFoundError(f"infos_projet.json introuvable : {infos_path}")
 
     infos = load_infos(infos_path)
+    compte_rendu_cfg = resolve_compte_rendu_config(infos)
     id_affaire = str(infos.get("id_affaire") or "").strip()
     id_captation = str(infos.get("id_captation") or "").strip()
     if not id_affaire or not id_captation:
         raise RuntimeError("id_affaire ou id_captation manquant dans infos_projet.json.")
 
-    csv_path = resolve_csv_path(infos, infos_path, args.csv)
-    context_path = resolve_context_path(infos, infos_path, csv_path, args.context)
-    sujets_path = resolve_excel_path(infos, infos_path, csv_path, args.sujets, ("fichier_sujets", "sujets_path"), "Sujets.xlsx")
-    participants_path = resolve_excel_path(infos, infos_path, csv_path, args.participants, ("fichier_participants", "participants_path"), "Participants.xlsx")
+    pseudo_api_base = resolve_pseudo_api_base(args, compte_rendu_cfg)
+    pseudo_job_id_override = (
+        str(args.pseudo_job_id or "").strip()
+        or str(compte_rendu_cfg.get("pseudo_job_id") or "").strip()
+    )
+    args.pseudo_api_base = pseudo_api_base
 
-    final_output_dir = resolve_output_dir(infos)
-    job_tag = datetime.now().strftime("job_%Y%m%d_%H%M%S")
-    pipeline_out_dir = final_output_dir / "out" / job_tag
-    pipeline_command = build_pipeline_command(args, infos, csv_path, context_path, sujets_path, participants_path, pipeline_out_dir)
+    csv_path_for_output = None
+    if infos.get("fichier_transcription"):
+        try:
+            csv_path_for_output = resolve_csv_path(infos, infos_path, args.csv)
+        except Exception:
+            csv_path_for_output = None
+    final_output_dir = resolve_output_dir(infos, infos_path, csv_path_for_output)
+    global_final_override = resolve_path_like(args.global_final, base_dir=infos_path.parent) if args.global_final else None
+    if global_final_override:
+        global_final_path = global_final_override
+        if not global_final_path.exists():
+            raise FileNotFoundError(f"global_final.json introuvable : {global_final_path}")
+        pseudo_job_id = pseudo_job_id_override
+        if args.pseudonymize_remote and not pseudo_job_id:
+            raise RuntimeError("--pseudo-job-id est requis avec --global-final quand la depseudonymisation distante est active.")
+    else:
+        csv_path = resolve_csv_path(infos, infos_path, args.csv)
+        final_output_dir = resolve_output_dir(infos, infos_path, csv_path)
+        context_path = resolve_context_path(infos, infos_path, csv_path, args.context)
+        sujets_path = resolve_excel_path(infos, infos_path, csv_path, args.sujets, ("fichier_sujets", "sujets_path"), "Sujets.xlsx")
+        participants_path = resolve_excel_path(infos, infos_path, csv_path, args.participants, ("fichier_participants", "participants_path"), "Participants.xlsx")
+        job_tag = build_unique_job_id()
+        pseudo_job_id = f"cr_{id_affaire}_{id_captation}_{job_tag}"
+        pipeline_out_dir = final_output_dir / "out" / job_tag
+        pipeline_command = build_pipeline_command(args, infos, csv_path, context_path, sujets_path, participants_path, pipeline_out_dir, pseudo_job_id)
 
-    print("[CR] Commande pipeline executee :")
-    print(subprocess.list2cmdline(pipeline_command))
+        print("[CR] Commande pipeline executee :")
+        print(subprocess.list2cmdline(pipeline_command))
 
-    completed = subprocess.run(pipeline_command, capture_output=True, text=True)
-    if completed.stdout:
-        print(completed.stdout)
-    if completed.stderr:
-        print(completed.stderr)
-    if completed.returncode != 0:
-        raise RuntimeError(f"Echec pipeline (code {completed.returncode}).")
+        completed = subprocess.run(pipeline_command, capture_output=True, text=True)
+        if completed.stdout:
+            print(completed.stdout)
+        if completed.stderr:
+            print(completed.stderr)
+        if completed.returncode != 0:
+            raise RuntimeError(f"Echec pipeline (code {completed.returncode}).")
 
-    global_final_path = pipeline_out_dir / "global_final.json"
-    if not global_final_path.exists():
-        raise FileNotFoundError(f"global_final.json introuvable : {global_final_path}")
+        global_final_path = pipeline_out_dir / "global_final.json"
+        if not global_final_path.exists():
+            raise FileNotFoundError(f"global_final.json introuvable : {global_final_path}")
+        promote_final_jsons(pipeline_out_dir, final_output_dir)
+        global_final_path = final_output_dir / "global_final.json"
 
     print(f"[CR] global_final.json : {global_final_path}")
 
     payload_text = global_final_path.read_text(encoding="utf-8")
-    payload_json = json.loads(payload_text)
+    provider = args.provider or str(infos.get("provider") or "").strip() or DEFAULT_PROVIDER
+    model_pass1 = args.model_pass1 or str(infos.get("model_pass1") or "").strip() or DEFAULT_MODEL_PASS1
+    model_pass2 = args.model_pass2 or str(infos.get("model_pass2") or "").strip() or DEFAULT_MODEL_PASS2
+    model_pass3 = args.model_pass3 or str(infos.get("model_pass3") or "").strip() or DEFAULT_MODEL_PASS3
+    if args.pseudonymize_remote and pipeline_uses_remote_llm(provider, model_pass1, model_pass2, model_pass3):
+        if not pseudo_api_base:
+            raise RuntimeError(
+                "Pseudonymisation distante activee mais aucune base URL n'est configuree. "
+                "Utilisez --pseudo-api-base, compte_rendu.pseudo_api_base, "
+                "CR_PSEUDO_API_BASE ou PSEUDO_API_BASE."
+            )
+        print(f"[CR][PSEUDO] depseudonymisation finale via {pseudo_api_base} job_id={pseudo_job_id}")
+        payload_json = depseudonymize_final_payload(
+            payload_text,
+            pseudo_api_base=pseudo_api_base,
+            pseudo_api_key=args.pseudo_api_key,
+            job_id=pseudo_job_id,
+        )
+    else:
+        payload_json = json.loads(payload_text)
 
     render_response = requests.post(
         args.render_url,

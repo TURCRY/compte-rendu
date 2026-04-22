@@ -6,6 +6,7 @@ set -euo pipefail
 # ----------------------------
 INFOS="${1:-}"
 shift || true
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DRY_RUN=0
 FORCE=0
@@ -81,6 +82,29 @@ to_container_path() {
   echo "$p"
 }
 
+to_unc_affaires_path() {
+  local p="$1"
+  [[ -z "$p" ]] && echo "" && return
+
+  if [[ "$p" == /data/Affaires/* ]]; then
+    p="\\\\192.168.0.155\\Affaires\\${p#/data/Affaires/}"
+    p="${p//\//\\}"
+  fi
+
+  echo "$p"
+}
+
+uses_remote_llm() {
+  local provider="${1,,}"
+  shift || true
+  [[ "$provider" == "openai" ]] || return 1
+  local model=""
+  for model in "$@"; do
+    [[ "${model,,}" == *remote* ]] && return 0
+  done
+  return 1
+}
+
 
 
 # ----------------------------
@@ -151,7 +175,9 @@ if [[ ! "$AFFAIRE_ID" =~ ^[0-9]{4}-[A-Za-z0-9._-]+$ ]]; then
   exit 12
 fi
 
-OUT_DIR="/data/Affaires/${AFFAIRE_ID}/BE_Traitement_captations/${CAPTATION_ID}/compte_rendu_LLM"
+OUT_ROOT="/data/Affaires/${AFFAIRE_ID}/BE_Traitement_captations/${CAPTATION_ID}/compte_rendu_LLM"
+RUN_JOB_ID="job_$(date +%Y%m%d_%H%M%S_%N)_$$"
+OUT_DIR="${OUT_ROOT}/out/${RUN_JOB_ID}"
 
 
 # Résolution du contexte via tests dans le conteneur
@@ -257,6 +283,8 @@ mkdir -p "$host_log_dir"
 
 ts="$(date '+%Y%m%d_%H%M%S')"
 log_file="$host_log_dir/run_${ts}.log"
+PSEUDO_JOB_ID="cr_${AFFAIRE_ID}_${CAPTATION_ID}_${RUN_JOB_ID}"
+PSEUDO_PART_PATH="$(to_unc_affaires_path "$PART_PATH")"
 
 # Tout ce qui suit est loggué
 exec > >(tee -a "$log_file") 2>&1
@@ -282,6 +310,38 @@ echo "ModelP2 : $MODEL_P2"
 echo "ModelP3 : $MODEL_P3"
 echo "Preset : $PRESET"
 
+PSEUDO_API_BASE="${PSEUDO_API_BASE:-http://192.168.0.155:5000}"
+PSEUDO_API_KEY="${LOCAL_LLM_API_KEY:-}"
+PSEUDONYMIZE_REMOTE=0
+if uses_remote_llm "$PROVIDER" "$MODEL_P1" "$MODEL_P2" "$MODEL_P3"; then
+  PSEUDONYMIZE_REMOTE=1
+fi
+
+python3 - <<'PY' "$INFOS" "$PSEUDO_JOB_ID" "$PSEUDO_API_BASE"
+import json
+import sys
+from pathlib import Path
+
+infos_path = Path(sys.argv[1])
+pseudo_job_id = sys.argv[2]
+pseudo_api_base = sys.argv[3]
+
+with infos_path.open("r", encoding="utf-8") as f:
+    data = json.load(f)
+
+compte_rendu = data.get("compte_rendu")
+if not isinstance(compte_rendu, dict):
+    compte_rendu = {}
+    data["compte_rendu"] = compte_rendu
+
+compte_rendu["pseudo_job_id"] = pseudo_job_id
+compte_rendu["pseudo_api_base"] = pseudo_api_base
+
+with infos_path.open("w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+PY
+
 # ------------------------------
 METADATA_FILE="$host_log_dir/run_metadata_${ts}.json"
 
@@ -301,7 +361,10 @@ cat > "$METADATA_FILE" <<EOF
   "model_pass1": "$MODEL_P1",
   "model_pass2": "$MODEL_P2",
   "model_pass3": "$MODEL_P3",
-  "preset": "$PRESET"
+  "preset": "$PRESET",
+  "pseudonymize_remote": $PSEUDONYMIZE_REMOTE,
+  "pseudo_api_base": "$PSEUDO_API_BASE",
+  "pseudo_job_id": "$PSEUDO_JOB_ID"
 }
 EOF
 
@@ -326,6 +389,25 @@ cmd=(docker exec -it cr-pipeline pwsh /pipeline/powershell/cr_reunion_point_mume
   -ModelPass3 "$MODEL_P3"
   -Preset "$PRESET"
 )
+
+if [[ $PSEUDONYMIZE_REMOTE -eq 1 ]]; then
+  if [[ -z "$PSEUDO_API_BASE" ]]; then
+    echo "ERREUR: pseudonymisation distante active mais PSEUDO_API_BASE est vide."
+    exit 13
+  fi
+  if [[ -z "$PSEUDO_API_KEY" ]]; then
+    echo "ERREUR: pseudonymisation distante active mais LOCAL_LLM_API_KEY est vide."
+    exit 14
+  fi
+
+  cmd+=(
+    -PseudonymizeRemote
+    -PseudoApiBase "$PSEUDO_API_BASE"
+    -PseudoApiKey "$PSEUDO_API_KEY"
+    -PseudoJobId "$PSEUDO_JOB_ID"
+    -PseudoParticipantsPath "$PSEUDO_PART_PATH"
+  )
+fi
 
 if [[ $FORCE -eq 1 ]]; then
   cmd+=(-Force)
@@ -352,47 +434,78 @@ rc=$?
 # ----------------------------
 # Post-traitements sur OUT_DIR (NAS)
 # ----------------------------
+HOST_OUT_ROOT="/volume1/Affaires${OUT_ROOT#/data/Affaires}"
 HOST_OUT_DIR="/volume1/Affaires${OUT_DIR#/data/Affaires}"
 
 # 1) Normaliser les mtimes (pour éviter les inversions de sens côté rsync)
 #    Attention: on parenthèse bien les -o avec find
-find "$HOST_OUT_DIR" -type f \( -name "*.csv" -o -name "*.json" -o -name "*.docx" \) -print0 \
-  | xargs -0 -I{} touch -m "{}"
+if [[ -d "$HOST_OUT_DIR" ]]; then
+  find "$HOST_OUT_DIR" -type f \( -name "*.csv" -o -name "*.json" -o -name "*.docx" \) -print0 \
+    | xargs -0 -I{} touch -m "{}"
+fi
 
 # 2) Génération DOCX depuis global_final.json (sur le NAS)
 if [[ $rc -eq 0 ]]; then
-  echo "=== Génération DOCX ==="
+  echo "=== Rendu DOCX final via render_compte_rendu_from_infos.py ==="
 
-  HOST_OUT_JSON="${HOST_OUT_DIR}/global_final.json"
+  required_jsons=(global.json global_meeting.json global_by_sujet.json global_final.json)
+  mkdir -p "$HOST_OUT_ROOT"
+  for json_name in "${required_jsons[@]}"; do
+    src_json="${HOST_OUT_DIR}/${json_name}"
+    dst_json="${HOST_OUT_ROOT}/${json_name}"
+    if [[ ! -f "$src_json" ]]; then
+      echo "❌ ${json_name} introuvable dans le run isolé: $src_json"
+      rc=5
+      break
+    fi
+    cp -f "$src_json" "$dst_json"
+    touch -m "$dst_json"
+  done
 
-  ts_doc="$(date '+%Y%m%d_%H%M%S')"
-  DOCX_FILE="${HOST_OUT_DIR}/compte_rendu_${AFFAIRE_ID}_${CAPTATION_ID}_V_${ts_doc}.docx"
-  TMP_DOCX="${DOCX_FILE}.tmp"
+  HOST_OUT_JSON="${HOST_OUT_ROOT}/global_final.json"
+  PY_RENDER="${SCRIPT_DIR}/render_compte_rendu_from_infos.py"
 
   echo "Source JSON : $HOST_OUT_JSON"
-  echo "Destination : $DOCX_FILE"
+  echo "Render script : $PY_RENDER"
+  echo "PseudoJobId   : $PSEUDO_JOB_ID"
+  echo "Run output    : $HOST_OUT_DIR"
+  echo "Canonical dir : $HOST_OUT_ROOT"
 
-  if [[ -f "$HOST_OUT_JSON" ]]; then
-    curl -s -X POST "http://192.168.1.20:8081/render?format=docx" \
-         -H "Content-Type: application/json" \
-         --data-binary @"$HOST_OUT_JSON" \
-         -o "$TMP_DOCX"
-
-    if [[ -s "$TMP_DOCX" ]]; then
-      mv -f "$TMP_DOCX" "$DOCX_FILE"
-      touch -m "$DOCX_FILE"
-      echo "✅ DOCX généré avec succès"
-    else
-      echo "❌ Échec génération DOCX (tmp vide ou absent)"
-      rm -f "$TMP_DOCX" 2>/dev/null || true
-      rc=4
-    fi
-  else
+  if [[ $rc -ne 0 ]]; then
+    :
+  elif [[ ! -f "$HOST_OUT_JSON" ]]; then
     echo "❌ global_final.json introuvable"
-    rc=5
+    rc=6
+  elif [[ ! -f "$PY_RENDER" ]]; then
+    echo "❌ render_compte_rendu_from_infos.py introuvable"
+    rc=7
+  else
+    render_cmd=(python3 "$PY_RENDER"
+      --infos "$INFOS"
+      --global-final "$HOST_OUT_JSON"
+      --provider "$PROVIDER"
+      --model-pass1 "$MODEL_P1"
+      --model-pass2 "$MODEL_P2"
+      --model-pass3 "$MODEL_P3"
+    )
+
+    if [[ $PSEUDONYMIZE_REMOTE -eq 1 ]]; then
+      render_cmd+=(
+        --pseudo-job-id "$PSEUDO_JOB_ID"
+        --pseudo-api-base "$PSEUDO_API_BASE"
+        --pseudo-api-key "$PSEUDO_API_KEY"
+      )
+    else
+      render_cmd+=(--no-pseudonymize-remote)
+    fi
+
+    echo "=== Commande render final ==="
+    printf '%q ' "${render_cmd[@]}"
+    echo
+
+    "${render_cmd[@]}" || rc=$?
   fi
 fi
 
 echo "=== FIN (exit=$rc): $(date -Is) ==="
 exit $rc
-

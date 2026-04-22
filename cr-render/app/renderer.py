@@ -98,6 +98,74 @@ def add_text_as_paragraphs(doc, text: str, style: str | None = None):
             doc.add_paragraph(p)
 
 
+def coerce_text_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                result.append(text)
+        return result
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def coerce_history_items(value):
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def render_subject_history(doc, history_items):
+    items = coerce_history_items(history_items)
+    if not items:
+        return
+
+    doc.add_heading("Historique des visites", level=4)
+    for idx, visit in enumerate(items, start=1):
+        visite_id = str(visit.get("visite_id") or "").strip()
+        visite_date = format_date_fr(visit.get("date"))
+        label = f"Visite {idx}"
+        if visite_date:
+            label += f" - {visite_date}"
+        if visite_id:
+            label += f" ({visite_id})"
+        doc.add_paragraph(label)
+
+        resume = str(visit.get("resume_factuel") or visit.get("synthese_locale") or "").strip()
+        if resume:
+            add_text_as_paragraphs(doc, resume, style="Normal")
+
+        conclusion = str(visit.get("conclusion_locale") or "").strip()
+        if conclusion:
+            doc.add_paragraph("Conclusion locale :")
+            add_text_as_paragraphs(doc, conclusion, style="Normal")
+
+
+def render_subject_simple_list(doc, heading, values):
+    items = coerce_text_list(values)
+    if not items:
+        return
+
+    doc.add_heading(heading, level=4)
+    for item in items:
+        try:
+            doc.add_paragraph(item, style="Enum??ration")
+        except Exception:
+            doc.add_paragraph(item)
+
+
 def render_markdown(data: dict) -> str:
     md = []
     md.append("# Compte rendu\n")
@@ -369,6 +437,10 @@ def render_docx(data: dict) -> BytesIO:
             if ce:
                 doc.add_heading("Conclusion de l’expert", level=4)
                 add_text_as_paragraphs(doc, ce, style="Normal")
+
+            render_subject_history(doc, sujet.get("historique_visites"))
+            render_subject_simple_list(doc, "Actions restantes", sujet.get("actions_restantes"))
+            render_subject_simple_list(doc, "Documents encore attendus", sujet.get("documents_encore_attendus"))
 
             # Demandes par sujet
             dds = []

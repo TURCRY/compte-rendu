@@ -47,6 +47,11 @@ param(
 
 
   [string] $ApiKey     = "",
+  [switch] $PseudonymizeRemote,
+  [string] $PseudoApiBase = "",
+  [string] $PseudoApiKey = "",
+  [string] $PseudoJobId = "",
+  [string] $PseudoParticipantsPath = "",
 
   # Segmentation : preset + debug
   [ValidateSet("conservateur","equilibre","agressif")] [string] $Preset = "equilibre",
@@ -67,6 +72,7 @@ param(
 # Valeurs neutres pour éviter l’erreur en StrictMode
 $logsDir = $null
 $logFile = $null
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 # Lecture des sujets numérotés (Excel)
 # via ImportExcel module, ou CSV si tu convertis avant
@@ -78,6 +84,8 @@ if (-not (Test-Path $ParticipantsPath)) { throw "ParticipantsPath introuvable: $
 
 if ($SujetsPath) {
     $Sujets = Import-Excel -Path $SujetsPath
+    $sujetsImportedCount = @($Sujets).Count
+    Microsoft.PowerShell.Utility\Write-Host ("Référentiel sujets importé : {0} ligne(s)" -f $sujetsImportedCount)
 
     # Normalisation + typage + fallback titre
     $Sujets = $Sujets | ForEach-Object {
@@ -101,12 +109,19 @@ if ($SujetsPath) {
             Description  = ($_.Description  | ForEach-Object { $_ })
         }
     }
+    $sujetsNormalizedCount = @($Sujets).Count
+    Microsoft.PowerShell.Utility\Write-Host ("Référentiel sujets après normalisation : {0} ligne(s)" -f $sujetsNormalizedCount)
 
     $sujetsTotal = @($Sujets).Count
     $Sujets = @($Sujets | Where-Object { $null -ne $_ -and [int]$_.Numero -gt 0 })
+    $sujetsFilteredCount = @($Sujets).Count
+    Microsoft.PowerShell.Utility\Write-Host ("Référentiel sujets après filtre Numero > 0 : {0} ligne(s)" -f $sujetsFilteredCount)
     $sujetsRetires = $sujetsTotal - @($Sujets).Count
     if ($sujetsRetires -gt 0) {
-      Write-Warn ("R?f?rentiel sujets: {0} entr?e(s) <= 0 ignor?e(s) (sujet 0 supprim? en amont)." -f $sujetsRetires)
+      Write-Warning ("R?f?rentiel sujets: {0} entr?e(s) <= 0 ignor?e(s) (sujet 0 supprim? en amont)." -f $sujetsRetires)
+    }
+    if (-not $Sujets -or @($Sujets).Count -eq 0) {
+      throw "Référentiel sujets vide après lecture de Sujets.xlsx."
     }
 }
 
@@ -138,25 +153,35 @@ if ($Pass2BatchSize -lt 1) {
 }
 
 
-Write-Host "==== PARAMS PIPELINE ====" -ForegroundColor Cyan
-Write-Host ("Provider       = {0}" -f $Provider)
-Write-Host ("ApiBase        = {0}" -f $ApiBase)
-Write-Host ("Model          = {0}" -f $Model)
-Write-Host ("ModelPass1     = {0}" -f $ModelPass1)
-Write-Host ("ModelPass2     = {0}" -f $ModelPass2)
-Write-Host ("ModelPass2E    = {0}" -f $ModelPass2E)
-Write-Host ("ModelPass3     = {0}" -f $ModelPass3)
-Write-Host ("ModelPass3E    = {0}" -f $ModelPass3E)
-Write-Host ("ModelReport    = {0}" -f $ModelReport)
-Write-Host ("Pass2BatchSize = {0}" -f $Pass2BatchSize)
+Microsoft.PowerShell.Utility\Write-Host "==== PARAMS PIPELINE ====" -ForegroundColor Cyan
+Microsoft.PowerShell.Utility\Write-Host ("Provider       = {0}" -f $Provider)
+Microsoft.PowerShell.Utility\Write-Host ("ApiBase        = {0}" -f $ApiBase)
+Microsoft.PowerShell.Utility\Write-Host ("PseudonymizeRemote = {0}" -f $PseudonymizeRemote)
+if ($PseudoApiBase) {
+  Microsoft.PowerShell.Utility\Write-Host ("PseudoApiBase  = {0}" -f $PseudoApiBase)
+}
+if ($PseudonymizeRemote) {
+  Microsoft.PowerShell.Utility\Write-Host ("PseudoApiKeyLen = {0}" -f $PseudoApiKey.Length)
+  if ($PseudoParticipantsPath) {
+    Microsoft.PowerShell.Utility\Write-Host ("PseudoParticipantsPath = {0}" -f $PseudoParticipantsPath)
+  }
+}
+Microsoft.PowerShell.Utility\Write-Host ("Model          = {0}" -f $Model)
+Microsoft.PowerShell.Utility\Write-Host ("ModelPass1     = {0}" -f $ModelPass1)
+Microsoft.PowerShell.Utility\Write-Host ("ModelPass2     = {0}" -f $ModelPass2)
+Microsoft.PowerShell.Utility\Write-Host ("ModelPass2E    = {0}" -f $ModelPass2E)
+Microsoft.PowerShell.Utility\Write-Host ("ModelPass3     = {0}" -f $ModelPass3)
+Microsoft.PowerShell.Utility\Write-Host ("ModelPass3E    = {0}" -f $ModelPass3E)
+Microsoft.PowerShell.Utility\Write-Host ("ModelReport    = {0}" -f $ModelReport)
+Microsoft.PowerShell.Utility\Write-Host ("Pass2BatchSize = {0}" -f $Pass2BatchSize)
 
 
 if ($ApiKey) {
-    Write-Host ("ApiKeyLen  = {0}" -f $ApiKey.Length)
+    Microsoft.PowerShell.Utility\Write-Host ("ApiKeyLen  = {0}" -f $ApiKey.Length)
 } else {
-    Write-Host "ApiKey     = (VIDE)" -ForegroundColor Yellow
+    Microsoft.PowerShell.Utility\Write-Host "ApiKey     = (VIDE)" -ForegroundColor Yellow
 }
-Write-Host "=========================" -ForegroundColor Cyan
+Microsoft.PowerShell.Utility\Write-Host "=========================" -ForegroundColor Cyan
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -164,9 +189,116 @@ $ErrorActionPreference = "Stop"
 [int] $script:Pass2BatchIndex = 0
 
 
-function Write-Info($m){ Write-Host "[INFO]  $m" -ForegroundColor Cyan }
-function Write-Warn($m){ Write-Host "[WARN]  $m" -ForegroundColor Yellow }
-function Write-Err ($m){ Write-Host "[ERROR] $m" -ForegroundColor Red  }
+function Write-Host($m){ Microsoft.PowerShell.Utility\Write-Host "[INFO]  $m" -ForegroundColor Cyan }
+function Write-Warn($m){ Microsoft.PowerShell.Utility\Write-Host "[WARN]  $m" -ForegroundColor Yellow }
+function Write-Err ($m){ Microsoft.PowerShell.Utility\Write-Host "[ERROR] $m" -ForegroundColor Red  }
+
+function Assert-RemotePseudonymizationReady {
+  param([string] $ModelName)
+
+  if (-not $PseudonymizeRemote) { return }
+  if ($Provider -ine "openai") { return }
+  if (-not (([string]$ModelName).ToLower().Contains("remote"))) { return }
+  if ([string]::IsNullOrWhiteSpace($PseudoApiBase)) {
+    throw ("Pseudonymisation distante requise pour le modele '{0}' mais PseudoApiBase est vide." -f $ModelName)
+  }
+  if ([string]::IsNullOrWhiteSpace($PseudoApiKey)) {
+    throw ("Pseudonymisation distante requise pour le modele '{0}' mais PseudoApiKey / LOCAL_LLM_API_KEY est absent." -f $ModelName)
+  }
+  if ([string]::IsNullOrWhiteSpace($PseudoJobId)) {
+    throw ("Pseudonymisation distante requise pour le modele '{0}' mais PseudoJobId est absent." -f $ModelName)
+  }
+  if ([string]::IsNullOrWhiteSpace($PseudoParticipantsPath)) {
+    throw ("Pseudonymisation distante requise pour le modele '{0}' mais PseudoParticipantsPath est absent." -f $ModelName)
+  }
+}
+
+function Use-RemotePseudonymizationForModel {
+  param([string] $ModelName)
+
+  return (
+    $PseudonymizeRemote -and
+    $Provider -ieq "openai" -and
+    -not [string]::IsNullOrWhiteSpace($PseudoApiBase) -and
+    (([string]$ModelName).ToLower().Contains("remote"))
+  )
+}
+
+function Get-PseudoResponseText {
+  param(
+    [object] $Response,
+    [string] $PrimaryKey,
+    [string] $FallbackText
+  )
+
+  if (-not $Response) { return $FallbackText }
+
+  $prop = $Response.PSObject.Properties[$PrimaryKey]
+  if ($prop -and -not [string]::IsNullOrWhiteSpace([string]$prop.Value)) {
+    return [string]$prop.Value
+  }
+
+  $prop = $Response.PSObject.Properties["text"]
+  if ($prop -and -not [string]::IsNullOrWhiteSpace([string]$prop.Value)) {
+    return [string]$prop.Value
+  }
+
+  return $FallbackText
+}
+
+function Invoke-PseudoTransform {
+  param(
+    [string] $Route,
+    [string] $Text,
+    [string] $ModelName = ""
+  )
+
+  if (-not (Use-RemotePseudonymizationForModel -ModelName $ModelName)) { return $Text }
+  if ([string]::IsNullOrWhiteSpace($Text)) { return $Text }
+
+  Assert-RemotePseudonymizationReady -ModelName $ModelName
+
+  $uri = ($PseudoApiBase.TrimEnd('/')) + $Route
+  $bodyObj = @{
+    text = $Text
+    participants_path = $PseudoParticipantsPath
+    job_id = $PseudoJobId
+    mode = "compte_rendu"
+  }
+  $body = $bodyObj | ConvertTo-Json -Depth 20 -Compress
+  $headers = @{
+    "x-api-key" = $PseudoApiKey
+  }
+
+  try {
+    $resp = Invoke-RestMethod -Method POST -Uri $uri -Headers $headers -Body $body -ContentType "application/json" -TimeoutSec 300 -ErrorAction Stop
+  }
+  catch {
+    throw ("Pseudo transform failed route={0} model={1} job_id={2}: {3}" -f $Route, $ModelName, $PseudoJobId, $_)
+  }
+
+  if ($Route -eq "/pseudonymize") {
+    return (Get-PseudoResponseText -Response $resp -PrimaryKey "text_pseudonymized" -FallbackText $Text)
+  }
+
+  return (Get-PseudoResponseText -Response $resp -PrimaryKey "text_depseudonymized" -FallbackText $Text)
+}
+
+function Write-ArtifactText {
+  param(
+    [string] $Path,
+    [string] $Text,
+    [string] $ModelName = ""
+  )
+
+  $toWrite = if (Use-RemotePseudonymizationForModel -ModelName $ModelName) {
+    Invoke-PseudoTransform -Route "/pseudonymize" -Text $Text -ModelName $ModelName
+  } else {
+    $Text
+  }
+
+  [System.IO.File]::WriteAllText($Path, $toWrite, [System.Text.Encoding]::UTF8)
+}
 
 function Ensure-Dir($p){
     if (-not $p) { 
@@ -214,7 +346,7 @@ function Enforce-ContextLimit {
 
   $maxUserTokens = $available - $tokSys
   if($maxUserTokens -le 0){
-    Write-Warn ("{0}: contexte insuffisant (tokSys={1}, available={2}), user vidé." -f $Label,$tokSys,$available)
+    Write-Warning ("{0}: contexte insuffisant (tokSys={1}, available={2}), user vidé." -f $Label,$tokSys,$available)
     "WARN: $Label → prompt tronqué à 0 token (tokSys=$tokSys, available=$available, n_ctx=$nCtx, max_tokens=$maxTok)" | Add-Content $LogFile
     return ""
   }
@@ -239,7 +371,7 @@ function Enforce-ContextLimit {
   $tokUserNew  = Estimate-Tokens $truncated
   $tokTotalNew = $tokSys + $tokUserNew
 
-  Write-Warn ("{0}: prompt tronqué (approx {1}→{2} tokens, n_ctx={3}, max_tokens={4})" -f $Label,$tokTotal,$tokTotalNew,$nCtx,$maxTok)
+  Write-Warning ("{0}: prompt tronqué (approx {1}→{2} tokens, n_ctx={3}, max_tokens={4})" -f $Label,$tokTotal,$tokTotalNew,$nCtx,$maxTok)
   "WARN: $Label → prompt tronqué (total≈$tokTotal, après≈$tokTotalNew, available=$available, n_ctx=$nCtx, max_tokens=$maxTok)" | Add-Content $LogFile
 
   return $truncated
@@ -443,7 +575,17 @@ function Hms-To-Seconds([string]$hms){
   # Cas 3 : HH:MM:SS ou MM:SS
   if($p.Count -lt 2){ return 0 }
   if($p.Count -eq 2){ $p = @("0") + $p }
-  return [int]$p[0]*3600 + [int]$p[1]*60 + [int][double](($p[2] -replace ',', '.'))
+  $hh = [int]$p[0]
+  $mm = [int]$p[1]
+  $ss = [int][double](($p[2] -replace ',', '.'))
+
+  # Tolérance à un ancien format erroné de type HH:MM:SS où MM contenait déjà
+  # le total de minutes (ex: 01:60:40 au lieu de 01:00:40).
+  if($mm -ge 60 -and $hh -ge 0 -and [int]($mm / 60) -eq $hh){
+    $mm = $mm % 60
+  }
+
+  return $hh*3600 + $mm*60 + $ss
 }
 
 
@@ -601,7 +743,10 @@ function Update-ContexteGeneralFromCsv {
   $durationSec = [int][math]::Max(0, [math]::Ceiling($maxTime - $minStart))
   $maxSecInt   = [int][math]::Ceiling($maxTime)
 
-  $ctx = Get-Content -Raw -Encoding UTF8 $ContexteJsonPath | ConvertFrom-Json
+  Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Avant lecture / mise à jour du contexte JSON : {0}" -f $ContexteJsonPath) -ForegroundColor Yellow
+  $ctxRaw = Get-Content -Raw -Encoding UTF8 $ContexteJsonPath
+  $ctx = $ctxRaw | ConvertFrom-Json
+  Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Après ConvertFrom-Json : chars={0}" -f $ctxRaw.Length) -ForegroundColor Yellow
 
   if (-not $ctx.PSObject.Properties['meta'] -or $null -eq $ctx.meta) {
     $ctx | Add-Member -Force NoteProperty meta ([pscustomobject]@{})
@@ -623,7 +768,8 @@ function Update-ContexteGeneralFromCsv {
   $ctx | Add-Member -Force NoteProperty csv_max_end_sec             $maxSecInt
 
   $jsonOut = $ctx | ConvertTo-Json -Depth 30
-  [System.IO.File]::WriteAllText($ContexteJsonPath, $jsonOut, [System.Text.Encoding]::UTF8)
+  [System.IO.File]::WriteAllText($ContexteJsonPath, $jsonOut, $utf8NoBom)
+  Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Après écriture du contexte mis à jour : {0}" -f $ContexteJsonPath) -ForegroundColor Yellow
 
   return [pscustomobject]@{
     durationSec = $durationSec
@@ -842,8 +988,8 @@ function Invoke-LLM-OpenAICompat {
   $body = $bodyObj | ConvertTo-Json -Depth 20 -Compress
 
   if ($DebugHttp) {
-    Write-Host ("[LLM] POST {0}" -f $uri)
-    Write-Host ("[LLM] model={0} bodyChars={1}" -f $model, $body.Length)
+    Microsoft.PowerShell.Utility\Write-Host ("[LLM] POST {0}" -f $uri)
+    Microsoft.PowerShell.Utility\Write-Host ("[LLM] model={0} bodyChars={1}" -f $model, $body.Length)
   }
 
   for ($t = 1; $t -le $MaxTry; $t++) {
@@ -879,8 +1025,8 @@ function Invoke-LLM-OpenAICompat {
       }
 
       if ($DebugHttp) {
-        Write-Host ("[LLM] ERROR try {0}/{1} status={2} msg={3}" -f $t, $MaxTry, $status, $msg)
-        if ($errBody) { Write-Host ("[LLM] ERROR body: {0}" -f $errBody) }
+        Microsoft.PowerShell.Utility\Write-Host ("[LLM] ERROR try {0}/{1} status={2} msg={3}" -f $t, $MaxTry, $status, $msg)
+        if ($errBody) { Microsoft.PowerShell.Utility\Write-Host ("[LLM] ERROR body: {0}" -f $errBody) }
       }
 
       Write-Warning ("LLM échec try {0}/{1} (status={2}) : {3}" -f $t, $MaxTry, $status, $msg)
@@ -995,8 +1141,16 @@ function Invoke-LLM {
     [switch] $DebugHttp
   )
 
+  $systemToSend = $system
+  $userToSend   = $user
+
+  if (Use-RemotePseudonymizationForModel -ModelName $model) {
+    $systemToSend = Invoke-PseudoTransform -Route "/pseudonymize" -Text $system -ModelName $model
+    $userToSend   = Invoke-PseudoTransform -Route "/pseudonymize" -Text $user -ModelName $model
+  }
+
   if($Provider -ieq "openai"){
-    return Invoke-LLM-OpenAICompat -system $system -user $user -model $model -DebugHttp:$DebugHttp
+    return Invoke-LLM-OpenAICompat -system $systemToSend -user $userToSend -model $model -DebugHttp:$DebugHttp
   } else {
     return Invoke-LLM-OllamaNative -system $system -user $user -model $model
   }
@@ -1209,7 +1363,7 @@ function Truncate-For-Context {
 
   $truncatedUser = $head + $marker + $tail
 
-  Write-Warn ("Prompt tronqué (Pass 3) : approx sys={0} tok, user={1}→{2} tok, n_ctx={3}, max_tokens={4}, available={5} (HEAD+TAIL {6}/{7} chars)" -f $sysTok,$usrTok,$maxUserTokens,$NCtx,$MaxTokens,$available,$headLen,$tailLen)
+  Write-Warning ("Prompt tronqué (Pass 3) : approx sys={0} tok, user={1}→{2} tok, n_ctx={3}, max_tokens={4}, available={5} (HEAD+TAIL {6}/{7} chars)" -f $sysTok,$usrTok,$maxUserTokens,$NCtx,$MaxTokens,$available,$headLen,$tailLen)
 
   return $truncatedUser
 }
@@ -1219,10 +1373,17 @@ function Truncate-For-Context {
 #------------------------------------------------------------
 
 # maxSec = max(end) si end existe et est non vide, sinon max(start)
+Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Début calcul durée max / lecture CSV : {0}" -f $CsvPath) -ForegroundColor Yellow
 $rows = Import-Csv $csvPath -Delimiter ';'
+Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Après Import-Csv : rows={0}" -f @($rows).Count) -ForegroundColor Yellow
 
 $maxSec = 0
+$maxSecLoopIndex = 0
 foreach($r in $rows){
+  $maxSecLoopIndex++
+  if (($maxSecLoopIndex % 200) -eq 0) {
+    Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] boucle maxSec : i={0}" -f $maxSecLoopIndex) -ForegroundColor Yellow
+  }
   if(-not $r.start){ continue }
 
   $s = To-SecondsSafe ([string]$r.start)
@@ -1235,31 +1396,43 @@ foreach($r in $rows){
 
   if($cand -gt $maxSec){ $maxSec = $cand }
 }
+Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Après boucle maxSec : maxSec={0}" -f $maxSec) -ForegroundColor Yellow
 
 $maxSecInt = [int][math]::Ceiling($maxSec)
+Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Avant conversion maxSec -> HH:MM:SS : maxSecInt={0}" -f $maxSecInt) -ForegroundColor Yellow
 $maxHms    = Seconds-To-Hms $maxSecInt
+Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Après conversion maxSec -> HH:MM:SS : maxHms={0}" -f $maxHms) -ForegroundColor Yellow
 
-Write-Info "Durée max détectée (sec) = $maxSecInt ; HH:MM:SS = $maxHms"
+Microsoft.PowerShell.Utility\Write-Host ("Durée max détectée (sec) = {0} ; HH:MM:SS = {1}" -f $maxSecInt, $maxHms)
 
 # ---- Charger contexte_general.json, injecter, réécrire ----
+Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Fin calcul durée max : rows={0} ; maxSec={1} ; maxHms={2}" -f @($rows).Count, $maxSecInt, $maxHms) -ForegroundColor Yellow
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step A2 - avant log fin calcul durée max" -ForegroundColor Yellow
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step B - avant résolution contextePath" -ForegroundColor Yellow
 $contextePath = $ContextJsonPath
+Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] step C - contextePath résolu : {0}" -f $contextePath) -ForegroundColor Yellow
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step D - avant test présence contextePath / Test-Path" -ForegroundColor Yellow
 if ($contextePath -and (Test-Path $contextePath)) {
+    Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step E - avant appel Update-ContexteGeneralFromCsv" -ForegroundColor Yellow
     $ctxUpdate = Update-ContexteGeneralFromCsv `
         -CsvPath $CsvPath `
         -ContexteJsonPath $contextePath `
         -StartCol "start" `
         -EndCol "end"
 
-    Write-Info ("Contexte mis à jour : duree_reunion_estimee_sec={0} ; duree_reunion_estimee_hms={1}" -f `
+    Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step E2 - retour Update-ContexteGeneralFromCsv" -ForegroundColor Yellow
+
+    Microsoft.PowerShell.Utility\Write-Host ("Contexte mis à jour : duree_reunion_estimee_sec={0} ; duree_reunion_estimee_hms={1}" -f `
         $ctxUpdate.durationSec, $ctxUpdate.durationHms)
 }
 else {
-    Write-Info "Contexte non mis à jour : ContextJsonPath absent ou introuvable."
+    Microsoft.PowerShell.Utility\Write-Host "Contexte non mis à jour : ContextJsonPath absent ou introuvable."
 }
 
 #------------------------------------------------------------
 # ── Prompts debrief expert Passe 1B ─────────────────────────────────────────
 #------------------------------------------------------------
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F01 - avant BaseDebrief_System" -ForegroundColor Yellow
 $BaseDebrief_System = @'
 Tu es un expert judiciaire relisant ta propre transcription de DÉBRIEF.
 
@@ -1324,6 +1497,7 @@ Sortie STRICTEMENT JSON :
 }
 '@
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F02 - avant branche Debrief_System selon GlobalContext" -ForegroundColor Yellow
 if ($GlobalContext) {
     $Debrief_System = @"
 $ContextSystem
@@ -1338,6 +1512,7 @@ else {
     $Debrief_System = $BaseDebrief_System
 }
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F03 - avant branche Debrief_User_Template selon ContextUser" -ForegroundColor Yellow
 if ($ContextUser) {
     $Debrief_User_Template = @"
 Contexte général de l’affaire (ne pas réécrire, ne pas inventer d’éléments nouveaux) :
@@ -1372,6 +1547,7 @@ Renvoie uniquement le JSON conforme au schéma.
 #------------------------------------------------------------
 # Passe 1 
 #------------------------------------------------------------
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F04 - avant BasePass1_System" -ForegroundColor Yellow
 $BasePass1_System = @'
 Tu es un assistant d’analyse judiciaire.
 
@@ -1411,6 +1587,7 @@ Tu dois répondre STRICTEMENT en JSON avec ce schéma :
   }
 }
 '@
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F05 - avant branche Pass1_System selon GlobalContext" -ForegroundColor Yellow
 if ($GlobalContext) {
     $Pass1_System = @"
 $ContextSystem
@@ -1426,6 +1603,7 @@ else {
     $Pass1_System = $BasePass1_System
 }
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F06 - avant branche Pass1_User_Template selon ContextUser" -ForegroundColor Yellow
 if ($ContextUser) {
     $Pass1_User_Template = @"
 Contexte général de l’affaire (ne pas le réécrire, ne pas inventer d’éléments nouveaux) :
@@ -1466,6 +1644,7 @@ Renvoie uniquement le JSON conforme au schéma.
 #--------------------------------------------------------
 # Passe 2
 #--------------------------------------------------------
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F07 - avant BasePass2_System" -ForegroundColor Yellow
 $BasePass2_System=@'
 Tu reçois plusieurs mini-CR JSON d'une même réunion. Fusionne-les en un seul JSON cohérent,
 sans doublons, en regroupant les thèmes similaires.
@@ -1494,6 +1673,7 @@ Règles :
 - en cas de conflit sur une date : retenir la date la plus précise.
 - pas d’invention : si incertain → null / [].
 '@
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F08 - avant branche Pass2_System selon GlobalContext" -ForegroundColor Yellow
 if ($GlobalContext) {
     $Pass2_System = @"
 $ContextSystem
@@ -1509,6 +1689,7 @@ else {
     $Pass2_System = $BasePass2_System
 }
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F09 - avant Pass2_User_Template" -ForegroundColor Yellow
 $Pass2_User_Template=@'
 Voici la liste des mini-CR JSON à fusionner (tableau JSON) :
 
@@ -1521,6 +1702,7 @@ Renvoie uniquement le JSON conforme au schéma.
 # ── Pass2B : construire un GLOBAL "réunion" (resume/themes/actions/problems) depuis global.json ──
 # ── Pass2B : GLOBAL "réunion" enrichi ──
 #------------------------------------------------------------
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F10 - avant BasePass2B_System" -ForegroundColor Yellow
 $BasePass2B_System = @'
 Tu reçois une LISTE JSON de segments annotés, sous la forme :
 [
@@ -1572,6 +1754,7 @@ Règles :
 '@
 
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F11 - avant branche Pass2B_System selon GlobalContext" -ForegroundColor Yellow
 if ($GlobalContext) {
   $Pass2B_System = @"
 $ContextSystem
@@ -1586,6 +1769,7 @@ $BasePass2B_System
   $Pass2B_System = $BasePass2B_System
 }
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F12 - avant Pass2B_User_Template" -ForegroundColor Yellow
 $Pass2B_User_Template = @'
 Voici la LISTE des segments annotés :
 
@@ -1596,6 +1780,7 @@ Renvoie uniquement le JSON "global réunion" conforme au schéma.
 
 
 # agregation hierarchique
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F13 - avant définition fonction Aggregate-Sujets" -ForegroundColor Yellow
 function Aggregate-Sujets {
   param(
     [object[]] $Segments,
@@ -1676,6 +1861,7 @@ function Aggregate-Sujets {
   return $bySujet
 }
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F14 - avant définition fonction Inject-DebriefIntoBySujet" -ForegroundColor Yellow
 function Inject-DebriefIntoBySujet {
   param(
     [Parameter(Mandatory=$true)] [hashtable] $BySujet,
@@ -1747,6 +1933,7 @@ function Inject-DebriefIntoBySujet {
   # Elles doivent rester dans globalMeetingMerged.demandes_documents_globales (Pass3D).
 }
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F15 - avant définition fonction Invoke-Pass2Fusion" -ForegroundColor Yellow
 function Invoke-Pass2Fusion {
     param(
         [object[]] $SegmentBatch,  # petit groupe de mini-CR
@@ -1859,7 +2046,7 @@ function Invoke-Pass2Fusion {
 
     if ($inputRich -gt 0 -and $resultEmpty) {
         # Cas anormal : le LLM a "tout vidé"
-        Write-Warn "Invoke-Pass2Fusion: résultat vide alors que le batch contenait des données. Fallback sur une fusion simple."
+        Write-Warning "Invoke-Pass2Fusion: résultat vide alors que le batch contenait des données. Fallback sur une fusion simple."
 
         # Fallback minimal : on concatène les champs des objets du batch
         $fallback = [pscustomobject]@{
@@ -1892,6 +2079,7 @@ function Invoke-Pass2Fusion {
 }
 
 #----------------------------------------------------
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F16 - avant définition fonction Aggregate-Segments-Hierarchical" -ForegroundColor Yellow
 function Aggregate-Segments-Hierarchical {
     param(
         [object[]] $SegmentsObjs,
@@ -1907,7 +2095,7 @@ function Aggregate-Segments-Hierarchical {
     $round   = 1
 
     while($current.Count -gt 1){
-        Write-Info ("Passe 2 (round {0}) → {1} objets à fusionner" -f $round, $current.Count)
+        Microsoft.PowerShell.Utility\Write-Host ("Passe 2 (round {0}) → {1} objets à fusionner" -f $round, $current.Count)
         $next = New-Object System.Collections.Generic.List[object]
 
         for($i=0; $i -lt $current.Count; $i += $BatchSize){
@@ -1930,6 +2118,7 @@ function Aggregate-Segments-Hierarchical {
 #------------------------------------------------------------
 # 3A : métadonnées et résumé global
 #------------------------------------------------------------
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F17 - avant BasePass3A_System" -ForegroundColor Yellow
 $BasePass3A_System = @'
 Tu reçois :
 (1) un contexte général d’expertise judiciaire (mission, état d’avancement, cadre procédural),
@@ -1997,6 +2186,7 @@ Contraintes de sortie :
 - JSON strict uniquement, conforme au schéma ci-dessus.
 '@
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F18 - avant branche Pass3A_System selon GlobalContext" -ForegroundColor Yellow
 if ($GlobalContext) {
     $Pass3A_System = @"
 $ContextSystem
@@ -2012,6 +2202,7 @@ $BasePass3A_System
 else {
     $Pass3A_System = $BasePass3A_System
 }
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F19 - avant Pass3A_User_Template" -ForegroundColor Yellow
 $Pass3A_User_Template = @'
 Voici le JSON global issu de la fusion des segments :
 {GLOBAL_JSON}
@@ -2035,6 +2226,7 @@ Renvoie uniquement le JSON.
 #------------------------------------------------------------
 # 3B : thèmes_abordes
 #------------------------------------------------------------
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F20 - avant BasePass3B_System" -ForegroundColor Yellow
 $BasePass3B_System = @'
 Tu reçois le JSON "global" d'une réunion.
 
@@ -2070,6 +2262,7 @@ Normalisation des dates (obligatoire) :
 
 '@
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F21 - avant branche Pass3B_System selon GlobalContext" -ForegroundColor Yellow
 if ($GlobalContext) {
     $Pass3B_System = @"
 $ContextSystem
@@ -2086,6 +2279,7 @@ else {
     $Pass3B_System = $BasePass3B_System
 }
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F22 - avant Pass3B_User_Template" -ForegroundColor Yellow
 $Pass3B_User_Template = @'
 Voici le JSON global issu de la fusion des segments :
 
@@ -2099,6 +2293,7 @@ Renvoie uniquement le JSON conforme au schéma.
 #------------------------------------------------------------
 # 3C : actions / perspectives / annexes
 #------------------------------------------------------------
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F23 - avant BasePass3C_System" -ForegroundColor Yellow
 $BasePass3C_System = @'
 Tu reçois le JSON "global" d'une réunion.
 
@@ -2139,6 +2334,7 @@ Normalisation des dates (obligatoire) :
 - Si une date est mentionnée en texte (exception), utiliser "D mois YYYY".
 
 '@
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F24 - avant branche Pass3C_System selon GlobalContext" -ForegroundColor Yellow
 if ($GlobalContext) {
     $Pass3C_System = @"
 $ContextSystem
@@ -2155,6 +2351,7 @@ else {
     $Pass3C_System = $BasePass3C_System
 }
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F25 - avant Pass3C_User_Template" -ForegroundColor Yellow
 $Pass3C_User_Template = @'
 Voici le JSON global issu de la fusion des segments :
 
@@ -2173,6 +2370,7 @@ Renvoie uniquement le JSON conforme au schéma.
 
 
 # Passe 3 → JSON final (structure CR complète, sans Markdown)
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F26 - avant BasePass3_System" -ForegroundColor Yellow
 $BasePass3_System = @'
 Tu es un expert judiciaire chargé de produire un rapport structuré par SUJET NUMÉROTÉ.
 
@@ -2250,6 +2448,7 @@ Règles :
 
 
 '@
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F27 - avant branche Pass3_System selon GlobalContext" -ForegroundColor Yellow
 if ($GlobalContext) {
     $Pass3_System = @"
 $ContextSystem
@@ -2266,6 +2465,7 @@ else {
     $Pass3_System = $BasePass3_System
 }
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F28 - avant branche Pass3_User_Template selon ContextUser" -ForegroundColor Yellow
 if ($ContextUser) {
     $Pass3_User_Template = @"
 Contexte général de l’affaire (ne pas réécrire, ne pas inventer d’éléments nouveaux) :
@@ -2310,6 +2510,7 @@ Renvoie uniquement le JSON.
 
 # ── Passe 3E : synthèse PAR SUJET (1 sujet = 1 appel LLM) ─────────────────────
 # Objectif : limiter le contexte et favoriser les SLM locaux.
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F29 - avant BasePass3E_System" -ForegroundColor Yellow
 $BasePass3E_System = @'
 Tu es un expert judiciaire chargé de produire une synthèse structurée pour UN SEUL sujet numéroté.
 
@@ -2362,6 +2563,7 @@ Un résumé ou une conclusion rédigé en un seul paragraphe sera considéré co
 
 '@
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F30 - avant branche Pass3E_System selon GlobalContext" -ForegroundColor Yellow
 if ($GlobalContext) {
     $Pass3E_System = @"
 $ContextSystem
@@ -2377,6 +2579,7 @@ else {
     $Pass3E_System = $BasePass3E_System
 }
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F31 - avant Pass3E_User_Template" -ForegroundColor Yellow
 $Pass3E_User_Template = @'
 Sujet :
 {SUJET_META_JSON}
@@ -2393,6 +2596,7 @@ Renvoie uniquement le JSON conforme au schéma.
 '@
 
 # ── Passe 2E : condensation intermédiaire par sujet ───────────────────────────
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F32 - avant BasePass2E_System" -ForegroundColor Yellow
 $BasePass2E_System = @'
 Tu es un assistant chargé de produire une synthèse intermédiaire STRICTEMENT factuelle
 pour un bloc d’interventions rattachées à un sujet d’expertise judiciaire.
@@ -2439,6 +2643,7 @@ Contraintes de rédaction :
 - les listes doivent être brèves, sans doublons, sans invention.
 '@
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F33 - avant branche Pass2E_System selon GlobalContext" -ForegroundColor Yellow
 if ($GlobalContext) {
     $Pass2E_System = @"
 $ContextSystem
@@ -2455,6 +2660,7 @@ else {
 }
 
 # 3D : demandes de documents
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F34 - avant BasePass3D_System" -ForegroundColor Yellow
 $BasePass3D_System = @'
 Tu reçois le JSON "global" d'une réunion d’expertise judiciaire.
 
@@ -2490,6 +2696,7 @@ Normalisation des dates (obligatoire) :
 
 
 '@
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F35 - avant branche Pass3D_System selon GlobalContext" -ForegroundColor Yellow
 if ($GlobalContext) {
     $Pass3D_System = @"
 $ContextSystem
@@ -2506,6 +2713,7 @@ else {
     $Pass3D_System = $BasePass3D_System
 }
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F36 - avant Pass3D_User_Template" -ForegroundColor Yellow
 $Pass3D_User_Template = @'
 Voici le JSON global issu de la fusion des segments :
 
@@ -2514,6 +2722,7 @@ Voici le JSON global issu de la fusion des segments :
 Renvoie uniquement un JSON contenant le champ "demandes_documents_globales".
 '@
 
+Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F37 - avant MergeGlobal_System" -ForegroundColor Yellow
 $MergeGlobal_System = @'
 Tu reçois TROIS objets JSON :
 - "sujets" : dictionnaire { "<numero>": [ {timecode,auteur,role,texte,segment_id}, ... ] } issu de la Passe 2A (référence factuelle)
@@ -2556,10 +2765,12 @@ function Get-IntelligentSegments {
         [int] $ChunkSize = 30   # valeur par défaut
     )
 
+    Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Entrée Get-IntelligentSegments : rows={0} ; chunkSize={1}" -f @($rows).Count, $ChunkSize) -ForegroundColor Yellow
     $segments = New-Object System.Collections.Generic.List[object]
 
     $total = $rows.Count
     if ($total -eq 0) {
+        Microsoft.PowerShell.Utility\Write-Host "[DEBUG] Sortie Get-IntelligentSegments : aucun row, retour vide" -ForegroundColor Yellow
         return @()
     }
 
@@ -2574,10 +2785,13 @@ function Get-IntelligentSegments {
     }
 
     if ($logPath) {
+        Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Avant écriture log segmentation : {0}" -f $logPath) -ForegroundColor Yellow
         $txt = "Segments (ChunkSize=$ChunkSize) générés : $($segments.Count)"
         [System.IO.File]::WriteAllText($logPath, $txt, [System.Text.Encoding]::UTF8)
+        Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Après écriture log segmentation : {0}" -f $logPath) -ForegroundColor Yellow
     }
 
+    Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Sortie Get-IntelligentSegments : segments={0}" -f $segments.Count) -ForegroundColor Yellow
     return $segments
 }
 
@@ -2592,7 +2806,8 @@ $txt = "Start: $(Get-Date)"
 [System.IO.File]::WriteAllText($logFile, $txt, [System.Text.Encoding]::UTF8)
 
 
-Write-Info "Lecture CSV: $CsvPath"
+Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Début chargement transcription / segmentation : {0}" -f $CsvPath) -ForegroundColor Yellow
+Microsoft.PowerShell.Utility\Write-Host "Lecture CSV: $CsvPath"
 
 # passe 0+1 technique
 
@@ -2608,7 +2823,14 @@ if(-not $colSpeaker -or -not $colTime -or -not $colText){
     throw "Colonnes attendues : start / end / speaker / text (au minimum start, speaker, text)."
 }
 
-$rows = $rows | ForEach-Object { $_ | Add-Member -NotePropertyName __sec -NotePropertyValue (Hms-To-Seconds $_.$colTime) -Force; $_ } | Sort-Object __sec
+Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Avant enrichissement __sec / tri : rows={0}" -f @($rows).Count) -ForegroundColor Yellow
+$rows = $rows | ForEach-Object {
+    $sec = Hms-To-Seconds $_.$colTime
+    $_ | Add-Member -NotePropertyName __sec -NotePropertyValue $sec -Force
+    $_ | Add-Member -NotePropertyName __time_hms -NotePropertyValue (Seconds-To-Hms $sec) -Force
+    $_
+} | Sort-Object __sec
+Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Après enrichissement __sec / tri : rows={0}" -f @($rows).Count) -ForegroundColor Yellow
 if($rows.Count -eq 0){ throw "CSV vide." }
 
 
@@ -2639,6 +2861,7 @@ if ($Provider -ieq "openai" -and $ModelPass1 -eq "annoter_segments_remote") {
 }
 
 $segLog  = Join-Path $logsDir "segments_debug.log"
+Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Avant appel Get-IntelligentSegments : rows={0} ; chunkSize={1} ; segLog={2}" -f @($rows).Count, $ChunkSize, $segLog) -ForegroundColor Yellow
 $segments = Get-IntelligentSegments `
     -rows       $rows `
     -colTime    $colTime `
@@ -2647,11 +2870,13 @@ $segments = Get-IntelligentSegments `
     -logPath    $segLog `
     -ChunkSize  $ChunkSize
 
-Write-Info ("Nombre de segments (ChunkSize={0}) : {1}" -f $ChunkSize, $segments.Count)
-if($SegDebug){ Write-Info ("Log segmentation → $segLog") }
+Microsoft.PowerShell.Utility\Write-Host ("Nombre de segments (ChunkSize={0}) : {1}" -f $ChunkSize, $segments.Count)
+Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Fin segmentation : rows={0} ; segments={1} ; chunkSize={2}" -f @($rows).Count, @($segments).Count, $ChunkSize) -ForegroundColor Yellow
+if($SegDebug){ Microsoft.PowerShell.Utility\Write-Host ("Log segmentation → $segLog") }
 
 # ── Passe 1A : mini-CR par segment (JSON strict) ───────────────────────────────
 $segmentJsonPaths = New-Object System.Collections.Generic.List[object]
+Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Début première passe 1A : segments={0}" -f @($segments).Count) -ForegroundColor Yellow
 
 for($i=0; $i -lt $segments.Count; $i++){
     $seg = $segments[$i]
@@ -2660,16 +2885,17 @@ for($i=0; $i -lt $segments.Count; $i++){
     $endH   = Seconds-To-Hms ($seg[-1].__sec)
 
     if((Test-Path $segOut) -and (-not $Force)){
-        Write-Info "Skip segment $($i+1) (existe) → $segOut"
+        Microsoft.PowerShell.Utility\Write-Host "Skip segment $($i+1) (existe) → $segOut"
         $segmentJsonPaths.Add($segOut)
         continue
     }
 
-    Write-Info ("Passe 1A → Segment {0:D2}  [{1} → {2}]" -f ($i+1), $startH, $endH)
+    Microsoft.PowerShell.Utility\Write-Host ("Passe 1A → Segment {0:D2}  [{1} → {2}]" -f ($i+1), $startH, $endH)
 
     # Construction du prompt utilisateur brut
     $lines = $seg | ForEach-Object {
-        "[{0}] {1}: {2}" -f $_.$colTime, $_.$colSpeaker, $_.$colText
+        $lineTime = if ($_.PSObject.Properties['__time_hms'] -and $_.__time_hms) { $_.__time_hms } else { [string]$_.$colTime }
+        "[{0}] {1}: {2}" -f $lineTime, $_.$colSpeaker, $_.$colText
     } | Out-String
 
     $sujetsJson       = ($Sujets | ConvertTo-Json -Depth 10)
@@ -2710,7 +2936,7 @@ for($i=0; $i -lt $segments.Count; $i++){
       $raw = Invoke-LLM -system $Pass1_System -user $userPrompt_Effective -model $ModelPass1 -DebugHttp:$DebugHttp
     }
     catch {
-      Write-Warn ("Segment {0:D2} : Invoke-LLM a échoué ({1}) → JSON minimal." -f ($i+1), $_.Exception.Message)
+      Write-Warning ("Segment {0:D2} : Invoke-LLM a échoué ({1}) → JSON minimal." -f ($i+1), $_.Exception.Message)
 
       $fallbackObj = [pscustomobject]@{
           segment_id = ("segment_{0:D2}" -f ($i+1))
@@ -2739,7 +2965,7 @@ for($i=0; $i -lt $segments.Count; $i++){
 
     # Garde-fou : réponse vide
     if (-not $raw -or $raw.Trim() -eq "") {
-      Write-Warn ("Segment {0:D2} : réponse vide → JSON minimal." -f ($i+1))
+      Write-Warning ("Segment {0:D2} : réponse vide → JSON minimal." -f ($i+1))
 
       $fallbackObj = [pscustomobject]@{
           segment_id = ("segment_{0:D2}" -f ($i+1))
@@ -2811,10 +3037,10 @@ $Global:DebriefObj = $null
 $DebriefObj = $null
 
 if ($CsvDebriefPath) {
-    Write-Info "Passe 1B → Analyse du débrief expert : $CsvDebriefPath"
+    Microsoft.PowerShell.Utility\Write-Host "Passe 1B → Analyse du débrief expert : $CsvDebriefPath"
 
     if (!(Test-Path $CsvDebriefPath)) {
-        Write-Warn "CsvDebriefPath indiqué mais fichier introuvable : $CsvDebriefPath"
+        Write-Warning "CsvDebriefPath indiqué mais fichier introuvable : $CsvDebriefPath"
         $Global:DebriefObj = $DebriefObj
     }
     else {
@@ -2827,7 +3053,7 @@ if ($CsvDebriefPath) {
 
         # Vérif minimale
         if (-not $rowsDebrief -or $rowsDebrief.Count -eq 0) {
-            Write-Warn "Débrief : CSV vide, aucune analyse effectuée."
+            Write-Warning "Débrief : CSV vide, aucune analyse effectuée."
             $Global:DebriefObj = $DebriefObj
 
         }
@@ -2859,17 +3085,9 @@ if ($CsvDebriefPath) {
             $debriefPromptPath = Join-Path $logsDir "debrief_prompt.txt"
             $debriefSystemPath = Join-Path $logsDir "debrief_system.txt"
 
-            [System.IO.File]::WriteAllText(
-                $debriefPromptPath,
-                $debriefUser,
-                [System.Text.Encoding]::UTF8
-            )
+            Write-ArtifactText -Path $debriefPromptPath -Text $debriefUser -ModelName $ModelReport
 
-            [System.IO.File]::WriteAllText(
-                $debriefSystemPath,
-                $Debrief_System,
-                [System.Text.Encoding]::UTF8
-            )
+            Write-ArtifactText -Path $debriefSystemPath -Text $Debrief_System -ModelName $ModelReport
             # Contrôle n_ctx
             $debriefUser_Effective = Enforce-ContextLimit `
                 -SystemPrompt $Debrief_System `
@@ -2879,25 +3097,17 @@ if ($CsvDebriefPath) {
                 -ModelName    $ModelReport
 
             $debriefEffPath = Join-Path $logsDir "debrief_prompt_effective.txt"
-            [System.IO.File]::WriteAllText(
-                $debriefEffPath,
-                $debriefUser_Effective,
-                [System.Text.Encoding]::UTF8
-            )
+            Write-ArtifactText -Path $debriefEffPath -Text $debriefUser_Effective -ModelName $ModelReport
 
             # Appel LLM (on utilise le modèle "remote" de passe 3 pour ce travail global)
             $debriefRaw = Invoke-LLM -system $Debrief_System -user $debriefUser_Effective -model $ModelReport -DebugHttp:$DebugHttp
-            [System.IO.File]::WriteAllText(
-                (Join-Path $logsDir "debrief_raw.txt"),
-                $debriefRaw,
-                [System.Text.Encoding]::UTF8
-            ) 
+            Write-ArtifactText -Path (Join-Path $logsDir "debrief_raw.txt") -Text $debriefRaw -ModelName $ModelReport
 
             try {
                 $DebriefObj = Parse-LlmJsonStrict -RawText $debriefRaw -Label "Debrief" -LogFile $logFile
             }
             catch {
-                Write-Warn "Échec parsing JSON Débrief, fallback sujet/demandes vides."
+                Write-Warning "Échec parsing JSON Débrief, fallback sujet/demandes vides."
                 $DebriefObj = [pscustomobject]@{
                     sujets                       = @()
                     demandes_documents_hors_sujet = @()
@@ -2921,14 +3131,14 @@ if ($CsvDebriefPath) {
                 [System.Text.Encoding]::UTF8
             )
 
-            Write-Info "Débrief expert analysé → $debriefPath"
+            Microsoft.PowerShell.Utility\Write-Host "Débrief expert analysé → $debriefPath"
             $Global:DebriefObj = $DebriefObj
             # On garde aussi en global pour éventuelle réutilisation en Passe 3
         }
     }
 }
 else {
-    Write-Info "Passe 1B ignorée (aucun CsvDebriefPath fourni)."
+    Microsoft.PowerShell.Utility\Write-Host "Passe 1B ignorée (aucun CsvDebriefPath fourni)."
 }
 
 # Alias local (si vous souhaitez n'utiliser que $DebriefObj ensuite)
@@ -2936,7 +3146,7 @@ $DebriefObj = $Global:DebriefObj # optionnel, mais alors vous n'utilisez plus qu
 
 
 # ── Passe 2A : agrégation par sujet (JSON strict) ─────────────────────────────
-Write-Info "Passe 2A → Agrégation par sujet"
+Microsoft.PowerShell.Utility\Write-Host "Passe 2A → Agrégation par sujet"
 
 # Chargement de tous les segments JSON produits en Passe 1
 $segmentsObjs = @()
@@ -2948,7 +3158,7 @@ foreach ($p in $segmentJsonPaths) {
         }
     }
     catch {
-        Write-Warn "JSON invalide ignoré : $p"
+        Write-Warning "JSON invalide ignoré : $p"
     }
 }
 
@@ -2963,7 +3173,7 @@ $bySujet = Aggregate-Sujets -Segments $segmentsObjs -MaxSec $maxSecInt
 if ($Global:DebriefObj) {
   $tmp = Inject-DebriefIntoBySujet -BySujet $bySujet -DebriefObj $Global:DebriefObj
   if ($null -ne $tmp) { $bySujet = $tmp }
-  Write-Info "Débrief injecté dans bySujet (matière expert pour Pass3E)."
+  Microsoft.PowerShell.Utility\Write-Host "Débrief injecté dans bySujet (matière expert pour Pass3E)."
 }
 
 
@@ -3006,7 +3216,7 @@ $globalPath = Join-Path $OutDir "global.json"
 )
 
 $Global:logsDir = $logsDir
-Write-Info "Agrégation Passe 2A OK → $globalPath"
+Microsoft.PowerShell.Utility\Write-Host "Agrégation Passe 2A OK → $globalPath"
 
 
 
@@ -3014,7 +3224,7 @@ Write-Info "Agrégation Passe 2A OK → $globalPath"
 # ── Passe 2B : construire le global "réunion" PAR BATCHS de segments ─────────
 #-------------------------------------------------------------------------
 
-Write-Info "Passe 2B → Construction du GLOBAL réunion (par batches de $Pass2BatchSize segments)"
+Microsoft.PowerShell.Utility\Write-Host "Passe 2B → Construction du GLOBAL réunion (par batches de $Pass2BatchSize segments)"
 
 $pass2BDir = Join-Path $OutDir "pass2B_batches"
 New-Item -ItemType Directory -Force -Path $pass2BDir | Out-Null
@@ -3121,6 +3331,75 @@ function Merge-MeetingBatchObjects {
   }
 }
 
+function Get-Pass2BInputDiagnostics {
+  param([object[]] $BatchSeg, [object] $BatchObj)
+
+  $batchThemesCount   = ($BatchSeg | ForEach-Object {
+    if ($_ -and $_.PSObject.Properties['themes']) { (@($_.themes) | Measure-Object).Count } else { 0 }
+  } | Measure-Object -Sum).Sum
+  $batchActionsCount  = ($BatchSeg | ForEach-Object {
+    if ($_ -and $_.PSObject.Properties['actions']) { (@($_.actions) | Measure-Object).Count } else { 0 }
+  } | Measure-Object -Sum).Sum
+  $batchProblemsCount = ($BatchSeg | ForEach-Object {
+    if ($_ -and $_.PSObject.Properties['problems']) { (@($_.problems) | Measure-Object).Count } else { 0 }
+  } | Measure-Object -Sum).Sum
+  $batchTextLen = (
+    $BatchSeg |
+    ForEach-Object {
+      $txt = ""
+      if ($_.PSObject.Properties['resume_global'] -and $_.resume_global) {
+        $txt += ($_.resume_global | Out-String)
+      }
+      if ($_.PSObject.Properties['resume_segment'] -and $_.resume_segment) {
+        $txt += ($_.resume_segment | Out-String)
+      }
+      $txt.Length
+    } | Measure-Object -Sum
+  ).Sum
+
+  $resultThemes   = if ($BatchObj -and $BatchObj.PSObject.Properties['themes']) { (@($BatchObj.themes) | Measure-Object).Count } else { 0 }
+  $resultActions  = if ($BatchObj -and $BatchObj.PSObject.Properties['actions']) { (@($BatchObj.actions) | Measure-Object).Count } else { 0 }
+  $resultProblems = if ($BatchObj -and $BatchObj.PSObject.Properties['problems']) { (@($BatchObj.problems) | Measure-Object).Count } else { 0 }
+  $resultTextLen  = if ($BatchObj -and $BatchObj.PSObject.Properties['resume_global']) { ([string]$BatchObj.resume_global | Out-String).Length } else { 0 }
+
+  $inputRich   = ($batchThemesCount + $batchActionsCount + $batchProblemsCount + $batchTextLen)
+  $resultEmpty = ($resultThemes -eq 0 -and $resultActions -eq 0 -and $resultProblems -eq 0 -and $resultTextLen -eq 0)
+
+  return [pscustomobject]@{
+    InputRich   = $inputRich
+    ResultEmpty = $resultEmpty
+  }
+}
+
+function New-Pass2BLocalFallback {
+  param([object[]] $BatchSeg)
+
+  $fallback = [pscustomobject]@{
+    resume_global = (
+      $BatchSeg |
+      ForEach-Object {
+        if ($_.PSObject.Properties['resume_global'] -and $_.resume_global) {
+          $_.resume_global
+        }
+        if ($_.PSObject.Properties['resume_segment'] -and $_.resume_segment) {
+          $_.resume_segment
+        }
+      } |
+      Where-Object { $_ } |
+      Out-String
+    ).Trim()
+    themes        = @()
+    actions       = @()
+    problems      = @()
+  }
+
+  $fallback.themes   = $BatchSeg | ForEach-Object { $_.themes }   | Where-Object { $_ }
+  $fallback.actions  = $BatchSeg | ForEach-Object { $_.actions }  | Where-Object { $_ }
+  $fallback.problems = $BatchSeg | ForEach-Object { $_.problems } | Where-Object { $_ }
+
+  return $fallback
+}
+
 function Invoke-Pass2BBatchAttempt {
   param(
     [int] $BatchIndex,
@@ -3156,8 +3435,8 @@ function Invoke-Pass2BBatchAttempt {
 
   $wasTruncated = ($pass2BUser_Effective -ne $pass2BUser)
 
-  [System.IO.File]::WriteAllText($promptPath, $pass2BUser_Effective, [System.Text.Encoding]::UTF8)
-  [System.IO.File]::WriteAllText($systemPath, $Pass2BSystem, [System.Text.Encoding]::UTF8)
+  Write-ArtifactText -Path $promptPath -Text $pass2BUser_Effective -ModelName $ModelReport
+  Write-ArtifactText -Path $systemPath -Text $Pass2BSystem -ModelName $ModelReport
 
   $meta = [pscustomobject]@{
     batch          = $BatchIndex
@@ -3168,21 +3447,25 @@ function Invoke-Pass2BBatchAttempt {
     was_truncated  = $wasTruncated
     timestamp      = (Get-Date).ToString("o")
   }
-  [System.IO.File]::WriteAllText($metaPath, ($meta | ConvertTo-Json -Depth 10), [System.Text.Encoding]::UTF8)
+  [System.IO.File]::WriteAllText($metaPath, ($meta | ConvertTo-Json -Depth 10), $utf8NoBom)
 
   $batchObj = $null
   $raw = $null
+  $outputTruncated = $false
 
   try {
     $raw = Invoke-LLM -system $Pass2BSystem -user $pass2BUser_Effective -model $ModelReport -DebugHttp:$DebugHttp
     if (-not $raw -or $raw.Trim().Length -eq 0) { throw "R?ponse LLM vide" }
-    [IO.File]::WriteAllText($rawPath, $raw, [Text.Encoding]::UTF8)
+    Write-ArtifactText -Path $rawPath -Text $raw -ModelName $ModelReport
   }
   catch {
     $errTxt = ($_ | Out-String)
+    if ($errTxt -match 'finish_reason=length' -or $errTxt -match 'Upstream truncated') {
+      $outputTruncated = $true
+    }
     [IO.File]::WriteAllText($errorPath, $errTxt, [Text.Encoding]::UTF8)
-    [IO.File]::WriteAllText($rawPath, $errTxt, [Text.Encoding]::UTF8)
-    Write-Warn ("Pass2B batch {0:D2} [{1}]: ?chec Invoke-LLM (voir {2})." -f $BatchIndex, $safeAttemptId, $errorPath)
+    Write-ArtifactText -Path $rawPath -Text $errTxt -ModelName $ModelReport
+    Write-Warning ("Pass2B batch {0:D2} [{1}]: ?chec Invoke-LLM (voir {2})." -f $BatchIndex, $safeAttemptId, $errorPath)
     $raw = $null
   }
 
@@ -3193,17 +3476,26 @@ function Invoke-Pass2BBatchAttempt {
     catch {
       $errTxt = ($_ | Out-String)
       [IO.File]::WriteAllText($errorPath, $errTxt, [Text.Encoding]::UTF8)
-      Write-Warn ("Pass2B batch {0:D2} [{1}]: JSON non parsable (voir {2})." -f $BatchIndex, $safeAttemptId, $errorPath)
+      Write-Warning ("Pass2B batch {0:D2} [{1}]: JSON non parsable (voir {2})." -f $BatchIndex, $safeAttemptId, $errorPath)
       $batchObj = $null
     }
   }
 
   $batchObj = Normalize-MeetingBatchObj $batchObj
-  [System.IO.File]::WriteAllText($attemptOut, ($batchObj | ConvertTo-Json -Depth 50), [System.Text.Encoding]::UTF8)
+  $diag = Get-Pass2BInputDiagnostics -BatchSeg $BatchSeg -BatchObj $batchObj
+  if ($diag.InputRich -gt 0 -and $diag.ResultEmpty) {
+    $outputTruncated = $true
+    Write-Warning ("Pass2B batch {0:D2} [{1}]: sortie vide malgré une entrée riche." -f $BatchIndex, $safeAttemptId)
+  }
+  [System.IO.File]::WriteAllText($attemptOut, ($batchObj | ConvertTo-Json -Depth 50), $utf8NoBom)
 
   return [pscustomobject]@{
     BatchObj      = $batchObj
-    WasTruncated  = $wasTruncated
+    WasTruncated  = ($wasTruncated -or $outputTruncated)
+    PromptTruncated = $wasTruncated
+    OutputTruncated = $outputTruncated
+    InputRich     = $diag.InputRich
+    ResultEmpty   = $diag.ResultEmpty
     SegmentCount  = @($BatchSeg).Count
     AttemptId     = $safeAttemptId
     OutputPath    = $attemptOut
@@ -3239,7 +3531,15 @@ function Invoke-Pass2BAdaptiveBatch {
     -Pass2BUserTemplate $Pass2BUserTemplate `
     -DebugHttp:$DebugHttp
 
-  if ((-not $attempt.WasTruncated) -or (@($BatchSeg).Count -le 1)) {
+  if (@($BatchSeg).Count -le 1) {
+    if ($attempt.ResultEmpty -and $attempt.InputRich -gt 0) {
+      Write-Warning ("Pass2B batch {0:D2}: batch unitaire avec sortie vide persistante, fallback local de fusion simple." -f $BatchIndex)
+      return (Normalize-MeetingBatchObj (New-Pass2BLocalFallback -BatchSeg $BatchSeg))
+    }
+    return $attempt.BatchObj
+  }
+
+  if (-not $attempt.WasTruncated) {
     return $attempt.BatchObj
   }
 
@@ -3257,7 +3557,11 @@ function Invoke-Pass2BAdaptiveBatch {
     return $attempt.BatchObj
   }
 
-  Write-Warn ("Pass2B batch {0:D2}: prompt tronqu? d?tect?, relance s?lective en sous-batches de {1}." -f $BatchIndex, $nextSize)
+  if ($attempt.OutputTruncated -and -not $attempt.PromptTruncated) {
+    Write-Warning ("Pass2B batch {0:D2}: troncature de sortie d?tect?e, relance s?lective en sous-batches de {1}." -f $BatchIndex, $nextSize)
+  } else {
+    Write-Warning ("Pass2B batch {0:D2}: prompt tronqu? d?tect?, relance s?lective en sous-batches de {1}." -f $BatchIndex, $nextSize)
+  }
 
   $subObjs = New-Object System.Collections.Generic.List[object]
   $subCount = [math]::Ceiling(@($BatchSeg).Count / [double]$nextSize)
@@ -3565,8 +3869,8 @@ function Assert-MeetingSchema {
 
   # 5) Reporting
   if ($errors.Count -gt 0) {
-    Write-Warn ("Assert-MeetingSchema({0}) : {1} ajustement(s) / anomalie(s)." -f $Label, $errors.Count)
-    foreach ($m in $errors) { Write-Warn (" - " + $m) }
+    Write-Warning ("Assert-MeetingSchema({0}) : {1} ajustement(s) / anomalie(s)." -f $Label, $errors.Count)
+    foreach ($m in $errors) { Write-Warning (" - " + $m) }
 
     if ($ThrowOnError) {
       throw ("Assert-MeetingSchema({0}) : schéma corrigé mais anomalies détectées." -f $Label)
@@ -3574,7 +3878,7 @@ function Assert-MeetingSchema {
     return $false
   }
 
-  Write-Info ("Assert-MeetingSchema({0}) : OK" -f $Label)
+  Microsoft.PowerShell.Utility\Write-Host ("Assert-MeetingSchema({0}) : OK" -f $Label)
   return $true
 }
 
@@ -3588,14 +3892,14 @@ foreach ($p in $segmentJsonPaths) {
     $o   = $txt | ConvertFrom-Json -Depth 50
     if ($o) { $segmentObjs += $o }
   } catch {
-    Write-Warn "Pass2B: segment illisible/JSON invalide: $p (skip)"
+    Write-Warning "Pass2B: segment illisible/JSON invalide: $p (skip)"
   }
 }
 
 # ---- 2) Cas sans segments : global_meeting vide conforme
 
 if (-not $segmentObjs -or $segmentObjs.Count -eq 0) {
-  Write-Warn "Pass2B: aucun segment exploitable. Fallback globalMeeting vide."
+  Write-Warning "Pass2B: aucun segment exploitable. Fallback globalMeeting vide."
   $globalMeetingObj = Normalize-MeetingBatchObj $null
 }
 else {
@@ -3620,12 +3924,12 @@ else {
     $errorPath  = "${batchBase}_error.txt"
 
     if ((Test-Path $batchOut) -and (-not $Force)) {
-      Write-Info "Pass2B: skip batch $batchIndex (existe) → $batchOut"
+      Microsoft.PowerShell.Utility\Write-Host "Pass2B: skip batch $batchIndex (existe) → $batchOut"
       $batchPaths.Add($batchOut) | Out-Null
       continue
     }
 
-    Write-Info ("Pass2B → Batch {0:D2}/{1} (segments {2}..{3})" -f $batchIndex, $batchCount, ($from+1), ($to+1))
+    Microsoft.PowerShell.Utility\Write-Host ("Pass2B → Batch {0:D2}/{1} (segments {2}..{3})" -f $batchIndex, $batchCount, ($from+1), ($to+1))
 
     $batchSeg = @($segmentObjs[$from..$to])
     $batchObj = Invoke-Pass2BAdaptiveBatch `
@@ -3643,7 +3947,7 @@ else {
 
     $batchObj = Normalize-MeetingBatchObj $batchObj
     $json = $batchObj | ConvertTo-Json -Depth 50
-    [System.IO.File]::WriteAllText($batchOut, $json, [System.Text.Encoding]::UTF8)
+    [System.IO.File]::WriteAllText($batchOut, $json, $utf8NoBom)
     $batchPaths.Add($batchOut) | Out-Null
   }
 
@@ -3656,7 +3960,7 @@ else {
       $o = Normalize-MeetingBatchObj $o
       $allBatchObjs += $o
     } catch {
-      Write-Warn "Pass2B: batch illisible: $bp (skip). Détail: $($_.Exception.Message)"
+      Write-Warning "Pass2B: batch illisible: $bp (skip). Détail: $($_.Exception.Message)"
     }
   }
 
@@ -3667,16 +3971,16 @@ else {
 
 $globalMeetingPath = Join-Path $OutDir "global_meeting.json"
 $json = $globalMeetingObj | ConvertTo-Json -Depth 50
-[System.IO.File]::WriteAllText($globalMeetingPath, $json, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($globalMeetingPath, $json, $utf8NoBom)
 
-Write-Info "GLOBAL réunion → $globalMeetingPath"
+Microsoft.PowerShell.Utility\Write-Host "GLOBAL réunion → $globalMeetingPath"
 
 
 
 # -----------------------------------------------------------------------
 # ── Split global.json en 1 fichier JSON par sujet (pour analyses ultérieures)
 # -----------------------------------------------------------------------
-Write-Info "Split par sujet → global.json"
+Microsoft.PowerShell.Utility\Write-Host "Split par sujet → global.json"
 
 try {
   $splitOutDir = Join-Path $OutDir "sujets"
@@ -3688,8 +3992,8 @@ try {
 
   # 1) produire le référentiel sujets_ref.json AVANT l'appel python
   $sujetsRefPath = Join-Path $OutDir "sujets_ref.json"
-  $sujetsJsonLocal = $Sujets | ConvertTo-Json -Depth 10
-  [System.IO.File]::WriteAllText($sujetsRefPath, $sujetsJsonLocal, [System.Text.Encoding]::UTF8)
+  $sujetsJsonLocal = ConvertTo-Json -InputObject @($Sujets) -Depth 10 -Compress
+  [System.IO.File]::WriteAllText($sujetsRefPath, $sujetsJsonLocal, $utf8NoBom)
 
   if (-not (Test-Path $sujetsRefPath)) { throw "sujets_ref.json non écrit: $sujetsRefPath" }
 
@@ -3710,7 +4014,7 @@ try {
 
   $p = Start-Process -FilePath "python3" -ArgumentList $argString -NoNewWindow -PassThru -Wait
   
-  Write-Info ("Split sujets → python3 " + $argString)
+  Microsoft.PowerShell.Utility\Write-Host ("Split sujets → python3 " + $argString)
 
   if ($p.ExitCode -ne 0) {
     throw "split_by_sujet.py a échoué (ExitCode=$($p.ExitCode))"
@@ -3719,10 +4023,10 @@ try {
   $splitIndexPath = Join-Path $splitOutDir "split_index.json"
   if (-not (Test-Path $splitIndexPath)) { throw "split_index.json non généré: $splitIndexPath" }
 
-  Write-Info "Split par sujet OK → $splitOutDir"
+  Microsoft.PowerShell.Utility\Write-Host "Split par sujet OK → $splitOutDir"
 }
 catch {
-  Write-Warn "Split par sujet: échec ($_). Le pipeline continue sans split."
+  Write-Warning "Split par sujet: échec ($_). Le pipeline continue sans split."
 }
 # -------------------------------------------------
 # Ingestion de la passe debrief 
@@ -3787,7 +4091,7 @@ elseif ($DebriefMode -eq "complement") { $useSubstitution = $false }
 else { $useSubstitution = $useSubstitutionByHeuristic }
 
 $mode = if($useSubstitution){ "substitution" } else { "complement" }
-Write-Info ("Mode debrief = {0} (debrief_mode={1}, resumeLen={2}, themes={3}, actions={4}, docs={5}, sujets={6}, participants={7})" -f
+Microsoft.PowerShell.Utility\Write-Host ("Mode debrief = {0} (debrief_mode={1}, resumeLen={2}, themes={3}, actions={4}, docs={5}, sujets={6}, participants={7})" -f
   $mode, $(if ($null -ne $DebriefMode -and "$DebriefMode" -ne "") { $DebriefMode } else { "null" }), $q.resumeLen, $q.themesCount, $q.actionsCount, $q.docsCount, $q.coveredSujets, $q.coveredParticipants)
 
 # Application (UNE SEULE FOIS)
@@ -3843,7 +4147,7 @@ if ($debAsMeeting -and @($globalMeetingMerged.actions).Count -eq 0 -and @($debAs
 # -----------------------------------------------------------------------
 # ── Passe 2E : condensation par sujet (LLM)
 # -----------------------------------------------------------------------
-Write-Info "Passe 2E → Condensation intermédiaire par sujet"
+Microsoft.PowerShell.Utility\Write-Host "Passe 2E → Condensation intermédiaire par sujet"
 
 function Get-EstimatedTokens2E {
     param(
@@ -4239,7 +4543,7 @@ function Invoke-Pass2EForSujetFile {
         -MaxSingleInterventionTokens $TargetTokens
 
     if (-not $chunkObjs -or @($chunkObjs).Count -eq 0) {
-        Write-Warn "Pass2E: aucun chunk pour $SujetPath"
+        Write-Warning "Pass2E: aucun chunk pour $SujetPath"
         return $null
     }
 
@@ -4248,7 +4552,7 @@ function Invoke-Pass2EForSujetFile {
 
     for ($i = 0; $i -lt @($chunkObjs).Count; $i++) {
         $chunk = $chunkObjs[$i]
-        Write-Info ("Pass2E {0} → chunk {1}/{2}" -f $sourceName, $chunk.chunk_index, $chunk.chunk_total)
+        Microsoft.PowerShell.Utility\Write-Host ("Pass2E {0} → chunk {1}/{2}" -f $sourceName, $chunk.chunk_index, $chunk.chunk_total)
 
         try {
             $partial = Invoke-Pass2EChunk `
@@ -4259,7 +4563,7 @@ function Invoke-Pass2EForSujetFile {
             $partials += $partial
         }
         catch {
-            Write-Warn ("Pass2E {0} chunk {1}: échec LLM : {2}" -f $sourceName, $chunk.chunk_index, $_.Exception.Message)
+            Write-Warning ("Pass2E {0} chunk {1}: échec LLM : {2}" -f $sourceName, $chunk.chunk_index, $_.Exception.Message)
             throw
         }
     }
@@ -4290,9 +4594,9 @@ function Invoke-Pass2EForSujetFile {
 
     $outPath = Join-Path $OutDir ($sourceName + "_compact.json")
     $json = $finalObj | ConvertTo-Json -Depth 50
-    [System.IO.File]::WriteAllText($outPath, $json, [System.Text.Encoding]::UTF8)
+    [System.IO.File]::WriteAllText($outPath, $json, $utf8NoBom)
 
-    Write-Info "Pass2E OK → $outPath"
+    Microsoft.PowerShell.Utility\Write-Host "Pass2E OK → $outPath"
     return $outPath
 }
 
@@ -4319,11 +4623,11 @@ foreach ($sf in $sujetFiles) {
         }
     }
     catch {
-        Write-Warn ("Pass2E échouée pour {0} : {1}" -f $sf.Name, $_.Exception.Message)
+        Write-Warning ("Pass2E échouée pour {0} : {1}" -f $sf.Name, $_.Exception.Message)
     }
 }
 
-Write-Info ("Passe 2E terminée → {0} fichier(s) compact(s)" -f @($pass2EPaths).Count)
+Microsoft.PowerShell.Utility\Write-Host ("Passe 2E terminée → {0} fichier(s) compact(s)" -f @($pass2EPaths).Count)
 
 # ── Fin Passe 2E : condensation par sujet (LLM) ─────────
 
@@ -4353,12 +4657,12 @@ function _GetField($o, [string]$k) {
 }
 
 
-Write-Info "Passe 3E → Synthèses par sujet (à partir des compacts 2E)"
+Microsoft.PowerShell.Utility\Write-Host "Passe 3E → Synthèses par sujet (à partir des compacts 2E)"
 
 trap {
-  Write-Host "[ERR] $($_.Exception.Message)"
-  Write-Host "[ERR] Position: $($_.InvocationInfo.PositionMessage)"
-  Write-Host "[ERR] ScriptStackTrace: $($_.ScriptStackTrace)"
+  Microsoft.PowerShell.Utility\Write-Host "[ERR] $($_.Exception.Message)"
+  Microsoft.PowerShell.Utility\Write-Host "[ERR] Position: $($_.InvocationInfo.PositionMessage)"
+  Microsoft.PowerShell.Utility\Write-Host "[ERR] ScriptStackTrace: $($_.ScriptStackTrace)"
   break
 }
 
@@ -4368,13 +4672,13 @@ Ensure-Dir $pass3EDir
 $pass2EOutDir = Join-Path $OutDir "pass2E_sujets_compact"
 
 if (-not (Test-Path $pass2EOutDir)) {
-  Write-Warn "Passe 3E ignorée : dossier pass2E introuvable ($pass2EOutDir)."
+  Write-Warning "Passe 3E ignorée : dossier pass2E introuvable ($pass2EOutDir)."
 }
 else {
   $compactFiles = Get-ChildItem -Path $pass2EOutDir -Filter "*_compact.json" -File | Sort-Object Name
 
   if (-not $compactFiles -or @($compactFiles).Count -eq 0) {
-    Write-Warn "Passe 3E: aucun fichier compact 2E trouvé."
+    Write-Warning "Passe 3E: aucun fichier compact 2E trouvé."
   }
   else {
 
@@ -4388,12 +4692,12 @@ else {
       try {
         $compactObj = Get-Content $cf.FullName -Raw | ConvertFrom-Json -Depth 50
       } catch {
-        Write-Warn ("Pass3E: fichier compact illisible : {0}" -f $cf.FullName)
+        Write-Warning ("Pass3E: fichier compact illisible : {0}" -f $cf.FullName)
         continue
       }
 
       if (-not $compactObj) {
-        Write-Warn ("Pass3E: fichier compact vide : {0}" -f $cf.FullName)
+        Write-Warning ("Pass3E: fichier compact vide : {0}" -f $cf.FullName)
         continue
       }
 
@@ -4405,7 +4709,7 @@ else {
       $outOne = Join-Path $pass3EDir ("sujet_{0:D3}_synthese.json" -f $num)
 
       if ((Test-Path $outOne) -and (-not $Force)) {
-        Write-Info ("Pass3E: skip sujet {0:D3} (existe) → {1}" -f $num, $outOne)
+        Microsoft.PowerShell.Utility\Write-Host ("Pass3E: skip sujet {0:D3} (existe) → {1}" -f $num, $outOne)
         try {
           $o = (Get-Content $outOne -Raw) | ConvertFrom-Json -Depth 50
           if ($o) { $pass3eResults.Add($o) | Out-Null }
@@ -4465,7 +4769,7 @@ else {
           $finalOne = Parse-LlmJsonStrict -RawText $raw -Label ("Pass3E sujet {0:D3}" -f $num) -LogFile $logFile
         }
         catch {
-          Write-Warn ("Pass3E: échec modèle local sur sujet {0:D3} → fallback ModelPass3." -f $num)
+          Write-Warning ("Pass3E: échec modèle local sur sujet {0:D3} → fallback ModelPass3." -f $num)
           try {
             $raw = Invoke-LLM -system $Pass3E_System -user $userEff -model $ModelPass3 -DebugHttp:$DebugHttp
             $raw = Unwrap-AdapterText $raw
@@ -4598,12 +4902,12 @@ else {
 
       # Puis seulement maintenant sérialiser
       $jsonOne = $finalOne | ConvertTo-Json -Depth 50
-      [IO.File]::WriteAllText($outOne, $jsonOne, [Text.Encoding]::UTF8)
+      [IO.File]::WriteAllText($outOne, $jsonOne, $utf8NoBom)
 
 
 
       $pass3eResults.Add($finalOne) | Out-Null
-      Write-Info ("Pass3E: sujet {0:D3} OK → {1}" -f $num, $outOne)
+      Microsoft.PowerShell.Utility\Write-Host ("Pass3E: sujet {0:D3} OK → {1}" -f $num, $outOne)
     }
 
     # ---- 3) Agrégation de toutes les synthèses sujet
@@ -4628,9 +4932,9 @@ else {
     }
 
     $aggPath = Join-Path $OutDir "global_by_sujet.json"
-    [IO.File]::WriteAllText($aggPath, ($agg | ConvertTo-Json -Depth 100), [Text.Encoding]::UTF8)
+    [IO.File]::WriteAllText($aggPath, ($agg | ConvertTo-Json -Depth 100), $utf8NoBom)
 
-    Write-Info ("Passe 3E: agrégation → {0}" -f $aggPath)
+    Microsoft.PowerShell.Utility\Write-Host ("Passe 3E: agrégation → {0}" -f $aggPath)
   }
 }
 
@@ -4640,7 +4944,7 @@ else {
 # ── Passe 3 : JSON FINAL normalisé (enrichissement progressif) 
 # -----------------------------------------------------------------------
 
-Write-Info "Passe 3 → JSON FINAL (enrichissement progressif)"
+Microsoft.PowerShell.Utility\Write-Host "Passe 3 → JSON FINAL (enrichissement progressif)"
 Ensure-Dir $logsDir
 
 $sujetsJson       = $Sujets       | ConvertTo-Json -Depth 10
@@ -4744,7 +5048,7 @@ if ($finalObj -and $finalObj.sujets) {
   })
   $sujetsRetiresFinal = $sujetsAvantFiltreFinal - @($finalObj.sujets).Count
   if ($sujetsRetiresFinal -gt 0) {
-    Write-Warn ("Assemblage final: {0} sujet(s) numero=0 ou invalide supprime(s) avant global_final.json." -f $sujetsRetiresFinal)
+    Write-Warning ("Assemblage final: {0} sujet(s) numero=0 ou invalide supprime(s) avant global_final.json." -f $sujetsRetiresFinal)
   }
 
   foreach ($s in $finalObj.sujets) {
@@ -4779,7 +5083,7 @@ if ($finalObj -and $finalObj.sujets) {
 #------------------------------------------------------------
 # 3A : métadonnées + résumé + ordre du jour
 #------------------------------------------------------------
-Write-Info "Passe 3A → date / link / resume / ordre_du_jour"
+Microsoft.PowerShell.Utility\Write-Host "Passe 3A → date / link / resume / ordre_du_jour"
 
 $ctxBlock = ""
 if ($GlobalContext) {
@@ -4800,7 +5104,7 @@ Consigne prioritaire :
 
 # log prompt brut
 $path = Join-Path $logsDir "pass3A_input.txt"
-[System.IO.File]::WriteAllText($path, $pass3AUser, [System.Text.Encoding]::UTF8)
+Write-ArtifactText -Path $path -Text $pass3AUser -ModelName $ModelPass3A
 
 
 
@@ -4813,11 +5117,7 @@ $pass3AUser_Effective = Truncate-For-Context `
 
 # log prompt effectif
 $path = Join-Path $logsDir "pass3A_input_effective.txt"
-[System.IO.File]::WriteAllText(
-    $path,
-    $pass3AUser_Effective,
-    [System.Text.Encoding]::UTF8
-)
+Write-ArtifactText -Path $path -Text $pass3AUser_Effective -ModelName $ModelPass3A
 
 $partAObj  = $null
 $pass3ARaw = $null
@@ -4827,18 +5127,14 @@ try {
   $pass3ARaw = Unwrap-AdapterText $pass3ARaw
   if ($pass3ARaw) {
     $path = Join-Path $logsDir "pass3A_raw.txt"
-    [System.IO.File]::WriteAllText(
-        $path,
-        $pass3ARaw,
-        [System.Text.Encoding]::UTF8
-    )
+    Write-ArtifactText -Path $path -Text $pass3ARaw -ModelName $ModelPass3A
 
   }
 
   $partAObj = Parse-LlmJsonStrict -RawText $pass3ARaw -Label "Pass3A" -LogFile $logFile
 }
 catch {
-  Write-Warn "Pass3A: échec LLM/JSON ($_). Fallback par défaut."
+  Write-Warning "Pass3A: échec LLM/JSON ($_). Fallback par défaut."
   $partAObj = [pscustomobject]@{
     date          = $null
     link          = $null
@@ -4856,17 +5152,13 @@ if (-not $partAObj.PSObject.Properties['ordre_du_jour']) { $partAObj | Add-Membe
 #------------------------------------------------------------
 # 3B : thèmes_abordes
 #------------------------------------------------------------
-Write-Info "Passe 3B → themes_abordes"
+Microsoft.PowerShell.Utility\Write-Host "Passe 3B → themes_abordes"
 
 $pass3BUser = $Pass3B_User_Template.Replace("{GLOBAL_JSON}", $globalMeetingMergedJson)
 
 # log prompt brut
 $path = Join-Path $logsDir "pass3B_input.txt"
-[System.IO.File]::WriteAllText(
-    $path,
-    $pass3BUser,
-    [System.Text.Encoding]::UTF8
-)
+Write-ArtifactText -Path $path -Text $pass3BUser -ModelName $ModelPass3B
 
 $pass3BUser_Effective = Truncate-For-Context `
   -SystemText $Pass3B_System `
@@ -4875,11 +5167,7 @@ $pass3BUser_Effective = Truncate-For-Context `
 
 # log prompt effectif
 $path = Join-Path $logsDir "pass3B_input_effective.txt"
-[System.IO.File]::WriteAllText(
-    $path,
-    $pass3BUser_Effective,
-    [System.Text.Encoding]::UTF8
-)
+Write-ArtifactText -Path $path -Text $pass3BUser_Effective -ModelName $ModelPass3B
 
 $partBObj  = $null
 $pass3BRaw = $null
@@ -4889,18 +5177,14 @@ try {
   $pass3BRaw = Unwrap-AdapterText $pass3BRaw
   if ($pass3BRaw) {
     $path = Join-Path $logsDir "pass3B_raw.txt"
-    [System.IO.File]::WriteAllText(
-        $path,
-        $pass3BRaw,
-        [System.Text.Encoding]::UTF8
-    )
- 
+    Write-ArtifactText -Path $path -Text $pass3BRaw -ModelName $ModelPass3B
+  
   }
 
   $partBObj = Parse-LlmJsonStrict -RawText $pass3BRaw -Label "Pass3B" -LogFile $logFile
 }
 catch {
-  Write-Warn "Pass3B: échec LLM/JSON ($_). Fallback themes_abordes=[]."
+  Write-Warning "Pass3B: échec LLM/JSON ($_). Fallback themes_abordes=[]."
   $partBObj = [pscustomobject]@{
     themes_abordes = @()
   }
@@ -4914,7 +5198,7 @@ Ensure-List $partBObj "themes_abordes"
 #------------------------------------------------------------
 # 3C : actions / perspectives / annexes
 #------------------------------------------------------------
-Write-Info "Passe 3C → actions / perspectives / annexes"
+Microsoft.PowerShell.Utility\Write-Host "Passe 3C → actions / perspectives / annexes"
 $globalObj = $globalMeetingMergedJson | ConvertFrom-Json -Depth 200
 
 $reduced = [pscustomobject]@{
@@ -4930,11 +5214,7 @@ $pass3CUser = $Pass3C_User_Template.Replace("{GLOBAL_JSON}", ($reduced | Convert
 
 # log prompt brut
 $path = Join-Path $logsDir "pass3C_input.txt"
-[System.IO.File]::WriteAllText(
-    $path,
-    $pass3CUser,
-    [System.Text.Encoding]::UTF8
-)
+Write-ArtifactText -Path $path -Text $pass3CUser -ModelName $ModelPass3C
 
 $pass3CUser_Effective = Truncate-For-Context `
   -SystemText $Pass3C_System `
@@ -4943,11 +5223,7 @@ $pass3CUser_Effective = Truncate-For-Context `
 
 # log prompt effectif
 $path = Join-Path $logsDir "pass3C_input_effective.txt"
-[System.IO.File]::WriteAllText(
-    $path,
-    $pass3CUser_Effective,
-    [System.Text.Encoding]::UTF8
-)
+Write-ArtifactText -Path $path -Text $pass3CUser_Effective -ModelName $ModelPass3C
 
 $partCObj  = $null
 $pass3CRaw = $null
@@ -4957,18 +5233,14 @@ try {
   $pass3CRaw = Unwrap-AdapterText $pass3CRaw
   if ($pass3CRaw) {
     $path = Join-Path $logsDir "pass3C_raw.txt"
-    [System.IO.File]::WriteAllText(
-        $path,
-        $pass3CRaw,
-        [System.Text.Encoding]::UTF8
-    )
+    Write-ArtifactText -Path $path -Text $pass3CRaw -ModelName $ModelPass3C
 
   }
 
   $partCObj = Parse-LlmJsonStrict -RawText $pass3CRaw -Label "Pass3C" -LogFile $logFile
 }
 catch {
-  Write-Warn "Pass3C: échec LLM/JSON ($_). Fallback actions/perspectives/annexes vides."
+  Write-Warning "Pass3C: échec LLM/JSON ($_). Fallback actions/perspectives/annexes vides."
   $partCObj = [pscustomobject]@{
     actions      = @()
     perspectives = @()
@@ -5079,16 +5351,12 @@ Ensure-List $partCObj "annexes"
 # 3D : demandes de documents
 #------------------------------------------------------------
 
-Write-Info "Passe 3D → demandes de documents"
+Microsoft.PowerShell.Utility\Write-Host "Passe 3D → demandes de documents"
 
 
 $pass3DUser = $Pass3D_User_Template.Replace("{GLOBAL_JSON}", $globalMeetingMergedJson)
 $path = Join-Path $logsDir "pass3D_input.txt"
-[System.IO.File]::WriteAllText(
-    $path,
-    $pass3DUser,
-    [System.Text.Encoding]::UTF8
-)
+Write-ArtifactText -Path $path -Text $pass3DUser -ModelName $ModelPass3D
 
 
 $pass3DUser_Effective = Truncate-For-Context `
@@ -5097,11 +5365,7 @@ $pass3DUser_Effective = Truncate-For-Context `
   -ModelName  $ModelPass3D
 
 $path = Join-Path $logsDir "pass3D_input_effective.txt"
-[System.IO.File]::WriteAllText(
-    $path,
-    $pass3DUser_Effective,
-    [System.Text.Encoding]::UTF8
-)
+Write-ArtifactText -Path $path -Text $pass3DUser_Effective -ModelName $ModelPass3D
 
 
 $partDObj  = $null
@@ -5113,18 +5377,14 @@ try {
   if ($pass3DRaw) {
     
     $path = Join-Path $logsDir "pass3D_raw.txt"
-    [System.IO.File]::WriteAllText(
-        $path,
-        $pass3DRaw,
-        [System.Text.Encoding]::UTF8
-    )
+    Write-ArtifactText -Path $path -Text $pass3DRaw -ModelName $ModelPass3D
 
   }
 
   $partDObj = Parse-LlmJsonStrict -RawText $pass3DRaw -Label "Pass3D" -LogFile $logFile
 }
 catch {
-  Write-Warn "Pass3D: échec LLM/JSON ($_). Fallback demandes_documents_globales=[]."
+  Write-Warning "Pass3D: échec LLM/JSON ($_). Fallback demandes_documents_globales=[]."
   $partDObj = [pscustomobject]@{
     demandes_documents_globales = @()
   }
@@ -5326,11 +5586,11 @@ $finalPath  = Join-Path $OutDir "global_final.json"
 [System.IO.File]::WriteAllText(
     $finalPath,
     $finalJson,
-    [System.Text.Encoding]::UTF8
+    $utf8NoBom
 )
 
-Write-Info "JSON FINAL → $finalPath"
+Microsoft.PowerShell.Utility\Write-Host "JSON FINAL → $finalPath"
 
 "Done: $(Get-Date)" | Add-Content $logFile
-Write-Info "Pipeline terminé (full JSON)."
+Microsoft.PowerShell.Utility\Write-Host "Pipeline terminé (full JSON)."
 
