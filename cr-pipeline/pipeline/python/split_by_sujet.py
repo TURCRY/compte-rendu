@@ -146,13 +146,18 @@ def main() -> int:
         for iv in raw_list:
             if not isinstance(iv, dict):
                 continue
-            clean.append({
+            item = {
                 "segment_id": iv.get("segment_id"),
                 "timecode": norm_timecode(iv.get("timecode")) or iv.get("timecode"),
                 "auteur": iv.get("auteur"),
                 "role": iv.get("role"),
                 "texte": iv.get("texte"),
-            })
+            }
+            if "source_sujet_principal" in iv:
+                item["source_sujet_principal"] = iv.get("source_sujet_principal")
+            if "multi_subject_match" in iv:
+                item["multi_subject_match"] = iv.get("multi_subject_match")
+            clean.append(item)
 
         if args.dedup:
             clean = dedup(clean)

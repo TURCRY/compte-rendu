@@ -64,9 +64,16 @@ param(
   [int] $Pass2BatchSize = 2,
 
   # Relance
+  [switch] $RebuildFromPass2B,
+  [switch] $RebuildPass2BOnly,
+  [int[]] $OnlyPass2BBatches = @(),
   [switch] $Force
 
 )
+[bool] $HasOnlyPass2BBatches = ($OnlyPass2BBatches -and @($OnlyPass2BBatches).Count -gt 0)
+if ($HasOnlyPass2BBatches -and (-not $RebuildFromPass2B)) {
+  $RebuildFromPass2B = $true
+}
 [int]$ChunkSize = 30 # voir fonction Get-IntelligentSegments (nombre de ligne de transcription par segment
 
 # Valeurs neutres pour éviter l’erreur en StrictMode
@@ -936,6 +943,133 @@ function Bag-Of-Words($tokens){
 function Cosine-Sim($a,$b){ if(-not $a.Keys.Count -or -not $b.Keys.Count){return 0.0}; $dot=0; foreach($k in $a.Keys){ if($b.ContainsKey($k)){ $dot += $a[$k]*$b[$k] } }; $na=[math]::Sqrt(($a.Values|Measure-Object -Sum).Sum); $nb=[math]::Sqrt(($b.Values|Measure-Object -Sum).Sum); if($na -eq 0 -or $nb -eq 0){return 0.0}; $dot/($na*$nb) }
 
 # ── LLM calls ─────────────────────────────────────────────────────────────────
+
+function Normalize-TextForSubjectMatch([string]$Text) {
+  if ([string]::IsNullOrWhiteSpace($Text)) { return "" }
+  $t = $Text.ToLowerInvariant()
+  $t = $t -replace "[\u2010-\u2015]", "-"
+  $t = $t -replace "\s+", " "
+  return $t.Trim()
+}
+
+function Get-ControlledSubjectAliases {
+  param(
+    [Parameter(Mandatory=$true)] [array] $Sujets
+  )
+
+  $rules = @{}
+  foreach ($sj in @($Sujets)) {
+    $num = [int]$sj.Numero
+    $label = Normalize-TextForSubjectMatch ("{0} {1} {2}" -f $sj.Titre, $sj.Localisation, $sj.Description)
+
+    # Controlled aliases for cave / sous-sol disorders.
+    # Additive only: copies already extracted interventions to an extra subject.
+    if ($label -match "cave|sous-sol|sous sol") {
+      $rules[[string]$num] = @(
+        @{ pattern = "cave"; score = 2; label = "cave" },
+        @{ pattern = "sous(-| )sol"; score = 2; label = "sous-sol" },
+        @{ pattern = "garage en dessous"; score = 2; label = "garage en dessous" },
+        @{ pattern = "local.*humide"; score = 2; label = "local humide" },
+        @{ pattern = "tr.s humide.*eau"; score = 2; label = "tres humide/eau" },
+        @{ pattern = "sous la terrasse|sous terrasse"; score = 2; label = "sous terrasse" },
+        @{ pattern = "en bas correctement"; score = 2; label = "en bas correctement" }
+      )
+    }
+  }
+  return $rules
+}
+
+function Get-InterventionKeyForMultiSubject($Iv) {
+  return ("{0}|{1}|{2}" -f `
+    ([string]$Iv.segment_id).Trim(), `
+    ([string]$Iv.timecode).Trim(), `
+    ([string]$Iv.texte).Trim())
+}
+
+function Add-MultiSubjectAssignments {
+  param(
+    [Parameter(Mandatory=$true)] [hashtable] $BySujet,
+    [Parameter(Mandatory=$true)] [array] $Sujets,
+    [string] $LogFile
+  )
+
+  $rulesBySubject = Get-ControlledSubjectAliases -Sujets $Sujets
+  if ($rulesBySubject.Count -eq 0) { return $BySujet }
+
+  $existingKeys = @{}
+  foreach ($num in @($BySujet.Keys)) {
+    $existingKeys[[string]$num] = @{}
+    foreach ($iv in @($BySujet[$num])) {
+      $existingKeys[[string]$num][(Get-InterventionKeyForMultiSubject $iv)] = $true
+    }
+  }
+
+  $additions = @()
+  foreach ($sourceNum in @($BySujet.Keys)) {
+    foreach ($iv in @($BySujet[$sourceNum])) {
+      $text = Normalize-TextForSubjectMatch ([string]$iv.texte)
+      if (-not $text) { continue }
+
+      foreach ($targetNum in @($rulesBySubject.Keys)) {
+        if ([string]$targetNum -eq [string]$sourceNum) { continue }
+
+        $score = 0
+        $matched = New-Object System.Collections.Generic.List[string]
+        foreach ($rule in @($rulesBySubject[$targetNum])) {
+          if ($text -match $rule.pattern) {
+            $score += [int]$rule.score
+            $matched.Add([string]$rule.label) | Out-Null
+          }
+        }
+
+        # Conservative threshold: one strong phrase/term or two weak cues.
+        if ($score -lt 2) { continue }
+
+        $copy = [pscustomobject]@{
+          segment_id = $iv.segment_id
+          timecode   = $iv.timecode
+          auteur     = $iv.auteur
+          role       = $iv.role
+          texte      = $iv.texte
+          source_sujet_principal = [string]$sourceNum
+          multi_subject_match = [pscustomobject]@{
+            target_sujet = [int]$targetNum
+            score        = $score
+            matched      = $matched.ToArray()
+            rule         = "controlled_aliases"
+          }
+        }
+
+        $key = Get-InterventionKeyForMultiSubject $copy
+        if (-not $existingKeys.ContainsKey([string]$targetNum)) {
+          $existingKeys[[string]$targetNum] = @{}
+        }
+        if ($existingKeys[[string]$targetNum].ContainsKey($key)) { continue }
+
+        $existingKeys[[string]$targetNum][$key] = $true
+        $additions += [pscustomobject]@{
+          target  = [string]$targetNum
+          item    = $copy
+          source  = [string]$sourceNum
+          score   = $score
+          matched = $matched.ToArray()
+        }
+      }
+    }
+  }
+
+  foreach ($a in @($additions)) {
+    if (-not $BySujet.ContainsKey($a.target)) {
+      $BySujet[$a.target] = @()
+    }
+    $BySujet[$a.target] = @($BySujet[$a.target]) + @($a.item)
+    $msg = "Multi-sujet: segment=$($a.item.segment_id) timecode=$($a.item.timecode) source=$($a.source) cible=$($a.target) score=$($a.score) match=$(@($a.matched) -join ',')"
+    Write-Host $msg
+    if ($LogFile) { $msg | Add-Content $LogFile }
+  }
+
+  return $BySujet
+}
 
 function Unwrap-AdapterText {
   param([string] $Raw)
@@ -3169,6 +3303,10 @@ if (-not $segmentsObjs -or $segmentsObjs.Count -eq 0) {
 # Agrégation par numéro de sujet
 $bySujet = Aggregate-Sujets -Segments $segmentsObjs -MaxSec $maxSecInt
 
+if ($Sujets) {
+  $bySujet = Add-MultiSubjectAssignments -BySujet $bySujet -Sujets $Sujets -LogFile $logFile
+}
+
 
 if ($Global:DebriefObj) {
   $tmp = Inject-DebriefIntoBySujet -BySujet $bySujet -DebriefObj $Global:DebriefObj
@@ -3225,6 +3363,18 @@ Microsoft.PowerShell.Utility\Write-Host "Agrégation Passe 2A OK → $globalPath
 #-------------------------------------------------------------------------
 
 Microsoft.PowerShell.Utility\Write-Host "Passe 2B → Construction du GLOBAL réunion (par batches de $Pass2BatchSize segments)"
+if ($OnlyPass2BBatches -and @($OnlyPass2BBatches).Count -gt 0) {
+  Microsoft.PowerShell.Utility\Write-Host ("Pass2B reprise ciblée → batch(es) {0}" -f ((@($OnlyPass2BBatches) | Sort-Object -Unique) -join ","))
+  if ($RebuildFromPass2B) {
+    Microsoft.PowerShell.Utility\Write-Host "RebuildFromPass2B actif → global_meeting, Pass2E, Pass3E, global_by_sujet et global_final seront reconstruits"
+  }
+}
+elseif ($RebuildPass2BOnly) {
+  Microsoft.PowerShell.Utility\Write-Host "Pass2B reprise ciblée → tous les batches Pass2B existants seront recalculés"
+}
+elseif ($RebuildFromPass2B) {
+  Microsoft.PowerShell.Utility\Write-Host "RebuildFromPass2B actif → aval Pass2B reconstruit sans forcer Pass1A"
+}
 
 $pass2BDir = Join-Path $OutDir "pass2B_batches"
 New-Item -ItemType Directory -Force -Path $pass2BDir | Out-Null
@@ -3908,6 +4058,11 @@ else {
 
   $batchCount = [math]::Ceiling($segmentObjs.Count / [double]$Pass2BatchSize)
   $batchPaths = New-Object System.Collections.Generic.List[object]
+  $onlyPass2BSet = @{}
+  foreach ($n in @($OnlyPass2BBatches)) {
+    if ($n -gt 0) { $onlyPass2BSet[[int]$n] = $true }
+  }
+  $hasOnlyPass2B = ($onlyPass2BSet.Count -gt 0)
 
   for ($b = 0; $b -lt $batchCount; $b++) {
 
@@ -3922,8 +4077,20 @@ else {
     $rawPath    = "${batchBase}_raw.txt"
     $metaPath   = "${batchBase}_meta.json"
     $errorPath  = "${batchBase}_error.txt"
+    $selectedForPass2BRebuild = ($RebuildPass2BOnly -or ($hasOnlyPass2B -and $onlyPass2BSet.ContainsKey($batchIndex)))
 
-    if ((Test-Path $batchOut) -and (-not $Force)) {
+    if ($hasOnlyPass2B -and (-not $selectedForPass2BRebuild)) {
+      Microsoft.PowerShell.Utility\Write-Host "Pass2B: skip batch $batchIndex (hors reprise ciblée) → $batchOut"
+      if (Test-Path $batchOut) {
+        $batchPaths.Add($batchOut) | Out-Null
+      }
+      else {
+        Write-Warning "Pass2B: batch $batchIndex absent alors qu'il n'est pas dans -OnlyPass2BBatches: $batchOut"
+      }
+      continue
+    }
+
+    if ((Test-Path $batchOut) -and (-not $Force) -and (-not $selectedForPass2BRebuild)) {
       Microsoft.PowerShell.Utility\Write-Host "Pass2B: skip batch $batchIndex (existe) → $batchOut"
       $batchPaths.Add($batchOut) | Out-Null
       continue
@@ -4708,13 +4875,16 @@ else {
 
       $outOne = Join-Path $pass3EDir ("sujet_{0:D3}_synthese.json" -f $num)
 
-      if ((Test-Path $outOne) -and (-not $Force)) {
+      if ((Test-Path $outOne) -and (-not $Force) -and (-not $RebuildFromPass2B)) {
         Microsoft.PowerShell.Utility\Write-Host ("Pass3E: skip sujet {0:D3} (existe) → {1}" -f $num, $outOne)
         try {
           $o = (Get-Content $outOne -Raw) | ConvertFrom-Json -Depth 50
           if ($o) { $pass3eResults.Add($o) | Out-Null }
         } catch {}
         continue
+      }
+      elseif ((Test-Path $outOne) -and $RebuildFromPass2B -and (-not $Force)) {
+        Microsoft.PowerShell.Utility\Write-Host ("Pass3E: rebuild sujet {0:D3} (RebuildFromPass2B) → {1}" -f $num, $outOne)
       }
 
       $meta = [pscustomobject]@{

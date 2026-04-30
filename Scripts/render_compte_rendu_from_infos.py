@@ -16,12 +16,14 @@ DEFAULT_PIPELINE_SCRIPT = "/pipeline/powershell/cr_reunion_point_mumerotes_pipel
 DEFAULT_PROVIDER = "openai"
 DEFAULT_API_BASE = "http://openai-adapter:5055"
 DEFAULT_PSEUDO_API_BASE = ""
-DEFAULT_PSEUDO_API_KEY = os.environ.get("LOCAL_LLM_API_KEY", "").strip()
+DEFAULT_PSEUDO_API_KEY = ""
 DEFAULT_MODEL_PASS1 = "annoter_segments_remote"
 DEFAULT_MODEL_PASS2 = "annoter_segments_remote"
 DEFAULT_MODEL_PASS3 = "annoter_segments_remote_alt"
 DEFAULT_PRESET = "equilibre"
 DEFAULT_API_KEY = os.environ.get("CR_PIPELINE_API_KEY", "*CRpy#VrWz#5zh&F%ww6zY24U")
+HOST_AFFAIRES_ROOT = Path("/volume1/Affaires")
+CONTAINER_AFFAIRES_ROOT = Path("/data/Affaires")
 FINAL_JSON_FILENAMES = (
     "global.json",
     "global_meeting.json",
@@ -59,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pseudo-api-key", default=DEFAULT_PSEUDO_API_KEY, help="Cle API transmise au service Flask de pseudonymisation.")
     parser.add_argument("--pseudo-job-id", default="", help="Job ID de pseudonymisation a reutiliser en mode rendu seul.")
     parser.add_argument("--global-final", default="", help="Chemin vers un global_final.json deja produit. Si renseigne, le pipeline n'est pas relance.")
+    parser.add_argument("--docx-only", action="store_true", help="Rendu DOCX seul depuis le global_final.json canonique, sans relancer le pipeline.")
     parser.add_argument("--pseudonymize-remote", dest="pseudonymize_remote", action="store_true", help="Active la pseudonymisation pour les flux distants compte-rendu.")
     parser.add_argument("--no-pseudonymize-remote", dest="pseudonymize_remote", action="store_false", help="Desactive la pseudonymisation pour les flux distants compte-rendu.")
     parser.add_argument("--force", action="store_true", help="Ajoute -Force a la commande pipeline.")
@@ -75,9 +78,66 @@ def resolve_path_like(value: str, *, base_dir: Path) -> Path:
     return (base_dir / path).resolve()
 
 
+def normalize_affaires_path(path: Path | str, *, must_exist: bool = False) -> Path:
+    candidate = Path(str(path or "").strip())
+    if not str(candidate):
+        return candidate
+
+    variants = [candidate]
+    raw = str(candidate)
+    host_prefix = str(HOST_AFFAIRES_ROOT)
+    container_prefix = str(CONTAINER_AFFAIRES_ROOT)
+    if raw == host_prefix or raw.startswith(host_prefix + "/"):
+        variants.append(CONTAINER_AFFAIRES_ROOT / raw[len(host_prefix):].lstrip("/"))
+    elif raw == container_prefix or raw.startswith(container_prefix + "/"):
+        variants.append(HOST_AFFAIRES_ROOT / raw[len(container_prefix):].lstrip("/"))
+
+    for variant in variants:
+        if variant.exists():
+            return variant
+    return candidate if not must_exist else variants[-1]
+
+
 def load_infos(infos_path: Path) -> dict:
-    with open(infos_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    text = infos_path.read_text(encoding="utf-8-sig")
+    first_line = text.lstrip().splitlines()[0] if text.lstrip().splitlines() else ""
+    if first_line.startswith("Usage:"):
+        raise RuntimeError(f"infos_projet.json semble corrompu par une sortie Usage: {infos_path}")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"infos_projet.json n'est pas un JSON valide : {infos_path} "
+            f"(ligne {exc.lineno}, colonne {exc.colno}: {exc.msg})"
+        ) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"infos_projet.json doit contenir un objet JSON : {infos_path}")
+    return data
+
+
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def load_env_candidates(infos_path: Path) -> None:
+    script_dir = Path(__file__).resolve().parent
+    for candidate in (
+        Path.cwd() / ".env",
+        script_dir / ".env",
+        script_dir.parent / ".env",
+        infos_path.parent / ".env",
+    ):
+        load_env_file(candidate)
 
 
 def resolve_compte_rendu_config(infos: dict) -> dict:
@@ -132,12 +192,206 @@ def _find_affaires_root_from_path(candidate: Path | str) -> Path | None:
     return None
 
 
-def resolve_pseudo_api_base(args: argparse.Namespace, compte_rendu_cfg: dict) -> str:
+def resolve_pseudo_api_base(
+    args: argparse.Namespace,
+    compte_rendu_cfg: dict,
+    metadata_cfg: dict | None = None,
+    pseudo_context_cfg: dict | None = None,
+) -> str:
+    metadata_cfg = metadata_cfg or {}
+    pseudo_context_cfg = pseudo_context_cfg or {}
+    if args.docx_only:
+        return choose_first_non_empty([
+            args.pseudo_api_base,
+            os.environ.get("CR_PSEUDO_API_BASE", ""),
+            os.environ.get("PSEUDO_API_BASE", ""),
+            pseudo_context_cfg.get("pseudo_api_base", ""),
+            metadata_cfg.get("pseudo_api_base", ""),
+            compte_rendu_cfg.get("pseudo_api_base", ""),
+        ])
     return choose_first_non_empty([
         args.pseudo_api_base,
         compte_rendu_cfg.get("pseudo_api_base", ""),
         os.environ.get("CR_PSEUDO_API_BASE", ""),
         os.environ.get("PSEUDO_API_BASE", ""),
+    ])
+
+
+def resolve_docx_only_global_final(final_output_dir: Path, explicit_global_final: Path | None = None) -> tuple[Path, list[Path]]:
+    tested: list[Path] = []
+    if explicit_global_final:
+        explicit_global_final = normalize_affaires_path(explicit_global_final)
+        tested.append(explicit_global_final)
+        if explicit_global_final.exists():
+            return explicit_global_final, tested
+        raise FileNotFoundError(
+            "global_final.json explicite introuvable. Chemins testes : "
+            + " ; ".join(str(path) for path in tested)
+        )
+
+    direct = normalize_affaires_path(final_output_dir / "global_final.json")
+    tested.append(direct)
+    if direct.exists():
+        return direct, tested
+
+    out_dir = normalize_affaires_path(final_output_dir / "out")
+    run_candidates: list[Path] = []
+    if out_dir.exists():
+        run_candidates = sorted(
+            (normalize_affaires_path(path) for path in out_dir.glob("*/global_final.json")),
+            key=lambda path: path.stat().st_mtime if path.exists() else 0,
+            reverse=True,
+        )
+    tested.extend(run_candidates)
+    if run_candidates:
+        return run_candidates[0], tested
+
+    raise FileNotFoundError(
+        "global_final.json introuvable en mode docx-only. Chemins testes : "
+        + " ; ".join(str(path) for path in tested)
+    )
+
+
+def resolve_docx_only_logs_dirs(final_output_dir: Path, global_final_path: Path) -> list[Path]:
+    logs_dirs: list[Path] = []
+    canonical_logs = normalize_affaires_path(final_output_dir / "logs")
+    logs_dirs.append(canonical_logs)
+
+    parent = normalize_affaires_path(global_final_path.parent)
+    run_logs = normalize_affaires_path(parent / "logs")
+    if run_logs != canonical_logs:
+        logs_dirs.append(run_logs)
+
+    return logs_dirs
+
+
+def load_json_object(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        print(f"[CR][PSEUDO]   ignore, JSON illisible : {path} ({exc})")
+        return {}
+    if not isinstance(data, dict):
+        print(f"[CR][PSEUDO]   ignore, JSON non objet : {path}")
+        return {}
+    return data
+
+
+def resolve_pseudo_context(final_output_dir: Path, logs_dirs: list[Path]) -> tuple[dict, Path | None]:
+    direct = normalize_affaires_path(final_output_dir / "pseudo_context.json")
+    print(f"[CR][PSEUDO] pseudo_context direct teste : {direct}")
+    if direct.exists():
+        data = load_json_object(direct)
+        if data:
+            print(f"[CR][PSEUDO] pseudo_context selectionne : {direct}")
+            return data, direct
+
+    candidates: list[Path] = []
+    for logs_dir in logs_dirs:
+        logs_dir = normalize_affaires_path(logs_dir)
+        if logs_dir.exists():
+            candidates.extend(logs_dir.glob("pseudo_context_*.json"))
+    candidates = sorted(candidates, key=lambda path: path.stat().st_mtime, reverse=True)
+    print(f"[CR][PSEUDO] pseudo_context_*.json trouves : {len(candidates)}")
+    for candidate in candidates:
+        print(f"[CR][PSEUDO] - pseudo_context candidat : {candidate}")
+        data = load_json_object(candidate)
+        if data:
+            print(f"[CR][PSEUDO] pseudo_context selectionne : {candidate}")
+            return data, candidate
+    return {}, None
+
+
+def _short_metadata_summary(data: dict) -> str:
+    fields = []
+    for key in ("timestamp", "pseudo_job_id", "pseudo_api_base", "provider"):
+        value = str(data.get(key) or "").strip()
+        if value:
+            fields.append(f"{key}={value}")
+    return ", ".join(fields) if fields else "aucun champ pseudo/timestamp"
+
+
+def resolve_latest_run_metadata(logs_dirs: list[Path]) -> tuple[dict, Path | None]:
+    existing_logs_dirs = []
+    for logs_dir in logs_dirs:
+        logs_dir = normalize_affaires_path(logs_dir)
+        if logs_dir.exists():
+            existing_logs_dirs.append(logs_dir)
+        else:
+            print(f"[CR][PSEUDO] Dossier logs introuvable : {logs_dir}")
+    if not existing_logs_dirs:
+        return {}, None
+
+    candidates = []
+    for logs_dir in existing_logs_dirs:
+        candidates.extend(logs_dir.glob("run_metadata_*.json"))
+    candidates = sorted(candidates, key=lambda path: path.stat().st_mtime, reverse=True)
+    print(f"[CR][PSEUDO] run_metadata_*.json trouves : {len(candidates)}")
+    for candidate in candidates:
+        print(f"[CR][PSEUDO] - metadata candidat : {candidate}")
+
+    fallback_data: dict = {}
+    fallback_path: Path | None = None
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8-sig"))
+        except Exception as exc:
+            print(f"[CR][PSEUDO]   ignore, JSON illisible : {candidate} ({exc})")
+            continue
+        if isinstance(data, dict):
+            print(f"[CR][PSEUDO]   contenu : {_short_metadata_summary(data)}")
+            if not fallback_path:
+                fallback_data, fallback_path = data, candidate
+            if str(data.get("pseudo_job_id") or "").strip():
+                return data, candidate
+        else:
+            print(f"[CR][PSEUDO]   ignore, metadata non objet JSON : {candidate}")
+    return fallback_data, fallback_path
+
+
+def resolve_pseudo_job_id_from_logs(logs_dirs: list[Path]) -> tuple[str, Path | None]:
+    existing_logs_dirs = []
+    for logs_dir in logs_dirs:
+        logs_dir = normalize_affaires_path(logs_dir)
+        if logs_dir.exists():
+            existing_logs_dirs.append(logs_dir)
+    if not existing_logs_dirs:
+        return "", None
+
+    candidates = []
+    for logs_dir in existing_logs_dirs:
+        candidates.extend(logs_dir.glob("run_*.log"))
+    candidates = sorted(candidates, key=lambda path: path.stat().st_mtime, reverse=True)
+    print(f"[CR][PSEUDO] run_*.log trouves : {len(candidates)}")
+    patterns = [
+        re.compile(r"PseudoJobId\s*[:=]\s*(?P<value>\S+)", re.I),
+        re.compile(r"-PseudoJobId\s+(?P<value>\S+)", re.I),
+        re.compile(r"pseudo_job_id[\"']?\s*[:=]\s*[\"']?(?P<value>[^\"'\s,}]+)", re.I),
+    ]
+    for candidate in candidates:
+        print(f"[CR][PSEUDO] - log candidat : {candidate}")
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="ignore")
+        except Exception as exc:
+            print(f"[CR][PSEUDO]   ignore, log illisible : {candidate} ({exc})")
+            continue
+        for pattern in patterns:
+            match = pattern.search(text)
+            if match:
+                value = match.group("value").strip().strip('"').strip("'")
+                if value:
+                    print(f"[CR][PSEUDO]   pseudo_job_id trouve dans log : {candidate}")
+                    return value, candidate
+    return "", None
+
+
+def resolve_runtime_value(args: argparse.Namespace, infos: dict, compte_rendu_cfg: dict, name: str, default: str) -> str:
+    arg_value = getattr(args, name, "")
+    return choose_first_non_empty([
+        arg_value,
+        compte_rendu_cfg.get(name, ""),
+        infos.get(name, ""),
+        default,
     ])
 
 
@@ -150,7 +404,7 @@ def resolve_output_root(infos: dict, infos_path: Path, csv_path: Path | None = N
         infos.get("root_affaires", ""),
     ])
     if configured:
-        return Path(configured)
+        return normalize_affaires_path(Path(configured))
 
     candidates = [
         infos_path,
@@ -161,7 +415,7 @@ def resolve_output_root(infos: dict, infos_path: Path, csv_path: Path | None = N
     for candidate in candidates:
         root = _find_affaires_root_from_path(candidate)
         if root is not None:
-            return root
+            return normalize_affaires_path(root)
 
     raise RuntimeError(
         "Racine Affaires introuvable. Renseignez CR_ROOT_AFFAIRES/AFFAIRES_ROOT "
@@ -176,7 +430,7 @@ def resolve_output_dir(infos: dict, infos_path: Path, csv_path: Path | None = No
         raise RuntimeError("id_affaire ou id_captation manquant dans infos_projet.json.")
 
     root_affaires = resolve_output_root(infos, infos_path, csv_path)
-    output_dir = root_affaires / id_affaire / "BE_Traitement_captations" / id_captation / "compte_rendu_LLM"
+    output_dir = normalize_affaires_path(root_affaires / id_affaire / "BE_Traitement_captations" / id_captation / "compte_rendu_LLM")
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
@@ -269,12 +523,13 @@ def build_pipeline_command(args: argparse.Namespace, infos: dict, csv_path: Path
     root_affaires = resolve_output_root(infos, Path(args.infos).resolve(), csv_path)
     out_dir_host.mkdir(parents=True, exist_ok=True)
 
-    provider = args.provider or str(infos.get("provider") or "").strip() or DEFAULT_PROVIDER
-    api_base = args.api_base or str(infos.get("api_base") or "").strip() or DEFAULT_API_BASE
-    model_pass1 = args.model_pass1 or str(infos.get("model_pass1") or "").strip() or DEFAULT_MODEL_PASS1
-    model_pass2 = args.model_pass2 or str(infos.get("model_pass2") or "").strip() or DEFAULT_MODEL_PASS2
-    model_pass3 = args.model_pass3 or str(infos.get("model_pass3") or "").strip() or DEFAULT_MODEL_PASS3
-    preset = args.preset or str(infos.get("preset") or "").strip() or DEFAULT_PRESET
+    compte_rendu_cfg = resolve_compte_rendu_config(infos)
+    provider = resolve_runtime_value(args, infos, compte_rendu_cfg, "provider", DEFAULT_PROVIDER)
+    api_base = resolve_runtime_value(args, infos, compte_rendu_cfg, "api_base", DEFAULT_API_BASE)
+    model_pass1 = resolve_runtime_value(args, infos, compte_rendu_cfg, "model_pass1", DEFAULT_MODEL_PASS1)
+    model_pass2 = resolve_runtime_value(args, infos, compte_rendu_cfg, "model_pass2", DEFAULT_MODEL_PASS2)
+    model_pass3 = resolve_runtime_value(args, infos, compte_rendu_cfg, "model_pass3", DEFAULT_MODEL_PASS3)
+    preset = resolve_runtime_value(args, infos, compte_rendu_cfg, "preset", DEFAULT_PRESET)
 
     cmd = [
         "docker", "exec", args.container,
@@ -331,9 +586,13 @@ def promote_final_jsons(run_output_dir: Path, final_output_dir: Path) -> None:
 
 def main() -> int:
     args = parse_args()
-    infos_path = resolve_path_like(args.infos, base_dir=Path.cwd())
+    infos_path_raw = resolve_path_like(args.infos, base_dir=Path.cwd())
+    infos_path = normalize_affaires_path(infos_path_raw)
     if not infos_path.exists():
         raise FileNotFoundError(f"infos_projet.json introuvable : {infos_path}")
+
+    load_env_candidates(infos_path)
+    args.pseudo_api_key = args.pseudo_api_key or os.environ.get("LOCAL_LLM_API_KEY", "").strip()
 
     infos = load_infos(infos_path)
     compte_rendu_cfg = resolve_compte_rendu_config(infos)
@@ -342,12 +601,8 @@ def main() -> int:
     if not id_affaire or not id_captation:
         raise RuntimeError("id_affaire ou id_captation manquant dans infos_projet.json.")
 
-    pseudo_api_base = resolve_pseudo_api_base(args, compte_rendu_cfg)
-    pseudo_job_id_override = (
-        str(args.pseudo_job_id or "").strip()
-        or str(compte_rendu_cfg.get("pseudo_job_id") or "").strip()
-    )
-    args.pseudo_api_base = pseudo_api_base
+    print(f"[CR] Infos recu : {infos_path_raw}")
+    print(f"[CR] Infos normalise : {infos_path}")
 
     csv_path_for_output = None
     if infos.get("fichier_transcription"):
@@ -356,14 +611,69 @@ def main() -> int:
         except Exception:
             csv_path_for_output = None
     final_output_dir = resolve_output_dir(infos, infos_path, csv_path_for_output)
+    final_output_dir = normalize_affaires_path(final_output_dir)
+
     global_final_override = resolve_path_like(args.global_final, base_dir=infos_path.parent) if args.global_final else None
-    if global_final_override:
+    logs_dirs: list[Path] = [normalize_affaires_path(final_output_dir / "logs")]
+    if args.docx_only:
+        global_final_path, global_final_tested = resolve_docx_only_global_final(final_output_dir, global_final_override)
+        logs_dirs = resolve_docx_only_logs_dirs(final_output_dir, global_final_path)
+        print("[CR] global_final candidats testes :")
+        for candidate in global_final_tested:
+            print(f"[CR] - {candidate}")
+
+    metadata_cfg: dict = {}
+    metadata_path: Path | None = None
+    pseudo_context_cfg: dict = {}
+    pseudo_context_path: Path | None = None
+    log_pseudo_job_id = ""
+    log_pseudo_job_path: Path | None = None
+    if args.docx_only:
+        pseudo_context_cfg, pseudo_context_path = resolve_pseudo_context(final_output_dir, logs_dirs)
+        metadata_cfg, metadata_path = resolve_latest_run_metadata(logs_dirs)
+        if metadata_path:
+            print(f"[CR][PSEUDO] Metadata selectionne : {metadata_path}")
+        if not str(metadata_cfg.get("pseudo_job_id") or "").strip():
+            log_pseudo_job_id, log_pseudo_job_path = resolve_pseudo_job_id_from_logs(logs_dirs)
+
+    pseudo_api_base = resolve_pseudo_api_base(args, compte_rendu_cfg, metadata_cfg, pseudo_context_cfg)
+    pseudo_job_id_override = choose_first_non_empty([
+        args.pseudo_job_id,
+        pseudo_context_cfg.get("pseudo_job_id", ""),
+        metadata_cfg.get("pseudo_job_id", ""),
+        compte_rendu_cfg.get("pseudo_job_id", ""),
+        log_pseudo_job_id,
+    ])
+    args.pseudo_api_base = pseudo_api_base
+
+    if args.docx_only:
+        pseudo_job_id = pseudo_job_id_override
+        if args.pseudonymize_remote and not pseudo_job_id:
+            expected_metadata = " / ".join(str(logs_dir / "run_metadata_*.json") for logs_dir in logs_dirs)
+            expected_log = " / ".join(str(logs_dir / "run_*.log") for logs_dir in logs_dirs)
+            raise RuntimeError(
+                "pseudo_job_id introuvable pour la depseudonymisation finale. "
+                "Renseignez --pseudo-job-id, restaurez compte_rendu.pseudo_job_id "
+                "ou verifiez compte_rendu_LLM/pseudo_context.json, "
+                f"ou verifiez les fichiers attendus : {expected_metadata} / {expected_log}. "
+                "Sans pseudo_job_id associe au registre de pseudonymisation, le DOCX ne peut pas etre depseudonymise."
+            )
+    elif global_final_override:
+        global_final_override = normalize_affaires_path(global_final_override)
         global_final_path = global_final_override
         if not global_final_path.exists():
             raise FileNotFoundError(f"global_final.json introuvable : {global_final_path}")
         pseudo_job_id = pseudo_job_id_override
         if args.pseudonymize_remote and not pseudo_job_id:
-            raise RuntimeError("--pseudo-job-id est requis avec --global-final quand la depseudonymisation distante est active.")
+            expected_metadata = logs_dirs[0] / "run_metadata_*.json"
+            expected_log = logs_dirs[0] / "run_*.log"
+            raise RuntimeError(
+                "pseudo_job_id introuvable pour la depseudonymisation finale. "
+                "Renseignez --pseudo-job-id, restaurez compte_rendu.pseudo_job_id "
+                "ou verifiez compte_rendu_LLM/pseudo_context.json, "
+                f"ou verifiez les fichiers attendus : {expected_metadata} / {expected_log}. "
+                "Sans pseudo_job_id associe au registre de pseudonymisation, le DOCX ne peut pas etre depseudonymise."
+            )
     else:
         csv_path = resolve_csv_path(infos, infos_path, args.csv)
         final_output_dir = resolve_output_dir(infos, infos_path, csv_path)
@@ -392,19 +702,28 @@ def main() -> int:
         promote_final_jsons(pipeline_out_dir, final_output_dir)
         global_final_path = final_output_dir / "global_final.json"
 
+    if args.docx_only:
+        print(f"[CR] Dossier compte_rendu_LLM : {final_output_dir}")
+        for logs_dir in logs_dirs:
+            print(f"[CR] Dossier logs utilise : {logs_dir}")
+        if pseudo_context_path:
+            print(f"[CR][PSEUDO] pseudo_context utilise : {pseudo_context_path}")
+        if log_pseudo_job_path:
+            print(f"[CR][PSEUDO] pseudo_job_id lu depuis log : {log_pseudo_job_path}")
+        print(f"[CR][PSEUDO] PseudoApiBase utilisee : {pseudo_api_base or '(non configuree)'}")
     print(f"[CR] global_final.json : {global_final_path}")
 
     payload_text = global_final_path.read_text(encoding="utf-8")
-    provider = args.provider or str(infos.get("provider") or "").strip() or DEFAULT_PROVIDER
-    model_pass1 = args.model_pass1 or str(infos.get("model_pass1") or "").strip() or DEFAULT_MODEL_PASS1
-    model_pass2 = args.model_pass2 or str(infos.get("model_pass2") or "").strip() or DEFAULT_MODEL_PASS2
-    model_pass3 = args.model_pass3 or str(infos.get("model_pass3") or "").strip() or DEFAULT_MODEL_PASS3
+    provider = resolve_runtime_value(args, infos, compte_rendu_cfg, "provider", DEFAULT_PROVIDER)
+    model_pass1 = resolve_runtime_value(args, infos, compte_rendu_cfg, "model_pass1", DEFAULT_MODEL_PASS1)
+    model_pass2 = resolve_runtime_value(args, infos, compte_rendu_cfg, "model_pass2", DEFAULT_MODEL_PASS2)
+    model_pass3 = resolve_runtime_value(args, infos, compte_rendu_cfg, "model_pass3", DEFAULT_MODEL_PASS3)
     if args.pseudonymize_remote and pipeline_uses_remote_llm(provider, model_pass1, model_pass2, model_pass3):
         if not pseudo_api_base:
             raise RuntimeError(
                 "Pseudonymisation distante activee mais aucune base URL n'est configuree. "
-                "Utilisez --pseudo-api-base, compte_rendu.pseudo_api_base, "
-                "CR_PSEUDO_API_BASE ou PSEUDO_API_BASE."
+                "Utilisez CR_PSEUDO_API_BASE, PSEUDO_API_BASE, --pseudo-api-base "
+                "ou compte_rendu.pseudo_api_base."
             )
         print(f"[CR][PSEUDO] depseudonymisation finale via {pseudo_api_base} job_id={pseudo_job_id}")
         payload_json = depseudonymize_final_payload(

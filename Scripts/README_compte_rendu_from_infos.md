@@ -298,13 +298,118 @@ python D:\GPT4All_Local\scripts\compte-rendu\render_compte_rendu_from_infos.py `
 
 ### Mode rendu seul sans relancer le pipeline
 
+Commande NAS recommandee :
+
+```bash
+cd /volume1/home/nicolas/Docker/compte-rendu/Scripts
+
+./render_docx_only_from_infos.sh \
+  "/volume1/Affaires/2025-J46/AF_Expert_ASR/transcriptions/accedit-2025-11-06/infos_projet.json"
+```
+
+Cette commande :
+
+- ne lance pas `cr_reunion_point_mumerotes_pipeline_json.ps1`
+- ne lance pas `docker exec cr-pipeline`
+- ne regenere aucun JSON
+- accepte les chemins hote NAS `/volume1/Affaires/...` et conteneur `/data/Affaires/...`
+- relit `global_final.json` dans le dossier canonique `BE_Traitement_captations/<id_captation>/compte_rendu_LLM/`
+- si absent, relit le plus recent `BE_Traitement_captations/<id_captation>/compte_rendu_LLM/out/*/global_final.json`
+- relit d'abord `compte_rendu_LLM/pseudo_context.json` pour les metadata de pseudonymisation
+- sinon relit le plus recent `logs/pseudo_context_*.json`
+- relit `compte_rendu.pseudo_job_id` et `compte_rendu.pseudo_api_base` depuis `infos_projet.json`
+- si `compte_rendu.pseudo_job_id` est absent, relit le plus recent `logs/run_metadata_*.json`
+- si les metadata ne contiennent pas `pseudo_job_id`, cherche un `PseudoJobId` dans le plus recent `logs/run_*.log`
+- charge automatiquement le `.env` du dossier parent de `Scripts`
+- relit `LOCAL_LLM_API_KEY` depuis l'environnement ou ce `.env`
+
+En mode `--docx-only`, la base de pseudonymisation est resolue dans cet ordre :
+
+1. `CR_PSEUDO_API_BASE`
+2. `PSEUDO_API_BASE`
+3. `compte_rendu_LLM/pseudo_context.json`
+4. le plus recent `logs/pseudo_context_*.json`
+5. le plus recent `logs/run_metadata_*.json`
+6. `infos_projet.json -> compte_rendu.pseudo_api_base`
+
+Le `pseudo_job_id` est resolu dans cet ordre :
+
+1. `--pseudo-job-id`
+2. `compte_rendu_LLM/pseudo_context.json`
+3. le plus recent `logs/pseudo_context_*.json`
+4. le plus recent `logs/run_metadata_*.json`
+5. `infos_projet.json -> compte_rendu.pseudo_job_id`
+
+La cle API n'est jamais affichee dans les logs.
+
+Au demarrage, le script affiche les chemins effectifs utilises :
+
+- chemin `infos_projet.json` recu et normalise ;
+- dossier `compte_rendu_LLM` ;
+- dossier `logs` ;
+- `global_final.json` ;
+- `PseudoApiBase` retenue.
+- le `pseudo_context` inspecte ou retenu ;
+- les `run_metadata_*.json` et `run_*.log` inspectes pour retrouver `pseudo_job_id`.
+
+La recherche du JSON final suit cet ordre :
+
+1. `--global-final` explicite ;
+2. `compte_rendu_LLM/global_final.json` ;
+3. le plus recent `compte_rendu_LLM/out/*/global_final.json`.
+
+Les metadata/logs de pseudonymisation sont cherches dans `compte_rendu_LLM/logs/` et, si le JSON final vient d'un run, dans `compte_rendu_LLM/out/<job_id>/logs/`.
+
+Le pipeline complet ecrit aussi un fichier de contexte pseudo independant de `infos_projet.json` :
+
+```text
+compte_rendu_LLM/pseudo_context.json
+compte_rendu_LLM/logs/pseudo_context_<YYYYMMDD_HHMMSS>.json
+```
+
+Ces fichiers ne contiennent pas la cle API. Ils evitent de dependre uniquement de `infos_projet.json`, qui peut etre resynchronise ou regenere par les flux NAS/PC fixe.
+
+### Restauration si `infos_projet.json` a ete corrompu
+
+Si `infos_projet.json` contient une sortie de script au lieu du JSON attendu, par exemple une ligne commencant par `Usage:`, ne pas relancer le pipeline.
+
+Procedure :
+
+1. recopier un `infos_projet.json` sain depuis la source PC fixe ou depuis une sauvegarde NAS ;
+2. verifier que le fichier restaure contient bien du JSON ;
+3. relancer uniquement le wrapper corrige :
+
+```bash
+cd /volume1/home/nicolas/Docker/compte-rendu/Scripts
+
+./render_docx_only_from_infos.sh \
+  "/volume1/Affaires/2025-J46/AF_Expert_ASR/transcriptions/accedit-2025-11-06/infos_projet.json"
+```
+
+Le wrapper refuse maintenant de continuer si le fichier passe en premier argument n'est pas un JSON valide ou s'il commence par `Usage:`.
+
+Si le JSON final n'est pas dans l'emplacement canonique :
+
+```bash
+./render_docx_only_from_infos.sh \
+  "/volume1/Affaires/2025-J46/AF_Expert_ASR/transcriptions/accedit-2025-11-06/infos_projet.json" \
+  --global-final "/volume1/Affaires/2025-J46/BE_Traitement_captations/accedit-2025-11-06/compte_rendu_LLM/global_final.json"
+```
+
+Equivalent Python :
+
+```bash
+python3 ./render_compte_rendu_from_infos.py \
+  --infos "/volume1/Affaires/2025-J46/AF_Expert_ASR/transcriptions/accedit-2025-11-06/infos_projet.json" \
+  --docx-only
+```
+
 ```powershell
 python "\\192.168.0.155\GPT4All_Local\scripts\compte-rendu\render_compte_rendu_from_infos.py" `
   --infos "\\192.168.0.155\Affaires\2025-J46\AF_Expert_ASR\transcriptions\accedit-2025-11-06\infos_projet.json" `
   --global-final "\\192.168.0.155\Affaires\2025-J46\BE_Traitement_captations\accedit-2025-11-06\compte_rendu_LLM\global_final.json" `
   --pseudo-job-id "job_test_pseudo_2025J46" `
-  --pseudo-api-base "http://192.168.0.155:5050" `
-  --pseudo-api-key "hy^wQ#4d3HpnEl4x1Mg&"
+  --pseudo-api-base "http://192.168.0.155:5050"
 ```
 
 Ce mode permet de tester uniquement :
