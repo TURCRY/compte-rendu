@@ -12,6 +12,7 @@ DRY_RUN=0
 FORCE=0
 STRICT_SYNC=0
 ONLY_PASS2B_BATCHES=""
+ONLY_SUBJECTS=""
 EXISTING_RUN=""
 EXPLICIT_OUT_DIR=""
 REPRISE_PASS2B=0
@@ -36,6 +37,14 @@ while [[ $# -gt 0 ]]; do
       fi
       shift 2
       ;;
+    --only-subjects)
+      ONLY_SUBJECTS="${2:-}"
+      if [[ -z "$ONLY_SUBJECTS" ]]; then
+        echo "ERREUR: --only-subjects attend une liste, ex: 1,2,3"
+        exit 2
+      fi
+      shift 2
+      ;;
     --existing-run)
       EXISTING_RUN="${2:-}"
       if [[ -z "$EXISTING_RUN" ]]; then
@@ -53,12 +62,12 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     -h|--help)
-      echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run] [--force|--no-force] [--docx-only] [--only-pass2b-batches \"9\"|\"7,9\"] [--existing-run job_...] [--out-dir /chemin/run]"
+      echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run] [--force|--no-force] [--docx-only] [--only-pass2b-batches \"9\"|\"7,9\"] [--only-subjects \"1,2,3\"] [--existing-run job_...] [--out-dir /chemin/run]"
       exit 0
       ;;
     *)
       echo "Option inconnue: $1"
-      echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run] [--force|--no-force] [--docx-only] [--only-pass2b-batches \"9\"|\"7,9\"] [--existing-run job_...] [--out-dir /chemin/run]"
+      echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run] [--force|--no-force] [--docx-only] [--only-pass2b-batches \"9\"|\"7,9\"] [--only-subjects \"1,2,3\"] [--existing-run job_...] [--out-dir /chemin/run]"
       echo "STRICT_SYNC : $([[ $STRICT_SYNC -eq 1 ]] && echo 'ON' || echo 'OFF')"
       exit 2
       ;;
@@ -66,7 +75,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$INFOS" ]]; then
-  echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run] [--force|--no-force] [--docx-only] [--only-pass2b-batches \"9\"|\"7,9\"] [--existing-run job_...] [--out-dir /chemin/run]"
+  echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run] [--force|--no-force] [--docx-only] [--only-pass2b-batches \"9\"|\"7,9\"] [--only-subjects \"1,2,3\"] [--existing-run job_...] [--out-dir /chemin/run]"
   exit 2
 fi
 if [[ ! -f "$INFOS" ]]; then
@@ -86,8 +95,24 @@ if [[ -n "$ONLY_PASS2B_BATCHES" ]]; then
     PASS2B_BATCHES_ARR+=("$batch_num")
   done
 fi
-if [[ $DOCX_ONLY -eq 1 && -n "$ONLY_PASS2B_BATCHES" ]]; then
-  echo "ERREUR: --docx-only ne peut pas être combiné avec --only-pass2b-batches."
+ONLY_SUBJECTS_ARR=()
+if [[ -n "$ONLY_SUBJECTS" ]]; then
+  IFS=',' read -r -a _only_subjects_raw <<< "$ONLY_SUBJECTS"
+  for subject_num in "${_only_subjects_raw[@]}"; do
+    subject_num="${subject_num//[[:space:]]/}"
+    if [[ -z "$subject_num" || ! "$subject_num" =~ ^[0-9]+$ || "$subject_num" -eq 0 ]]; then
+      echo "ERREUR: --only-subjects doit contenir des entiers > 0 séparés par des virgules: $ONLY_SUBJECTS"
+      exit 2
+    fi
+    ONLY_SUBJECTS_ARR+=("$subject_num")
+  done
+fi
+if [[ $DOCX_ONLY -eq 1 && ( -n "$ONLY_PASS2B_BATCHES" || -n "$ONLY_SUBJECTS" ) ]]; then
+  echo "ERREUR: --docx-only ne peut pas être combiné avec une reprise ciblée."
+  exit 2
+fi
+if [[ -n "$ONLY_PASS2B_BATCHES" && -n "$ONLY_SUBJECTS" ]]; then
+  echo "ERREUR: utilisez soit --only-pass2b-batches, soit --only-subjects, pas les deux."
   exit 2
 fi
 
@@ -278,6 +303,15 @@ elif [[ ${#PASS2B_BATCHES_ARR[@]} -gt 0 ]]; then
   fi
   RUN_JOB_ID="$(basename "$OUT_DIR")"
   REUSE_EXISTING_RUN=1
+elif [[ ${#ONLY_SUBJECTS_ARR[@]} -gt 0 ]]; then
+  OUT_DIR="$(docker exec cr-pipeline sh -lc "ls -1td \"$OUT_ROOT\"/out/job_* 2>/dev/null | while IFS= read -r d; do if [ -d \"\$d/segments\" ] && [ -f \"\$d/global.json\" ]; then echo \"\$d\"; break; fi; done")"
+  if [[ -z "$OUT_DIR" ]]; then
+    echo "ERREUR: aucun run existant exploitable trouvé dans ${OUT_ROOT}/out/job_*"
+    echo "Attendu: segments/ et global.json"
+    exit 2
+  fi
+  RUN_JOB_ID="$(basename "$OUT_DIR")"
+  REUSE_EXISTING_RUN=1
 elif [[ $FORCE -eq 0 ]]; then
   EXISTING_OUT_DIR="$(docker exec cr-pipeline sh -lc "ls -1td \"$OUT_ROOT\"/out/job_* 2>/dev/null | while IFS= read -r d; do if [ -f \"\$d/global.json\" ] || [ -d \"\$d/segments\" ]; then echo \"\$d\"; break; fi; done")"
   if [[ -n "$EXISTING_OUT_DIR" ]]; then
@@ -292,6 +326,8 @@ if [[ $REUSE_EXISTING_RUN -eq 1 ]]; then
     RESUME_RUN_MSG="Generation DOCX sur run existant : $OUT_DIR"
   elif [[ ${#PASS2B_BATCHES_ARR[@]} -gt 0 ]]; then
     RESUME_RUN_MSG="Reprise ciblée sur run existant : $OUT_DIR"
+  elif [[ ${#ONLY_SUBJECTS_ARR[@]} -gt 0 ]]; then
+    RESUME_RUN_MSG="Reprise sujets ciblés sur run existant : $OUT_DIR"
   else
     RESUME_RUN_MSG="Reprise sur run existant : $OUT_DIR"
   fi
@@ -443,6 +479,11 @@ elif [[ ${REPRISE_PASS2B:-0} -eq 1 ]]; then
     exit 2
   fi
 
+  docker exec cr-pipeline sh -lc "mkdir -p \"$OUT_DIR/logs\""
+elif [[ ${#ONLY_SUBJECTS_ARR[@]} -gt 0 ]]; then
+  docker exec cr-pipeline sh -lc "test -d \"$OUT_DIR\" || (echo 'KO: run existant introuvable: $OUT_DIR' && exit 2)"
+  docker exec cr-pipeline sh -lc "test -d \"$OUT_DIR/segments\" || (echo 'KO: segments/ absent dans le run: $OUT_DIR' && exit 2)"
+  docker exec cr-pipeline sh -lc "test -f \"$OUT_DIR/global.json\" || (echo 'KO: global.json absent dans le run: $OUT_DIR' && exit 2)"
   docker exec cr-pipeline sh -lc "mkdir -p \"$OUT_DIR/logs\""
 elif [[ ${REUSE_EXISTING_RUN:-0} -eq 1 ]]; then
   docker exec cr-pipeline sh -lc "test -d \"$OUT_DIR\" || (echo 'KO: run existant introuvable: $OUT_DIR' && exit 2)"
@@ -667,6 +708,11 @@ if [[ -n "$ONLY_PASS2B_BATCHES" ]]; then
     cmd+=("$batch_num")
   done
   echo "Reprise ciblée Pass2B : batch(es) $ONLY_PASS2B_BATCHES ; aval reconstruit depuis Pass2B."
+fi
+
+if [[ -n "$ONLY_SUBJECTS" ]]; then
+  cmd+=(-RebuildFromSubjects -OnlySubjectsCsv "$ONLY_SUBJECTS")
+  echo "Reprise ciblée sujets : sujet(s) $ONLY_SUBJECTS ; split, Pass2E, Pass3E et aval reconstruits."
 fi
 
 echo "=== Commande ==="

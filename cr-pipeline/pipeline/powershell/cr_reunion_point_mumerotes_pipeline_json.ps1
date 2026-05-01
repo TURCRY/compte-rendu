@@ -65,14 +65,42 @@ param(
 
   # Relance
   [switch] $RebuildFromPass2B,
+  [switch] $RebuildFromSubjects,
   [switch] $RebuildPass2BOnly,
   [int[]] $OnlyPass2BBatches = @(),
+  [int[]] $OnlySubjects = @(),
+  [string] $OnlySubjectsCsv = "",
   [switch] $Force
 
 )
+[int[]] $OnlySubjectsEffective = @()
+if (-not [string]::IsNullOrWhiteSpace($OnlySubjectsCsv)) {
+  $OnlySubjectsEffective = @(
+    $OnlySubjectsCsv -split "," |
+      ForEach-Object { ([string]$_).Trim() } |
+      Where-Object { $_ -ne "" } |
+      ForEach-Object {
+        if ($_ -notmatch '^\d+$' -or [int]$_ -le 0) {
+          throw "OnlySubjectsCsv invalide: '$OnlySubjectsCsv'. Attendu: liste d'entiers, ex: 1,2,3"
+        }
+        [int]$_
+      }
+  )
+}
+elseif ($OnlySubjects -and @($OnlySubjects).Count -gt 0) {
+  $OnlySubjectsEffective = @($OnlySubjects | Where-Object { $_ -gt 0 } | ForEach-Object { [int]$_ })
+}
 [bool] $HasOnlyPass2BBatches = ($OnlyPass2BBatches -and @($OnlyPass2BBatches).Count -gt 0)
 if ($HasOnlyPass2BBatches -and (-not $RebuildFromPass2B)) {
   $RebuildFromPass2B = $true
+}
+[bool] $HasOnlySubjects = ($OnlySubjectsEffective -and @($OnlySubjectsEffective).Count -gt 0)
+if ($HasOnlySubjects -and (-not $RebuildFromSubjects)) {
+  $RebuildFromSubjects = $true
+}
+$onlySubjectsSet = @{}
+foreach ($n in @($OnlySubjectsEffective)) {
+  if ($n -gt 0) { $onlySubjectsSet[[int]$n] = $true }
 }
 [int]$ChunkSize = 30 # voir fonction Get-IntelligentSegments (nombre de ligne de transcription par segment
 
@@ -159,6 +187,20 @@ if ($Pass2BatchSize -lt 1) {
     $Pass2BatchSize = 1
 }
 
+$modelGuard = @{
+  Model       = $Model
+  ModelPass2E = $ModelPass2E
+  ModelPass3E = $ModelPass3E
+  ModelReport = $ModelReport
+}
+foreach ($kv in $modelGuard.GetEnumerator()) {
+  if ([string]$kv.Value -match '^\d+$') {
+    throw ("Paramètres incohérents: {0}='{1}' ressemble à un numéro de sujet. Vérifier le passage de -OnlySubjectsCsv / -OnlySubjects." -f $kv.Key, $kv.Value)
+  }
+}
+if ($PSBoundParameters.ContainsKey('Pass2BatchSize') -and $HasOnlySubjects -and (@($OnlySubjectsEffective) -contains [int]$Pass2BatchSize)) {
+  throw ("Paramètres incohérents: Pass2BatchSize={0} correspond à un sujet ciblé. Vérifier que les sujets sont transmis via -OnlySubjectsCsv '1,2,3'." -f $Pass2BatchSize)
+}
 
 Microsoft.PowerShell.Utility\Write-Host "==== PARAMS PIPELINE ====" -ForegroundColor Cyan
 Microsoft.PowerShell.Utility\Write-Host ("Provider       = {0}" -f $Provider)
@@ -181,6 +223,9 @@ Microsoft.PowerShell.Utility\Write-Host ("ModelPass3     = {0}" -f $ModelPass3)
 Microsoft.PowerShell.Utility\Write-Host ("ModelPass3E    = {0}" -f $ModelPass3E)
 Microsoft.PowerShell.Utility\Write-Host ("ModelReport    = {0}" -f $ModelReport)
 Microsoft.PowerShell.Utility\Write-Host ("Pass2BatchSize = {0}" -f $Pass2BatchSize)
+if ($HasOnlySubjects) {
+  Microsoft.PowerShell.Utility\Write-Host ("OnlySubjects   = {0}" -f ((@($OnlySubjectsEffective) | Sort-Object -Unique) -join ","))
+}
 
 
 if ($ApiKey) {
@@ -946,10 +991,56 @@ function Cosine-Sim($a,$b){ if(-not $a.Keys.Count -or -not $b.Keys.Count){return
 
 function Normalize-TextForSubjectMatch([string]$Text) {
   if ([string]::IsNullOrWhiteSpace($Text)) { return "" }
-  $t = $Text.ToLowerInvariant()
+  $t = $Text.ToLowerInvariant().Normalize([System.Text.NormalizationForm]::FormD)
+  $chars = New-Object System.Text.StringBuilder
+  foreach ($ch in $t.ToCharArray()) {
+    if ([System.Globalization.CharUnicodeInfo]::GetUnicodeCategory($ch) -ne [System.Globalization.UnicodeCategory]::NonSpacingMark) {
+      [void]$chars.Append($ch)
+    }
+  }
+  $t = $chars.ToString().Normalize([System.Text.NormalizationForm]::FormC)
   $t = $t -replace "[\u2010-\u2015]", "-"
   $t = $t -replace "\s+", " "
   return $t.Trim()
+}
+
+function Get-SubjectMatchTokens([string]$Text) {
+  $norm = Normalize-TextForSubjectMatch $Text
+  if (-not $norm) { return @() }
+  $stop = @{
+    "avec"=$true; "dans"=$true; "pour"=$true; "sans"=$true; "sous"=$true; "sur"=$true
+    "entre"=$true; "comme"=$true; "plus"=$true; "moins"=$true; "cette"=$true; "celui"=$true
+    "celle"=$true; "elles"=$true; "leurs"=$true; "notre"=$true; "votre"=$true; "nous"=$true
+    "vous"=$true; "fait"=$true; "faite"=$true; "ete"=$true; "sont"=$true; "avoir"=$true
+    "reserve"=$true; "reserves"=$true; "porte"=$true; "fenetre"=$true; "garage"=$true
+    "niveau"=$true; "cote"=$true; "chaque"=$true
+  }
+  $tokens = @()
+  foreach ($tok in @($norm -split "[^a-z0-9]+")) {
+    if ($tok.Length -lt 4) { continue }
+    if ($stop.ContainsKey($tok)) { continue }
+    $tokens += $tok
+  }
+  return @($tokens)
+}
+
+function Get-SubjectRepairTokens([string]$Text) {
+  $norm = Normalize-TextForSubjectMatch $Text
+  if (-not $norm) { return @() }
+  $stop = @{
+    "avec"=$true; "dans"=$true; "pour"=$true; "sans"=$true; "sous"=$true; "sur"=$true
+    "entre"=$true; "comme"=$true; "plus"=$true; "moins"=$true; "cette"=$true; "celui"=$true
+    "celle"=$true; "elles"=$true; "leurs"=$true; "notre"=$true; "votre"=$true; "nous"=$true
+    "vous"=$true; "fait"=$true; "faite"=$true; "ete"=$true; "sont"=$true; "avoir"=$true
+    "reserve"=$true; "reserves"=$true; "niveau"=$true; "cote"=$true; "chaque"=$true
+  }
+  $tokens = @()
+  foreach ($tok in @($norm -split "[^a-z0-9]+")) {
+    if ($tok.Length -lt 4) { continue }
+    if ($stop.ContainsKey($tok)) { continue }
+    if ($tokens -notcontains $tok) { $tokens += $tok }
+  }
+  return @($tokens)
 }
 
 function Get-ControlledSubjectAliases {
@@ -965,7 +1056,7 @@ function Get-ControlledSubjectAliases {
     # Controlled aliases for cave / sous-sol disorders.
     # Additive only: copies already extracted interventions to an extra subject.
     if ($label -match "cave|sous-sol|sous sol") {
-      $rules[[string]$num] = @(
+      $rules[([string]$num)] = @(
         @{ pattern = "cave"; score = 2; label = "cave" },
         @{ pattern = "sous(-| )sol"; score = 2; label = "sous-sol" },
         @{ pattern = "garage en dessous"; score = 2; label = "garage en dessous" },
@@ -974,6 +1065,49 @@ function Get-ControlledSubjectAliases {
         @{ pattern = "sous la terrasse|sous terrasse"; score = 2; label = "sous terrasse" },
         @{ pattern = "en bas correctement"; score = 2; label = "en bas correctement" }
       )
+    }
+
+    # Generic reserve fallback: when a reserve subject is empty, allow a segment
+    # already attached elsewhere to be copied if it clearly matches the reserve
+    # code or several consecutive distinctive words from the reserve description.
+    $title = Normalize-TextForSubjectMatch ([string]$sj.Titre)
+    if ($title -match "\breserve\s+(r\s*s?\s*\d+|rs\s*\d+)\b") {
+      $subjectRules = @()
+      if ($rules.ContainsKey([string]$num)) {
+        $subjectRules = @($rules[([string]$num)])
+      }
+
+      $reserveCode = ($matches[1] -replace "\s+", "").ToUpperInvariant()
+      if ($reserveCode -match "^RS(\d+)$") {
+        $digits = $matches[1]
+        $subjectRules += @{ pattern = "\br\s*s\s*$digits\b"; score = 5; label = "code $reserveCode"; fallback_empty_only = $true }
+        $subjectRules += @{ pattern = "\breserve\s+supplementaire\s*$digits\b"; score = 5; label = "reserve supplementaire $digits"; fallback_empty_only = $true }
+      }
+      elseif ($reserveCode -match "^R(\d+)$") {
+        $digits = $matches[1]
+        $subjectRules += @{ pattern = "\br\s*$digits\b"; score = 5; label = "code $reserveCode"; fallback_empty_only = $true }
+        $subjectRules += @{ pattern = "\breserve\s+(r\s*)?$digits\b"; score = 5; label = "reserve $reserveCode"; fallback_empty_only = $true }
+      }
+
+      $tokens = @(Get-SubjectMatchTokens ("{0} {1}" -f $sj.Description, $sj.Localisation))
+      $seenPairs = @{}
+      for ($i = 0; $i -lt ($tokens.Count - 1); $i++) {
+        $a = [regex]::Escape($tokens[$i])
+        $b = [regex]::Escape($tokens[($i + 1)])
+        $pairKey = "$a|$b"
+        if ($seenPairs.ContainsKey($pairKey)) { continue }
+        $seenPairs[$pairKey] = $true
+        $subjectRules += @{
+          pattern = "\b$a\b.{0,80}\b$b\b"
+          score = 3
+          label = ("phrase {0} {1}" -f $tokens[$i], $tokens[($i + 1)])
+          fallback_empty_only = $true
+        }
+      }
+
+      if (@($subjectRules).Count -gt 0) {
+        $rules[([string]$num)] = @($subjectRules)
+      }
     }
   }
   return $rules
@@ -998,9 +1132,9 @@ function Add-MultiSubjectAssignments {
 
   $existingKeys = @{}
   foreach ($num in @($BySujet.Keys)) {
-    $existingKeys[[string]$num] = @{}
+    $existingKeys[([string]$num)] = @{}
     foreach ($iv in @($BySujet[$num])) {
-      $existingKeys[[string]$num][(Get-InterventionKeyForMultiSubject $iv)] = $true
+      $existingKeys[([string]$num)][(Get-InterventionKeyForMultiSubject $iv)] = $true
     }
   }
 
@@ -1014,16 +1148,23 @@ function Add-MultiSubjectAssignments {
         if ([string]$targetNum -eq [string]$sourceNum) { continue }
 
         $score = 0
+        $matchedFallbackOnly = $true
         $matched = New-Object System.Collections.Generic.List[string]
         foreach ($rule in @($rulesBySubject[$targetNum])) {
           if ($text -match $rule.pattern) {
             $score += [int]$rule.score
             $matched.Add([string]$rule.label) | Out-Null
+            if (-not $rule.ContainsKey('fallback_empty_only') -or -not [bool]$rule.fallback_empty_only) {
+              $matchedFallbackOnly = $false
+            }
           }
         }
 
         # Conservative threshold: one strong phrase/term or two weak cues.
         if ($score -lt 2) { continue }
+        if ($matchedFallbackOnly -and $BySujet.ContainsKey([string]$targetNum) -and @($BySujet[([string]$targetNum)]).Count -gt 0) {
+          continue
+        }
 
         $copy = [pscustomobject]@{
           segment_id = $iv.segment_id
@@ -1042,11 +1183,11 @@ function Add-MultiSubjectAssignments {
 
         $key = Get-InterventionKeyForMultiSubject $copy
         if (-not $existingKeys.ContainsKey([string]$targetNum)) {
-          $existingKeys[[string]$targetNum] = @{}
+          $existingKeys[([string]$targetNum)] = @{}
         }
-        if ($existingKeys[[string]$targetNum].ContainsKey($key)) { continue }
+        if ($existingKeys[([string]$targetNum)].ContainsKey($key)) { continue }
 
-        $existingKeys[[string]$targetNum][$key] = $true
+        $existingKeys[([string]$targetNum)][$key] = $true
         $additions += [pscustomobject]@{
           target  = [string]$targetNum
           item    = $copy
@@ -1066,6 +1207,132 @@ function Add-MultiSubjectAssignments {
     $msg = "Multi-sujet: segment=$($a.item.segment_id) timecode=$($a.item.timecode) source=$($a.source) cible=$($a.target) score=$($a.score) match=$(@($a.matched) -join ',')"
     Write-Host $msg
     if ($LogFile) { $msg | Add-Content $LogFile }
+  }
+
+  return $BySujet
+}
+
+function Repair-EmptySubjectsFromSegments {
+  param(
+    [Parameter(Mandatory=$true)] [hashtable] $BySujet,
+    [Parameter(Mandatory=$true)] [array] $Segments,
+    [Parameter(Mandatory=$true)] [array] $Sujets,
+    [hashtable] $OnlySubjectsSet = @{},
+    [int] $MaxPerSubject = 8,
+    [string] $LogFile
+  )
+
+  if (-not $OnlySubjectsSet -or $OnlySubjectsSet.Count -eq 0) { return $BySujet }
+
+  $subjectByNum = @{}
+  foreach ($sj in @($Sujets)) {
+    if ($null -eq $sj -or $null -eq $sj.Numero) { continue }
+    $subjectByNum[[int]$sj.Numero] = $sj
+  }
+
+  $allInterventions = @()
+  foreach ($seg in @($Segments)) {
+    if (-not $seg -or -not $seg.PSObject.Properties['sujets'] -or -not $seg.sujets) { continue }
+    $segId = if ($seg.PSObject.Properties['segment_id']) { [string]$seg.segment_id } else { "" }
+    foreach ($p in @($seg.sujets.PSObject.Properties)) {
+      $sourceNum = [string]$p.Name
+      foreach ($iv in @($p.Value)) {
+        if (-not $iv -or -not $iv.PSObject.Properties['texte']) { continue }
+        $txt = ([string]$iv.texte).Trim()
+        if (-not $txt) { continue }
+        $allInterventions += [pscustomobject]@{
+          segment_id = if ($iv.PSObject.Properties['segment_id'] -and $iv.segment_id) { [string]$iv.segment_id } else { $segId }
+          timecode   = if ($iv.PSObject.Properties['timecode']) { $iv.timecode } else { $null }
+          auteur     = if ($iv.PSObject.Properties['auteur']) { $iv.auteur } else { $null }
+          role       = if ($iv.PSObject.Properties['role']) { $iv.role } else { $null }
+          texte      = $txt
+          source_sujet_principal = $sourceNum
+        }
+      }
+    }
+  }
+
+  foreach ($targetNumObj in @($OnlySubjectsSet.Keys)) {
+    $targetNum = [int]$targetNumObj
+    $targetKey = [string]$targetNum
+    if (-not $subjectByNum.ContainsKey($targetNum)) { continue }
+    if ($BySujet.ContainsKey($targetKey) -and @($BySujet[$targetKey]).Count -gt 0) { continue }
+
+    $sj = $subjectByNum[$targetNum]
+    $title = [string]$sj.Titre
+    $label = "{0} {1} {2}" -f $sj.Titre, $sj.Localisation, $sj.Description
+    $tokens = @(Get-SubjectRepairTokens $label)
+    $codePatterns = @()
+    $normTitle = Normalize-TextForSubjectMatch $title
+    if ($normTitle -match "\breserve\s+(r\s*s?\s*\d+|rs\s*\d+)\b") {
+      $reserveCode = ($matches[1] -replace "\s+", "").ToUpperInvariant()
+      if ($reserveCode -match "^RS(\d+)$") {
+        $digits = $matches[1]
+        $codePatterns += "\br\s*s\s*$digits\b"
+        $codePatterns += "\breserve\s+supplementaire\s*$digits\b"
+      }
+      elseif ($reserveCode -match "^R(\d+)$") {
+        $digits = $matches[1]
+        $codePatterns += "\br\s*$digits\b"
+        $codePatterns += "\breserve\s+(r\s*)?$digits\b"
+      }
+    }
+
+    $candidates = @()
+    foreach ($iv in @($allInterventions)) {
+      $textNorm = Normalize-TextForSubjectMatch ([string]$iv.texte)
+      if (-not $textNorm) { continue }
+
+      $score = 0
+      $matched = New-Object System.Collections.Generic.List[string]
+      foreach ($rx in @($codePatterns)) {
+        if ($textNorm -match $rx) {
+          $score += 10
+          $matched.Add("code reserve") | Out-Null
+          break
+        }
+      }
+      foreach ($tok in @($tokens)) {
+        if ($textNorm -match ("\b{0}\b" -f [regex]::Escape($tok))) {
+          $score += 2
+          $matched.Add($tok) | Out-Null
+        }
+      }
+
+      if ($score -lt 4) { continue }
+      $candidates += [pscustomobject]@{
+        score   = $score
+        matched = @($matched.ToArray() | Select-Object -Unique)
+        item    = $iv
+      }
+    }
+
+    $selected = @()
+    $seen = @{}
+    foreach ($cand in @($candidates | Sort-Object -Property @{Expression='score';Descending=$true})) {
+      $iv = $cand.item
+      $key = Get-InterventionKeyForMultiSubject $iv
+      if ($seen.ContainsKey($key)) { continue }
+      $seen[$key] = $true
+      $selected += [pscustomobject]@{
+        segment_id = $iv.segment_id
+        timecode   = $iv.timecode
+        auteur     = $iv.auteur
+        role       = $iv.role
+        texte      = $iv.texte
+        source_sujet_principal = $iv.source_sujet_principal
+        source_repair = "segments_pass1a"
+        match_reason = ("score={0}; terms={1}" -f $cand.score, (@($cand.matched) -join ","))
+      }
+      if (@($selected).Count -ge $MaxPerSubject) { break }
+    }
+
+    if (@($selected).Count -gt 0) {
+      $BySujet[$targetKey] = @($selected)
+      $msg = "Repair sujets: sujet=$targetKey depuis segments_pass1a count=$(@($selected).Count)"
+      Write-Host $msg
+      if ($LogFile) { $msg | Add-Content $LogFile }
+    }
   }
 
   return $BySujet
@@ -2533,6 +2800,14 @@ Pour chaque sujet de la liste (dans l’ordre 1 → N) :
 - rédiger une synthèse globale des échanges,
 - proposer une conclusion d’expert (neutre, motivée, factuelle).
 
+Règles rédactionnelles autonomes par sujet :
+- Si des échanges sont identifiés, produire une synthèse factuelle fondée uniquement sur ces échanges.
+- Si le sujet est évoqué comme corrigé, réglé, repris ou fait, le mentionner comme "déclaré repris", sans conclure à la conformité technique.
+- Si aucun échange n’est identifié, utiliser exactement :
+  "Aucun élément relatif à ce point n’a été identifié dans les échanges analysés."
+- Ne jamais inventer de constat matériel.
+- Distinguer ce qui est dit dans les échanges de ce qui est effectivement constaté.
+
 Utilisation du debrief_expert (si présent) :
 - S’il existe une entrée de debrief pour un numéro de sujet donné, utiliser "orientation_expert"
   comme fil directeur de "conclusion_expert".
@@ -2546,8 +2821,8 @@ même si aucun échange n’existe pour un sujet donné.
 
 Si aucun échange n’est présent pour un sujet :
 - "avis_participants" = []
-- "synthese_echanges" = "Aucun échange identifié pour ce sujet."
-- "conclusion_expert" = conclusion minimale et prudente.
+- "synthese_echanges" = "Aucun élément relatif à ce point n’a été identifié dans les échanges analysés."
+- "conclusion_expert" = "Aucune conclusion technique ne peut être formulée à partir des échanges analysés."
 
 Réponds STRICTEMENT au format JSON avec ce schéma :
 
@@ -2663,6 +2938,13 @@ Objectif :
 - Ne pas inclure l’expert judiciaire dans "avis_participants".
   Ses constats/positions doivent être intégrés dans "synthese_echanges" et/ou "conclusion_expert" selon le cas.
 
+Règles rédactionnelles autonomes :
+- Si des échanges sont identifiés, produire une synthèse factuelle fondée uniquement sur ces échanges.
+- Si le sujet est évoqué comme corrigé, réglé, repris ou fait, écrire qu’il est "déclaré repris", sans conclure à la conformité technique.
+- Si aucun échange n’est identifié, écrire exactement dans "synthese_echanges" :
+  "Aucun élément relatif à ce point n’a été identifié dans les échanges analysés."
+- Ne jamais inventer de constat matériel.
+- Distinguer ce qui est dit dans les échanges de ce qui est effectivement constaté.
 
 Réponds STRICTEMENT au format JSON (aucun texte hors JSON) :
 
@@ -2723,7 +3005,8 @@ Interventions rattachées à ce sujet :
 
 Rappels :
 - Ne pas inventer de faits.
-- Si aucune intervention : avis_participants=[], synthese_echanges="Aucun échange identifié pour ce sujet.", conclusion_expert prudente.
+- Si aucune intervention : avis_participants=[], synthese_echanges="Aucun élément relatif à ce point n’a été identifié dans les échanges analysés.", conclusion_expert="Aucune conclusion technique ne peut être formulée à partir des échanges analysés."
+- Si un point est seulement indiqué comme corrigé, réglé, repris ou fait, l’écrire comme "déclaré repris", sans conclure à la conformité technique.
 - Les interventions dont l’auteur est "Expert" et/ou sans timecode peuvent correspondre au débrief post-réunion : à intégrer en priorité dans conclusion_expert, sans les mettre dans avis_participants.
 
 Renvoie uniquement le JSON conforme au schéma.
@@ -2751,6 +3034,8 @@ Objectif :
 Règles impératives :
 - restituer uniquement les éléments explicitement présents dans les interventions ;
 - si une information est incertaine, ambiguë ou non attribuable avec certitude, ne pas l’affirmer ;
+- si un sujet est évoqué comme corrigé, réglé, repris ou fait, l’indiquer comme "déclaré repris", sans conclure à la conformité technique ;
+- distinguer ce qui est dit dans les échanges de ce qui est effectivement constaté ;
 - ne pas reformuler de manière extensive ;
 - ne pas introduire d’analyse juridique ;
 - si un champ ne contient aucun élément exploitable, renvoyer un tableau vide ;
@@ -3307,6 +3592,16 @@ if ($Sujets) {
   $bySujet = Add-MultiSubjectAssignments -BySujet $bySujet -Sujets $Sujets -LogFile $logFile
 }
 
+if ($HasOnlySubjects -and $Sujets) {
+  $bySujet = Repair-EmptySubjectsFromSegments `
+    -BySujet $bySujet `
+    -Segments $segmentsObjs `
+    -Sujets $Sujets `
+    -OnlySubjectsSet $onlySubjectsSet `
+    -MaxPerSubject 8 `
+    -LogFile $logFile
+}
+
 
 if ($Global:DebriefObj) {
   $tmp = Inject-DebriefIntoBySujet -BySujet $bySujet -DebriefObj $Global:DebriefObj
@@ -3374,6 +3669,10 @@ elseif ($RebuildPass2BOnly) {
 }
 elseif ($RebuildFromPass2B) {
   Microsoft.PowerShell.Utility\Write-Host "RebuildFromPass2B actif → aval Pass2B reconstruit sans forcer Pass1A"
+}
+
+if ($HasOnlySubjects) {
+  Microsoft.PowerShell.Utility\Write-Host ("RebuildFromSubjects actif -> sujet(s) {0}; split sujets, Pass2E/Pass3E ciblees, global_by_sujet et global_final reconstruits" -f ((@($OnlySubjectsEffective) | Sort-Object -Unique) -join ","))
 }
 
 $pass2BDir = Join-Path $OutDir "pass2B_batches"
@@ -4497,6 +4796,11 @@ Objectif :
 - ne pas rédiger de compte rendu final ;
 - ne rien inventer.
 
+Règles rédactionnelles :
+- si le bloc mentionne qu’un point est corrigé, réglé, repris ou fait, le noter comme "déclaré repris", sans conclure à la conformité technique ;
+- distinguer ce qui est dit dans les échanges de ce qui est effectivement constaté ;
+- ne jamais inventer de constat matériel.
+
 $schemaHint
 
 Bloc à analyser :
@@ -4566,6 +4870,11 @@ Objectif :
 - fusionner proprement les listes ;
 - ne rien inventer ;
 - ne pas produire de compte rendu final rédigé.
+
+Règles rédactionnelles :
+- conserver les mentions "déclaré repris" lorsqu’un point est seulement indiqué comme corrigé, réglé, repris ou fait ;
+- ne pas transformer une reprise déclarée en conformité technique ;
+- distinguer ce qui est dit dans les échanges de ce qui est effectivement constaté.
 
 $schemaHint
 
@@ -4711,7 +5020,43 @@ function Invoke-Pass2EForSujetFile {
 
     if (-not $chunkObjs -or @($chunkObjs).Count -eq 0) {
         Write-Warning "Pass2E: aucun chunk pour $SujetPath"
-        return $null
+        $sourceName = [System.IO.Path]::GetFileNameWithoutExtension($SujetPath)
+        $outPath = Join-Path $OutDir ($sourceName + "_compact.json")
+        $sujetRaw = $null
+        try {
+            $sujetRaw = Get-Content -LiteralPath $SujetPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        }
+        catch {
+            Write-Warning ("Pass2E: impossible de lire le sujet vide {0}: {1}" -f $SujetPath, $_.Exception.Message)
+            $sujetRaw = [pscustomobject]@{}
+        }
+
+        $fallbackText = "Aucun élément relatif à ce point n’a été identifié dans les échanges analysés."
+        $compact = [pscustomobject]@{
+            resume_factuel      = $fallbackText
+            points_cles         = @()
+            actions             = @()
+            desaccords          = @()
+            documents_demandes  = @()
+            elements_techniques = @()
+        }
+        $finalObj = [pscustomobject]@{
+            source_name            = $sourceName
+            numero                 = $sujetRaw.numero
+            titre                  = $sujetRaw.titre
+            localisation           = $sujetRaw.localisation
+            description            = $sujetRaw.description
+            synthese_intermediaire = $compact
+            stats                  = [pscustomobject]@{
+                chunk_count         = 0
+                interventions_count = 0
+            }
+            source                 = $sujetRaw.source
+        }
+
+        $finalObj | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath $outPath -Encoding $utf8NoBom
+        Microsoft.PowerShell.Utility\Write-Host ("Pass2E: fallback sujet sans chunk -> {0}" -f $outPath)
+        return $outPath
     }
 
     $sourceName = $chunkObjs[0].source_name
@@ -4777,6 +5122,23 @@ $sujetFiles = Get-ChildItem -Path $splitOutDir -Filter "*.json" -File |
 $pass2EPaths = @()
 
 foreach ($sf in $sujetFiles) {
+    $selectedForSubjectRebuild = $true
+    $sfNum = $null
+    if ($sf.BaseName -match '^sujet_(\d{3})') {
+        $sfNum = [int]$matches[1]
+    }
+    if ($HasOnlySubjects) {
+        $selectedForSubjectRebuild = ($null -ne $sfNum -and $onlySubjectsSet.ContainsKey($sfNum))
+        if (-not $selectedForSubjectRebuild) {
+            continue
+        }
+        $compactToRemove = Join-Path $pass2EOutDir ($sf.BaseName + "_compact.json")
+        if (Test-Path $compactToRemove) { Remove-Item -LiteralPath $compactToRemove -Force }
+        if ($null -ne $sfNum) {
+            $pass3ToRemove = Join-Path (Join-Path $OutDir "pass3E_sujets") ("sujet_{0:D3}_synthese.json" -f $sfNum)
+            if (Test-Path $pass3ToRemove) { Remove-Item -LiteralPath $pass3ToRemove -Force }
+        }
+    }
     try {
         $compactPath = Invoke-Pass2EForSujetFile `
             -SujetPath $sf.FullName `
@@ -4873,15 +5235,19 @@ else {
       $localisation = if ($compactObj.PSObject.Properties['localisation']) { [string]$compactObj.localisation } else { "" }
       $description  = if ($compactObj.PSObject.Properties['description'])  { [string]$compactObj.description  } else { "" }
 
+      $selectedForSubjectRebuild = ($HasOnlySubjects -and $onlySubjectsSet.ContainsKey($num))
       $outOne = Join-Path $pass3EDir ("sujet_{0:D3}_synthese.json" -f $num)
 
-      if ((Test-Path $outOne) -and (-not $Force) -and (-not $RebuildFromPass2B)) {
+      if ((Test-Path $outOne) -and (-not $Force) -and (-not $RebuildFromPass2B) -and (-not $selectedForSubjectRebuild)) {
         Microsoft.PowerShell.Utility\Write-Host ("Pass3E: skip sujet {0:D3} (existe) → {1}" -f $num, $outOne)
         try {
           $o = (Get-Content $outOne -Raw) | ConvertFrom-Json -Depth 50
           if ($o) { $pass3eResults.Add($o) | Out-Null }
         } catch {}
         continue
+      }
+      elseif ((Test-Path $outOne) -and $selectedForSubjectRebuild -and (-not $Force)) {
+        Microsoft.PowerShell.Utility\Write-Host ("Pass3E: rebuild sujet {0:D3} (RebuildFromSubjects) -> {1}" -f $num, $outOne)
       }
       elseif ((Test-Path $outOne) -and $RebuildFromPass2B -and (-not $Force)) {
         Microsoft.PowerShell.Utility\Write-Host ("Pass3E: rebuild sujet {0:D3} (RebuildFromPass2B) → {1}" -f $num, $outOne)
@@ -4906,8 +5272,8 @@ else {
           localisation = $localisation
           description  = $description
           avis_participants = @()
-          synthese_echanges = "Synthèse intermédiaire indisponible."
-          conclusion_expert = "Conclusion prudente : aucune synthèse intermédiaire exploitable n’a été produite pour ce sujet."
+          synthese_echanges = "Aucun élément relatif à ce point n’a été identifié dans les échanges analysés."
+          conclusion_expert = "Aucune conclusion technique ne peut être formulée à partir des échanges analysés."
         }
       }
       else {
@@ -4919,6 +5285,13 @@ else {
     $($compactSynth | ConvertTo-Json -Depth 50)
 
     À partir de cette synthèse intermédiaire, produis la synthèse finale du sujet.
+
+    Règles :
+    - Si des échanges sont identifiés, produire une synthèse factuelle.
+    - Si le sujet est évoqué comme corrigé, réglé, repris ou fait, écrire qu’il est "déclaré repris", sans conclure à la conformité technique.
+    - Si aucun échange n’est identifié, utiliser exactement : "Aucun élément relatif à ce point n’a été identifié dans les échanges analysés."
+    - Ne jamais inventer de constat matériel.
+    - Distinguer ce qui est dit dans les échanges de ce qui est effectivement constaté.
 
     Renvoie uniquement le JSON conforme au schéma.
 "@
@@ -5616,7 +5989,7 @@ foreach ($s in $finalObj.sujets) {
       $hay = (([string]$objet) + " " + ([string]$commentaire)).Trim()
 
       if ($hay) {
-        $rxNum = "(?i)\b(point|sujet|item|odj|ordre)\s*0*$num\b|\b0*$num\s*[-–]\s*"
+        $rxNum = '(?i)\b(point|sujet|item|odj|ordre)\s*0*' + [regex]::Escape([string]$num) + '\b|\b0*' + [regex]::Escape([string]$num) + '\s*[-–—]\s*'
         if ($hay -match $rxNum) { $matched = $true }
         elseif ($refTitre -and $refTitre.Length -ge 12 -and ($hay -imatch [regex]::Escape($refTitre))) { $matched = $true }
       }

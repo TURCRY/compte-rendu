@@ -157,6 +157,10 @@ def main() -> int:
                 item["source_sujet_principal"] = iv.get("source_sujet_principal")
             if "multi_subject_match" in iv:
                 item["multi_subject_match"] = iv.get("multi_subject_match")
+            if "source_repair" in iv:
+                item["source_repair"] = iv.get("source_repair")
+            if "match_reason" in iv:
+                item["match_reason"] = iv.get("match_reason")
             clean.append(item)
 
         if args.dedup:
