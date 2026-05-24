@@ -1,4 +1,4 @@
-<#
+﻿<#
 cr_reunion_pipeline_fulljson.ps1
 Pipeline complet : CSV → segmentation intelligente → Passes 1/2/3 (JSON strict à chaque étape)
 
@@ -62,6 +62,8 @@ param(
   
   # Paramétrage Passe 2 (agrégation hiérarchique)
   [int] $Pass2BatchSize = 2,
+  [int] $Pass2BPromptCharsLimit = 20000,
+  [int] $Pass2BEstimatedTokensLimit = 5500,
 
   # Relance
   [switch] $RebuildFromPass2B,
@@ -70,6 +72,9 @@ param(
   [int[]] $OnlyPass2BBatches = @(),
   [int[]] $OnlySubjects = @(),
   [string] $OnlySubjectsCsv = "",
+  [switch] $RunInternalSelfTests,
+  [int] $MaxSegmentSeconds = 600,
+  [int] $MaxAsrGapSeconds = 120,
   [switch] $Force
 
 )
@@ -223,6 +228,8 @@ Microsoft.PowerShell.Utility\Write-Host ("ModelPass3     = {0}" -f $ModelPass3)
 Microsoft.PowerShell.Utility\Write-Host ("ModelPass3E    = {0}" -f $ModelPass3E)
 Microsoft.PowerShell.Utility\Write-Host ("ModelReport    = {0}" -f $ModelReport)
 Microsoft.PowerShell.Utility\Write-Host ("Pass2BatchSize = {0}" -f $Pass2BatchSize)
+Microsoft.PowerShell.Utility\Write-Host ("Pass2BPromptCharsLimit = {0}" -f $Pass2BPromptCharsLimit)
+Microsoft.PowerShell.Utility\Write-Host ("Pass2BEstimatedTokensLimit = {0}" -f $Pass2BEstimatedTokensLimit)
 if ($HasOnlySubjects) {
   Microsoft.PowerShell.Utility\Write-Host ("OnlySubjects   = {0}" -f ((@($OnlySubjectsEffective) | Sort-Object -Unique) -join ","))
 }
@@ -742,7 +749,7 @@ function Normalize-Timecodes {
        
     # Sortie normalisée au choix :
     # 1) HH:MM:SS (arrondi) :
-    $out += (Seconds-To-Hms -s ([int][math]::Round($sec)))
+    $out += (Convert-SecondsToHms -s ([int][math]::Round($sec)))
 
     # ou 2) garder une précision ms : à activer si vous préférez
     # $h=[int]($sec/3600); $m=[int](($sec%3600)/60); $s2=[int]($sec%60)
@@ -806,7 +813,7 @@ function Update-ContexteGeneralFromCsv {
 
   # Écriture propre dans meta
   $ctx.meta | Add-Member -Force NoteProperty duree_reunion_seconds  $durationSec
-  $ctx.meta | Add-Member -Force NoteProperty duree_reunion_hms      (Seconds-To-Hms $durationSec)
+  $ctx.meta | Add-Member -Force NoteProperty duree_reunion_hms      (Convert-SecondsToHms $durationSec)
   $ctx.meta | Add-Member -Force NoteProperty csv_time_min_seconds   ([int][math]::Floor($minStart))
   $ctx.meta | Add-Member -Force NoteProperty csv_time_max_seconds   $maxSecInt
   $ctx.meta | Add-Member -Force NoteProperty csv_path               ((Resolve-Path $CsvPath).Path)
@@ -815,7 +822,7 @@ function Update-ContexteGeneralFromCsv {
 
   # Compatibilité éventuelle avec le reste du pipeline
   $ctx | Add-Member -Force NoteProperty duree_reunion_estimee_sec   $durationSec
-  $ctx | Add-Member -Force NoteProperty duree_reunion_estimee_hms   (Seconds-To-Hms $durationSec)
+  $ctx | Add-Member -Force NoteProperty duree_reunion_estimee_hms   (Convert-SecondsToHms $durationSec)
   $ctx | Add-Member -Force NoteProperty source_duree                "csv"
   $ctx | Add-Member -Force NoteProperty csv_max_end_sec             $maxSecInt
 
@@ -825,7 +832,7 @@ function Update-ContexteGeneralFromCsv {
 
   return [pscustomobject]@{
     durationSec = $durationSec
-    durationHms = (Seconds-To-Hms $durationSec)
+    durationHms = (Convert-SecondsToHms $durationSec)
     minStartSec = [int][math]::Floor($minStart)
     maxSec      = $maxSecInt
     wrote       = $ContexteJsonPath
@@ -916,7 +923,7 @@ function Normalize-InterventionTimecode {
 
   if ($MaxSec -gt 0 -and ($sec -lt 0 -or $sec -gt $MaxSec)) { return $null }
 
-  return (Seconds-To-Hms ([int][math]::Round($sec)))
+  return (Convert-SecondsToHms ([int][math]::Round($sec)))
 }
 
 
@@ -937,15 +944,19 @@ function Clean-Timecodes([object[]]$timecodes, [int]$maxSec){
       continue
     }
 
-    $out.Add((Seconds-To-Hms ([int][math]::Round($sec)))) | Out-Null
+    $out.Add((Convert-SecondsToHms ([int][math]::Round($sec)))) | Out-Null
   }
   return $out.ToArray()
 }
 
 
-function Seconds-To-Hms([int]$s){
-  $h=[int]($s/3600); $m=[int](($s%3600)/60); $ss=[int]($s%60)
-  "{0:D2}:{1:D2}:{2:D2}" -f $h,$m,$ss
+function Convert-SecondsToHms {
+  param(
+    [Alias('s')]
+    [int] $Sec
+  )
+  if ($Sec -lt 0) { $Sec = 0 }
+  return ([TimeSpan]::FromSeconds($Sec).ToString("hh\:mm\:ss"))
 }
 
 function To-SecondsSafe([string]$v){
@@ -1359,12 +1370,47 @@ function Unwrap-AdapterText {
   return $Raw
 }
 
+function Get-CurrentLLMTimingAttemptsList {
+  $timingVar = Get-Variable -Scope Script -Name CurrentLLMTimingAttempts -ErrorAction SilentlyContinue
+  if (-not $timingVar) { return $null }
+
+  $value = $timingVar.Value
+  if ($null -eq $value) { return $null }
+
+  if ($value -is [System.Collections.IList] -and -not $value.IsFixedSize) {
+    return $value
+  }
+
+  if ($value -is [System.Collections.IEnumerable] -and -not ($value -is [string])) {
+    $list = New-Object System.Collections.Generic.List[object]
+    foreach ($item in @($value)) {
+      $list.Add($item) | Out-Null
+    }
+    Set-Variable -Scope Script -Name CurrentLLMTimingAttempts -Value $list
+    return $list
+  }
+
+  return $null
+}
+
+function Add-CurrentLLMTimingAttempt {
+  param(
+    [Parameter(Mandatory=$true)] [object] $Attempt
+  )
+
+  $attempts = Get-CurrentLLMTimingAttemptsList
+  if ($null -eq $attempts) { return }
+
+  $attempts.Add($Attempt) | Out-Null
+}
+
 
 function Invoke-LLM-OpenAICompat {
   param(
     [string] $system,
     [string] $user,
     [string] $model,
+    [string] $Label = "",
     [int]    $TimeoutSec = 600,
     [int]    $MaxTry = 6,
     [switch] $DebugHttp
@@ -1386,6 +1432,9 @@ function Invoke-LLM-OpenAICompat {
       @{ role="user";   content=$user   }
     )
   }
+  # Passe 1: pas de response_format OpenAI.
+  # Le JSON est obtenu par prompt strict, puis extrait/repare/valide localement
+  # par structured_output_utils.py afin de conserver l'enveloppe ASR deterministe.
   $body = $bodyObj | ConvertTo-Json -Depth 20 -Compress
 
   if ($DebugHttp) {
@@ -1394,13 +1443,50 @@ function Invoke-LLM-OpenAICompat {
   }
 
   for ($t = 1; $t -le $MaxTry; $t++) {
+    $tryStart = Get-Date
+    $attemptStatus = "OK"
+    $attemptError = ""
+    $attemptHttpStatus = $null
+    $attemptRetryAfter = $null
     try {
       $resp = Invoke-RestMethod -Method POST -Uri $uri -Headers $headers -Body $body `
         -ContentType "application/json" -TimeoutSec $TimeoutSec -ErrorAction Stop
 
-      return $resp.choices[0].message.content
+      $tryEnd = Get-Date
+      $finishReason = ""
+      $responseModel = ""
+      $usagePromptTokens = $null
+      $usageCompletionTokens = $null
+      $usageTotalTokens = $null
+      try { $finishReason = [string]$resp.choices[0].finish_reason } catch {}
+      try { $responseModel = [string]$resp.model } catch {}
+      try { $usagePromptTokens = $resp.usage.prompt_tokens } catch {}
+      try { $usageCompletionTokens = $resp.usage.completion_tokens } catch {}
+      try { $usageTotalTokens = $resp.usage.total_tokens } catch {}
+      Add-CurrentLLMTimingAttempt ([pscustomobject]@{
+        attempt_number = $t
+        max_attempts = $MaxTry
+        started_at = $tryStart.ToString("o")
+        ended_at = $tryEnd.ToString("o")
+        duration_sec = [math]::Round(($tryEnd - $tryStart).TotalSeconds, 3)
+        status = "OK"
+        error_message = ""
+        http_status = $null
+        retry_after_sec = $null
+        requested_model = $model
+        response_model = $responseModel
+        finish_reason = $finishReason
+        usage_prompt_tokens = $usagePromptTokens
+        usage_completion_tokens = $usageCompletionTokens
+        usage_total_tokens = $usageTotalTokens
+      })
+      if ($Label) {
+        Microsoft.PowerShell.Utility\Write-Host ("{0} try {1}/{2} OK" -f $Label, $t, $MaxTry)
+      }
+      return ([string]$resp.choices[0].message.content).TrimStart([char]0xFEFF)
     }
     catch {
+      $tryEnd = Get-Date
       $ex = $_.Exception
       $msg = $ex.Message
 
@@ -1425,6 +1511,10 @@ function Invoke-LLM-OpenAICompat {
         } catch {}
       }
 
+      $attemptHttpStatus = $status
+      $attemptError = if ($errBody) { $errBody } else { $msg }
+      $attemptStatus = if ($msg -match 'timed out|timeout|délai|delai' -or $attemptError -match 'timed out|timeout') { "TIMEOUT" } else { "ERROR" }
+
       if ($DebugHttp) {
         Microsoft.PowerShell.Utility\Write-Host ("[LLM] ERROR try {0}/{1} status={2} msg={3}" -f $t, $MaxTry, $status, $msg)
         if ($errBody) { Microsoft.PowerShell.Utility\Write-Host ("[LLM] ERROR body: {0}" -f $errBody) }
@@ -1440,13 +1530,38 @@ function Invoke-LLM-OpenAICompat {
       if ($status -and ($status -ge 400 -and $status -lt 500) -and ($status -ne 429)) {
         $shouldRetry = $false
       }
+      if ($shouldRetry -and $t -lt $MaxTry) {
+        $attemptRetryAfter = [math]::Min(60, 5 * $t)
+      }
+
+      Add-CurrentLLMTimingAttempt ([pscustomobject]@{
+        attempt_number = $t
+        max_attempts = $MaxTry
+        started_at = $tryStart.ToString("o")
+        ended_at = $tryEnd.ToString("o")
+        duration_sec = [math]::Round(($tryEnd - $tryStart).TotalSeconds, 3)
+        status = $attemptStatus
+        error_message = $attemptError
+        http_status = $attemptHttpStatus
+        retry_after_sec = $attemptRetryAfter
+        requested_model = $model
+        response_model = ""
+        finish_reason = ""
+        usage_prompt_tokens = $null
+        usage_completion_tokens = $null
+        usage_total_tokens = $null
+      })
+      if ($Label) {
+        $labelStatus = if ($attemptStatus -eq "TIMEOUT") { "timeout" } else { "échec" }
+        Microsoft.PowerShell.Utility\Write-Host ("{0} try {1}/{2} {3}" -f $Label, $t, $MaxTry, $labelStatus)
+      }
 
       if (-not $shouldRetry -or $t -eq $MaxTry) {
         $detail = if ($errBody) { $errBody } else { $msg }
         throw ("LLM failed (status={0}) {1}" -f $status, $detail)
       }
 
-      Start-Sleep -Seconds ([math]::Min(60, 5 * $t))
+      Start-Sleep -Seconds $attemptRetryAfter
     }
   }
 }
@@ -1531,7 +1646,7 @@ function Invoke-LLM-OllamaNative {
     options = @{ temperature = 0.2 }
   } | ConvertTo-Json -Depth 10
 
-  (Invoke-RestMethod -Method POST -Uri $uri -Body $body -ContentType "application/json").response
+  return ([string](Invoke-RestMethod -Method POST -Uri $uri -Body $body -ContentType "application/json").response).TrimStart([char]0xFEFF)
 }
 
 function Invoke-LLM {
@@ -1539,6 +1654,7 @@ function Invoke-LLM {
     [string] $system,
     [string] $user,
     [string] $model,
+    [string] $Label = "",
     [switch] $DebugHttp
   )
 
@@ -1551,7 +1667,7 @@ function Invoke-LLM {
   }
 
   if($Provider -ieq "openai"){
-    return Invoke-LLM-OpenAICompat -system $systemToSend -user $userToSend -model $model -DebugHttp:$DebugHttp
+    return Invoke-LLM-OpenAICompat -system $systemToSend -user $userToSend -model $model -Label $Label -DebugHttp:$DebugHttp
   } else {
     return Invoke-LLM-OllamaNative -system $system -user $user -model $model
   }
@@ -1801,7 +1917,7 @@ Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Après boucle maxSec : maxSec=
 
 $maxSecInt = [int][math]::Ceiling($maxSec)
 Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Avant conversion maxSec -> HH:MM:SS : maxSecInt={0}" -f $maxSecInt) -ForegroundColor Yellow
-$maxHms    = Seconds-To-Hms $maxSecInt
+$maxHms    = Convert-SecondsToHms $maxSecInt
 Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Après conversion maxSec -> HH:MM:SS : maxHms={0}" -f $maxHms) -ForegroundColor Yellow
 
 Microsoft.PowerShell.Utility\Write-Host ("Durée max détectée (sec) = {0} ; HH:MM:SS = {1}" -f $maxSecInt, $maxHms)
@@ -1961,31 +2077,36 @@ Objectif :
 Tu disposes :
 - d’une liste de sujets numérotés (JSON) comprenant au minimum Numero et Titre, et éventuellement Localisation/Description que tu peux utiliser comme indices de rattachement,
 - d’une liste de participants (Nom + Rôle + éventuels alias),
-- d’un segment de transcription sous forme de lignes : "[HH:MM:SS] SPEAKER: texte".
+- d’un segment de transcription sous forme de lignes : "[ROW <numero>] SPEAKER: texte".
 
 Règles :
 - Tu peux associer une même prise de parole à plusieurs sujets si elle en parle clairement.
 - Si tu n’es pas sûr, tu n’associes pas (mieux vaut rater un lien que d’en inventer un).
 - Tu ne fais AUCUN résumé ici, uniquement du repérage de contenu par sujet.
-- Ne créer une clé "<numero_sujet>" que si au moins une intervention est rattachée à ce sujet.
+- Ne créer une entrée dans "sujets" que si au moins une intervention est rattachée à ce sujet.
+- Dans chaque objet sujet, "titre" doit commencer par le numéro du sujet, sous la forme "<numero> - <titre>".
 - "auteur" doit être choisi dans la liste des participants fournie. Si non reconnaissable : "auteur" = "Inconnu", "role" = null.
-- "timecode" doit être exactement celui entre crochets [HH:MM:SS] de la ligne source.
+- Ne produis jamais de timecode. Si tu veux citer la source, utilise uniquement "row_ref" avec le numéro ROW fourni.
 - "texte" : extrait fidèle, 1 à 2 phrases maximum, sans reformulation.
+- La réponse brute doit commencer directement par "{" et se terminer par "}" : aucun BOM, aucune balise Markdown, aucun texte avant/après.
 
 Tu dois répondre STRICTEMENT en JSON avec ce schéma :
 
 {
   "segment_id": "string",
-  "sujets": {
-    "<numero_sujet>": [
+  "sujets": [
+    {
+      "titre": "1 - titre du sujet",
+      "interventions": [
       {
-        "timecode": "HH:MM:SS",
+        "row_ref": 123,
         "auteur": "Nom canonique du participant| Inconnu",
         "role": "string | null",
         "texte": "extrait fidèle (1 à 2 phrases), sans reformulation"
       }
-    ]
-  }
+      ]
+    }
+  ]
 }
 '@
 Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F05 - avant branche Pass1_System selon GlobalContext" -ForegroundColor Yellow
@@ -3181,7 +3302,9 @@ function Get-IntelligentSegments {
         $colSpeaker,
         $colText,
         $logPath,
-        [int] $ChunkSize = 30   # valeur par défaut
+        [int] $ChunkSize = 30,
+        [int] $MaxSegmentSeconds = 600,
+        [int] $MaxAsrGapSeconds = 120
     )
 
     Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Entrée Get-IntelligentSegments : rows={0} ; chunkSize={1}" -f @($rows).Count, $ChunkSize) -ForegroundColor Yellow
@@ -3193,19 +3316,59 @@ function Get-IntelligentSegments {
         return @()
     }
 
-    $i = 0
-    while ($i -lt $total) {
-        $j = [math]::Min($i + $ChunkSize - 1, $total - 1)
+    $current = New-Object System.Collections.Generic.List[object]
+    for ($i = 0; $i -lt $total; $i++) {
+        $row = $rows[$i]
+        $rowSec = [int]$row.__sec
+        $rowEndSec = [int]$row.__end_sec
+        if ($rowEndSec -lt $rowSec) { $rowEndSec = $rowSec }
 
-        $segmentRows = $rows[$i..$j]
-        $segments.Add($segmentRows) | Out-Null
+        if ($current.Count -gt 0) {
+            $firstSec = [int]$current[0].__sec
+            $prevSec = [int]$current[$current.Count - 1].__sec
+            $gapSec = $rowSec - $prevSec
+            $durationIfAdded = $rowEndSec - $firstSec
+            $mustSplit = $false
+            if ($current.Count -ge $ChunkSize) { $mustSplit = $true }
+            if ($MaxAsrGapSeconds -gt 0 -and $gapSec -gt $MaxAsrGapSeconds) { $mustSplit = $true }
+            if ($MaxSegmentSeconds -gt 0 -and $durationIfAdded -gt $MaxSegmentSeconds) { $mustSplit = $true }
 
-        $i = $j + 1
+            if ($mustSplit) {
+                $segments.Add(@($current.ToArray())) | Out-Null
+                $current.Clear()
+            }
+        }
+
+        $current.Add($row) | Out-Null
+    }
+
+    if ($current.Count -gt 0) {
+        $segments.Add(@($current.ToArray())) | Out-Null
     }
 
     if ($logPath) {
         Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Avant écriture log segmentation : {0}" -f $logPath) -ForegroundColor Yellow
-        $txt = "Segments (ChunkSize=$ChunkSize) générés : $($segments.Count)"
+        $lines = New-Object System.Collections.Generic.List[string]
+        $lines.Add(("Segments (ChunkSize={0}, MaxSegmentSeconds={1}, MaxAsrGapSeconds={2}) générés : {3}" -f $ChunkSize, $MaxSegmentSeconds, $MaxAsrGapSeconds, $segments.Count)) | Out-Null
+        for ($si = 0; $si -lt $segments.Count; $si++) {
+            $segRows = @($segments[$si])
+            if ($segRows.Count -eq 0) { continue }
+            $segStart = [int]$segRows[0].__sec
+            $segEnd = [int]$segRows[-1].__end_sec
+            if ($segEnd -lt $segStart) { $segEnd = [int]$segRows[-1].__sec }
+            $duration = [math]::Max(0, $segEnd - $segStart)
+            $maxGap = 0
+            for ($ri = 1; $ri -lt $segRows.Count; $ri++) {
+                $gap = [int]$segRows[$ri].__sec - [int]$segRows[$ri - 1].__sec
+                if ($gap -gt $maxGap) { $maxGap = $gap }
+            }
+            $alert = @()
+            if ($MaxSegmentSeconds -gt 0 -and $duration -gt $MaxSegmentSeconds) { $alert += "duration_gt_threshold" }
+            if ($MaxAsrGapSeconds -gt 0 -and $maxGap -gt $MaxAsrGapSeconds) { $alert += "gap_gt_threshold" }
+            $alertText = if ($alert.Count -gt 0) { $alert -join "," } else { "none" }
+            $lines.Add(("segment_{0:D2}: rows={1}-{2}; start={3}; end={4}; duration_sec={5}; max_gap_sec={6}; alerts={7}" -f ($si + 1), $segRows[0].__row_index, $segRows[-1].__row_index, (Convert-SecondsToHms $segStart), (Convert-SecondsToHms $segEnd), $duration, $maxGap, $alertText)) | Out-Null
+        }
+        $txt = $lines -join [Environment]::NewLine
         [System.IO.File]::WriteAllText($logPath, $txt, [System.Text.Encoding]::UTF8)
         Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Après écriture log segmentation : {0}" -f $logPath) -ForegroundColor Yellow
     }
@@ -3223,6 +3386,158 @@ Ensure-Dir $logsDir
 $logFile = Join-Path $logsDir ("run_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".log")
 $txt = "Start: $(Get-Date)"
 [System.IO.File]::WriteAllText($logFile, $txt, [System.Text.Encoding]::UTF8)
+$CriticalQaWarnings = New-Object System.Collections.Generic.List[string]
+
+$StructuredOutputUtils = "/pipeline/python/structured_output_utils.py"
+if (-not (Test-Path $StructuredOutputUtils)) {
+    $StructuredOutputUtils = Join-Path (Split-Path $PSScriptRoot -Parent) "python/structured_output_utils.py"
+}
+
+function Test-ObjectProperty {
+  param([object] $Obj, [string] $Name)
+  return ($null -ne $Obj -and $null -ne $Obj.PSObject.Properties[$Name])
+}
+
+function Add-Pass1EnvelopeError {
+  param([object] $Obj, [string] $Message)
+  if (-not (Test-ObjectProperty $Obj "llm_validation_errors") -or $null -eq $Obj.llm_validation_errors) {
+    $Obj | Add-Member -Force NoteProperty llm_validation_errors @()
+  }
+  $Obj.llm_validation_errors = @($Obj.llm_validation_errors) + @($Message)
+}
+
+function New-Pass1FallbackEnvelope {
+  param(
+    [string] $SegmentId,
+    [int] $RowStart,
+    [int] $RowEnd,
+    [int] $StartSec,
+    [int] $EndSec,
+    [string] $StartHms,
+    [string] $EndHms,
+    [string] $TexteSource,
+    [string] $RawResponse,
+    [string[]] $Errors = @()
+  )
+
+  return [pscustomobject]@{
+    segment_id = $SegmentId
+    row_start = $RowStart
+    row_end = $RowEnd
+    start_sec = $StartSec
+    end_sec = $EndSec
+    start_hms = $StartHms
+    end_hms = $EndHms
+    texte_source = $TexteSource
+    llm_analysis = [pscustomobject]@{ sujets = [pscustomobject]@{} }
+    llm_raw_response = if ($null -ne $RawResponse) { $RawResponse } else { "" }
+    llm_valid = $false
+    llm_validation_errors = @($Errors)
+    llm_repaired = $false
+    llm_fallback = $true
+    sujets = [pscustomobject]@{}
+  }
+}
+
+function Complete-Pass1Envelope {
+  param(
+    [object] $Obj,
+    [string] $SegmentId,
+    [int] $RowStart,
+    [int] $RowEnd,
+    [int] $StartSec,
+    [int] $EndSec,
+    [string] $StartHms,
+    [string] $EndHms,
+    [string] $TexteSource,
+    [string] $RawResponse
+  )
+
+  if (-not $Obj) {
+    return New-Pass1FallbackEnvelope `
+      -SegmentId $SegmentId -RowStart $RowStart -RowEnd $RowEnd `
+      -StartSec $StartSec -EndSec $EndSec -StartHms $StartHms -EndHms $EndHms `
+      -TexteSource $TexteSource -RawResponse $RawResponse `
+      -Errors @("structured_output_utils returned no JSON object")
+  }
+
+  $missing = New-Object System.Collections.Generic.List[string]
+  if (-not (Test-ObjectProperty $Obj "segment_id")) { $Obj | Add-Member -Force NoteProperty segment_id $SegmentId; $missing.Add("segment_id") | Out-Null }
+  if (-not (Test-ObjectProperty $Obj "row_start")) { $Obj | Add-Member -Force NoteProperty row_start $RowStart; $missing.Add("row_start") | Out-Null }
+  if (-not (Test-ObjectProperty $Obj "row_end")) { $Obj | Add-Member -Force NoteProperty row_end $RowEnd; $missing.Add("row_end") | Out-Null }
+  if (-not (Test-ObjectProperty $Obj "start_sec")) { $Obj | Add-Member -Force NoteProperty start_sec $StartSec; $missing.Add("start_sec") | Out-Null }
+  if (-not (Test-ObjectProperty $Obj "end_sec")) { $Obj | Add-Member -Force NoteProperty end_sec $EndSec; $missing.Add("end_sec") | Out-Null }
+  if (-not (Test-ObjectProperty $Obj "start_hms")) { $Obj | Add-Member -Force NoteProperty start_hms $StartHms; $missing.Add("start_hms") | Out-Null }
+  if (-not (Test-ObjectProperty $Obj "end_hms")) { $Obj | Add-Member -Force NoteProperty end_hms $EndHms; $missing.Add("end_hms") | Out-Null }
+  if (-not (Test-ObjectProperty $Obj "texte_source")) { $Obj | Add-Member -Force NoteProperty texte_source $TexteSource; $missing.Add("texte_source") | Out-Null }
+  if (-not (Test-ObjectProperty $Obj "llm_analysis")) { $Obj | Add-Member -Force NoteProperty llm_analysis ([pscustomobject]@{ sujets = [pscustomobject]@{} }); $missing.Add("llm_analysis") | Out-Null }
+  if (-not (Test-ObjectProperty $Obj "llm_raw_response")) { $Obj | Add-Member -Force NoteProperty llm_raw_response $(if ($null -ne $RawResponse) { $RawResponse } else { "" }); $missing.Add("llm_raw_response") | Out-Null }
+  if (-not (Test-ObjectProperty $Obj "llm_valid")) { $Obj | Add-Member -Force NoteProperty llm_valid $false; $missing.Add("llm_valid") | Out-Null }
+  if (-not (Test-ObjectProperty $Obj "llm_validation_errors")) { $Obj | Add-Member -Force NoteProperty llm_validation_errors @(); $missing.Add("llm_validation_errors") | Out-Null }
+  if (-not (Test-ObjectProperty $Obj "llm_repaired")) { $Obj | Add-Member -Force NoteProperty llm_repaired $false; $missing.Add("llm_repaired") | Out-Null }
+  if (-not (Test-ObjectProperty $Obj "llm_fallback")) { $Obj | Add-Member -Force NoteProperty llm_fallback $true; $missing.Add("llm_fallback") | Out-Null }
+  if (-not (Test-ObjectProperty $Obj "sujets")) { $Obj | Add-Member -Force NoteProperty sujets ([pscustomobject]@{}); $missing.Add("sujets") | Out-Null }
+
+  if ($missing.Count -gt 0) {
+    Add-Pass1EnvelopeError $Obj ("incomplete pass1 envelope, missing fields: {0}" -f (($missing.ToArray()) -join ", "))
+    $Obj.llm_valid = $false
+    $Obj.llm_fallback = $true
+  }
+
+  return $Obj
+}
+
+function Convert-ToSegmentPathList {
+  param([object] $Value)
+
+  $paths = New-Object System.Collections.Generic.List[string]
+  if ($null -eq $Value) {
+    return ,([string[]]@())
+  }
+
+  if ($Value -is [string]) {
+    if (-not [string]::IsNullOrWhiteSpace($Value)) {
+      $paths.Add([string]$Value) | Out-Null
+    }
+    return ,([string[]]$paths.ToArray())
+  }
+
+  if ($Value -is [System.Collections.IEnumerable]) {
+    foreach ($item in $Value) {
+      if ($null -eq $item) { continue }
+      $s = [string]$item
+      if (-not [string]::IsNullOrWhiteSpace($s)) {
+        $paths.Add($s) | Out-Null
+      }
+    }
+    return ,([string[]]$paths.ToArray())
+  }
+
+  $single = [string]$Value
+  if (-not [string]::IsNullOrWhiteSpace($single)) {
+    $paths.Add($single) | Out-Null
+  }
+  return ,([string[]]$paths.ToArray())
+}
+
+function Test-ConvertToSegmentPathList {
+  $cases = @(
+    [pscustomobject]@{ Name="empty"; Value=@(); Expected=0 },
+    [pscustomobject]@{ Name="single string"; Value="segment_01.json"; Expected=1 },
+    [pscustomobject]@{ Name="string array"; Value=[string[]]@("segment_01.json","segment_02.json"); Expected=2 },
+    [pscustomobject]@{ Name="arraylist"; Value=($( $a=New-Object System.Collections.ArrayList; [void]$a.Add("segment_01.json"); [void]$a.Add("segment_02.json"); $a )); Expected=2 }
+  )
+  foreach ($case in $cases) {
+    $actual = Convert-ToSegmentPathList $case.Value
+    $actualCount = @($actual).Count
+    if ($actualCount -ne $case.Expected) {
+      throw ("Convert-ToSegmentPathList test failed: {0}, expected={1}, actual={2}" -f $case.Name, $case.Expected, $actualCount)
+    }
+  }
+}
+if ($RunInternalSelfTests -or $env:CR_PIPELINE_RUN_INTERNAL_SELF_TESTS -eq "1") {
+  Test-ConvertToSegmentPathList
+}
 
 
 Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Début chargement transcription / segmentation : {0}" -f $CsvPath) -ForegroundColor Yellow
@@ -3243,10 +3558,18 @@ if(-not $colSpeaker -or -not $colTime -or -not $colText){
 }
 
 Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Avant enrichissement __sec / tri : rows={0}" -f @($rows).Count) -ForegroundColor Yellow
+$rowOrdinal = 0
 $rows = $rows | ForEach-Object {
+    $rowOrdinal += 1
     $sec = Hms-To-Seconds $_.$colTime
+    $endSec = $sec
+    if ($_.PSObject.Properties.Name -contains $colEnd -and -not [string]::IsNullOrWhiteSpace([string]$_.$colEnd)) {
+        $endSec = Hms-To-Seconds $_.$colEnd
+    }
+    $_ | Add-Member -NotePropertyName __row_index -NotePropertyValue $rowOrdinal -Force
     $_ | Add-Member -NotePropertyName __sec -NotePropertyValue $sec -Force
-    $_ | Add-Member -NotePropertyName __time_hms -NotePropertyValue (Seconds-To-Hms $sec) -Force
+    $_ | Add-Member -NotePropertyName __end_sec -NotePropertyValue $endSec -Force
+    $_ | Add-Member -NotePropertyName __time_hms -NotePropertyValue (Convert-SecondsToHms $sec) -Force
     $_
 } | Sort-Object __sec
 Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Après enrichissement __sec / tri : rows={0}" -f @($rows).Count) -ForegroundColor Yellow
@@ -3287,21 +3610,124 @@ $segments = Get-IntelligentSegments `
     -colSpeaker $colSpeaker `
     -colText    $colText `
     -logPath    $segLog `
-    -ChunkSize  $ChunkSize
+    -ChunkSize  $ChunkSize `
+    -MaxSegmentSeconds $MaxSegmentSeconds `
+    -MaxAsrGapSeconds $MaxAsrGapSeconds
 
 Microsoft.PowerShell.Utility\Write-Host ("Nombre de segments (ChunkSize={0}) : {1}" -f $ChunkSize, $segments.Count)
 Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Fin segmentation : rows={0} ; segments={1} ; chunkSize={2}" -f @($rows).Count, @($segments).Count, $ChunkSize) -ForegroundColor Yellow
 if($SegDebug){ Microsoft.PowerShell.Utility\Write-Host ("Log segmentation → $segLog") }
 
 # ── Passe 1A : mini-CR par segment (JSON strict) ───────────────────────────────
+$segmentationQa = [pscustomobject]@{
+  thresholds = [pscustomobject]@{
+    max_segment_seconds = $MaxSegmentSeconds
+    max_asr_gap_seconds = $MaxAsrGapSeconds
+  }
+  segment_count = @($segments).Count
+  segments = @()
+  asr_gaps_over_threshold = @()
+  hms_consistency_errors = @()
+  critical_warnings = @()
+}
+for ($si = 0; $si -lt @($segments).Count; $si++) {
+  $segRows = @($segments[$si])
+  if ($segRows.Count -eq 0) { continue }
+  $segStart = [int]$segRows[0].__sec
+  $segEnd = [int]$segRows[-1].__end_sec
+  if ($segEnd -lt $segStart) { $segEnd = [int]$segRows[-1].__sec }
+  $duration = [math]::Max(0, $segEnd - $segStart)
+  $segStartHms = Convert-SecondsToHms $segStart
+  $segEndHms = Convert-SecondsToHms $segEnd
+  $alerts = @()
+  if ($MaxSegmentSeconds -gt 0 -and $duration -gt $MaxSegmentSeconds) { $alerts += "duration_gt_threshold" }
+  $startHmsSec = Hms-To-Seconds $segStartHms
+  $endHmsSec = Hms-To-Seconds $segEndHms
+  if ($startHmsSec -ne $segStart) {
+    $alerts += "start_hms_mismatch"
+    $segmentationQa.hms_consistency_errors += [pscustomobject]@{
+      segment_id = ("segment_{0:D2}" -f ($si + 1))
+      field = "start_hms"
+      sec = $segStart
+      hms = $segStartHms
+      hms_to_seconds = $startHmsSec
+    }
+  }
+  if ($endHmsSec -ne $segEnd) {
+    $alerts += "end_hms_mismatch"
+    $segmentationQa.hms_consistency_errors += [pscustomobject]@{
+      segment_id = ("segment_{0:D2}" -f ($si + 1))
+      field = "end_hms"
+      sec = $segEnd
+      hms = $segEndHms
+      hms_to_seconds = $endHmsSec
+    }
+  }
+  $segmentationQa.segments += [pscustomobject]@{
+    segment_id = ("segment_{0:D2}" -f ($si + 1))
+    row_start = [int]$segRows[0].__row_index
+    row_end = [int]$segRows[-1].__row_index
+    start_sec = $segStart
+    end_sec = $segEnd
+    start_hms = $segStartHms
+    end_hms = $segEndHms
+    duration_sec = $duration
+    alerts = @($alerts)
+  }
+  if ($alerts -contains "duration_gt_threshold") {
+    $critical = "WARNING CRITIQUE QA: segment_{0:D2} dure {1}s > seuil {2}s; découpe de secours à vérifier avant Passe 1." -f ($si + 1), $duration, $MaxSegmentSeconds
+    Write-Warning $critical
+    $critical | Add-Content $logFile
+    $CriticalQaWarnings.Add($critical) | Out-Null
+    $segmentationQa.critical_warnings += $critical
+  }
+}
+if (@($segmentationQa.hms_consistency_errors).Count -gt 0) {
+  $critical = "WARNING CRITIQUE QA: incohérence conversion HMS détectée dans {0} champ(s) de segmentation." -f @($segmentationQa.hms_consistency_errors).Count
+  Write-Warning $critical
+  $critical | Add-Content $logFile
+  $CriticalQaWarnings.Add($critical) | Out-Null
+  $segmentationQa.critical_warnings += $critical
+}
+for ($ri = 1; $ri -lt @($rows).Count; $ri++) {
+  $prev = $rows[$ri - 1]
+  $cur = $rows[$ri]
+  $gap = [int]$cur.__sec - [int]$prev.__sec
+  if ($MaxAsrGapSeconds -gt 0 -and $gap -gt $MaxAsrGapSeconds) {
+    $segmentationQa.asr_gaps_over_threshold += [pscustomobject]@{
+      previous_row = [int]$prev.__row_index
+      current_row = [int]$cur.__row_index
+      previous_hms = Convert-SecondsToHms ([int]$prev.__sec)
+      current_hms = Convert-SecondsToHms ([int]$cur.__sec)
+      gap_sec = $gap
+    }
+  }
+}
+$segmentationQaPath = Join-Path $OutDir "segmentation_qa.json"
+[System.IO.File]::WriteAllText($segmentationQaPath, ($segmentationQa | ConvertTo-Json -Depth 20), [System.Text.Encoding]::UTF8)
+Microsoft.PowerShell.Utility\Write-Host "QA segmentation -> $segmentationQaPath"
+
 $segmentJsonPaths = New-Object System.Collections.Generic.List[object]
 Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Début première passe 1A : segments={0}" -f @($segments).Count) -ForegroundColor Yellow
 
 for($i=0; $i -lt $segments.Count; $i++){
     $seg = $segments[$i]
     $segOut = Join-Path $OutDir ("segments/segment_{0:D2}.json" -f ($i+1))
-    $startH = Seconds-To-Hms ($seg[0].__sec)
-    $endH   = Seconds-To-Hms ($seg[-1].__sec)
+    $segmentId = ("segment_{0:D2}" -f ($i+1))
+    $startSecSegment = [int]$seg[0].__sec
+    $endSecSegment = [int]$seg[-1].__end_sec
+    if ($endSecSegment -lt $startSecSegment) { $endSecSegment = [int]$seg[-1].__sec }
+    $durationSegment = [math]::Max(0, $endSecSegment - $startSecSegment)
+    if ($MaxSegmentSeconds -gt 0 -and $durationSegment -gt $MaxSegmentSeconds) {
+        $msg = "ABORT QA segmentation: $segmentId dure ${durationSegment}s > seuil ${MaxSegmentSeconds}s; segment non envoye a la passe 1."
+        Write-Warning $msg
+        $msg | Add-Content $logFile
+        throw $msg
+    }
+    $startH = Convert-SecondsToHms $startSecSegment
+    $endH   = Convert-SecondsToHms $endSecSegment
+    $rowStart = [int]$seg[0].__row_index
+    $rowEnd = [int]$seg[-1].__row_index
 
     if((Test-Path $segOut) -and (-not $Force)){
         Microsoft.PowerShell.Utility\Write-Host "Skip segment $($i+1) (existe) → $segOut"
@@ -3313,8 +3739,11 @@ for($i=0; $i -lt $segments.Count; $i++){
 
     # Construction du prompt utilisateur brut
     $lines = $seg | ForEach-Object {
+        "[ROW {0}] {1}: {2}" -f $_.__row_index, $_.$colSpeaker, $_.$colText
+    } | Out-String
+    $sourceLines = $seg | ForEach-Object {
         $lineTime = if ($_.PSObject.Properties['__time_hms'] -and $_.__time_hms) { $_.__time_hms } else { [string]$_.$colTime }
-        "[{0}] {1}: {2}" -f $lineTime, $_.$colSpeaker, $_.$colText
+        "[ROW {0}] [{1}] {2}: {3}" -f $_.__row_index, $lineTime, $_.$colSpeaker, $_.$colText
     } | Out-String
 
     $sujetsJson       = ($Sujets | ConvertTo-Json -Depth 10)
@@ -3324,7 +3753,7 @@ for($i=0; $i -lt $segments.Count; $i++){
         Replace("{START_HMS}", $startH).
         Replace("{END_HMS}",   $endH).
         Replace("{LINES}",     $lines.Trim()).
-        Replace("{SEGMENT_ID}", ("segment_{0:D2}" -f ($i+1))).
+        Replace("{SEGMENT_ID}", $segmentId).
         Replace("{SUJETS_JSON}", $sujetsJson).
         Replace("{PARTICIPANTS_JSON}", $participantsJson)
 
@@ -3346,6 +3775,121 @@ for($i=0; $i -lt $segments.Count; $i++){
         $userPrompt_Effective,
         [System.Text.Encoding]::UTF8
     )
+
+    $sourcePath = $segOut + ".source.txt"
+    [System.IO.File]::WriteAllText($sourcePath, $sourceLines.Trim(), [System.Text.Encoding]::UTF8)
+
+    $raw = ""
+    $jsonStr = $null
+    $validationErrorsForRetry = ""
+    $maxStructuredAttempts = 2
+
+    for ($attempt = 1; $attempt -le $maxStructuredAttempts; $attempt++) {
+      $promptForAttempt = $userPrompt_Effective
+      if ($attempt -gt 1 -and $validationErrorsForRetry) {
+        $promptForAttempt = $userPrompt_Effective + "`n`nCorrection requise: la sortie JSON prÃ©cÃ©dente est invalide. Erreurs du validateur: $validationErrorsForRetry`nRenvoie uniquement le JSON corrigÃ©, sans timecode."
+      }
+
+      try {
+        $raw = Invoke-LLM -system $Pass1_System -user $promptForAttempt -model $ModelPass1 -DebugHttp:$DebugHttp
+      }
+      catch {
+        Write-Warning ("Segment {0:D2} : Invoke-LLM a Ã©chouÃ© ({1}) ; enveloppe fallback conservÃ©e." -f ($i+1), $_.Exception.Message)
+        $raw = ""
+      }
+
+      [System.IO.File]::WriteAllText(($segOut + ".raw.txt"), $raw, [System.Text.Encoding]::UTF8)
+
+      $jsonStr = $null
+      try {
+        $jsonStr = & python3 $StructuredOutputUtils pass1 `
+          --raw-file ($segOut + ".raw.txt") `
+          --source-file $sourcePath `
+          --segment-id $segmentId `
+          --row-start $rowStart `
+          --row-end $rowEnd `
+          --start-sec $startSecSegment `
+          --end-sec $endSecSegment `
+          --start-hms $startH `
+          --end-hms $endH
+      }
+      catch {
+        $validatedObj = New-Pass1FallbackEnvelope `
+          -SegmentId $segmentId -RowStart $rowStart -RowEnd $rowEnd `
+          -StartSec $startSecSegment -EndSec $endSecSegment -StartHms $startH -EndHms $endH `
+          -TexteSource $sourceLines.Trim() -RawResponse $raw `
+          -Errors @("structured_output_utils failed: $($_.Exception.Message)")
+        $jsonStr = $validatedObj | ConvertTo-Json -Depth 80
+      }
+
+      if ($jsonStr) {
+        try {
+          $validatedObj = $jsonStr | ConvertFrom-Json -Depth 80
+        }
+        catch {
+          $validatedObj = New-Pass1FallbackEnvelope `
+            -SegmentId $segmentId -RowStart $rowStart -RowEnd $rowEnd `
+            -StartSec $startSecSegment -EndSec $endSecSegment -StartHms $startH -EndHms $endH `
+            -TexteSource $sourceLines.Trim() -RawResponse $raw `
+            -Errors @("structured_output_utils returned invalid JSON: $($_.Exception.Message)")
+        }
+      }
+      else {
+        $validatedObj = New-Pass1FallbackEnvelope `
+          -SegmentId $segmentId -RowStart $rowStart -RowEnd $rowEnd `
+          -StartSec $startSecSegment -EndSec $endSecSegment -StartHms $startH -EndHms $endH `
+          -TexteSource $sourceLines.Trim() -RawResponse $raw `
+          -Errors @("structured_output_utils returned empty output")
+      }
+
+      $validatedObj = Complete-Pass1Envelope `
+        -Obj $validatedObj `
+        -SegmentId $segmentId `
+        -RowStart $rowStart `
+        -RowEnd $rowEnd `
+        -StartSec $startSecSegment `
+        -EndSec $endSecSegment `
+        -StartHms $startH `
+        -EndHms $endH `
+        -TexteSource $sourceLines.Trim() `
+        -RawResponse $raw
+      $jsonStr = $validatedObj | ConvertTo-Json -Depth 80
+
+      $llmValid = if (Test-ObjectProperty $validatedObj "llm_valid") { [bool]$validatedObj.llm_valid } else { $false }
+      if ($llmValid -or $attempt -eq $maxStructuredAttempts) {
+        break
+      }
+      $validationErrorsForRetry = if (Test-ObjectProperty $validatedObj "llm_validation_errors") { (@($validatedObj.llm_validation_errors) -join " | ") } else { "missing llm_validation_errors" }
+      ("Segment {0:D2} RETRY structured JSON: {1}" -f ($i+1), $validationErrorsForRetry) | Add-Content $logFile
+    }
+
+    [System.IO.File]::WriteAllText($segOut, $jsonStr, [System.Text.Encoding]::UTF8)
+    $segmentJsonPaths.Add($segOut)
+    $llmValidFinal = if (Test-ObjectProperty $validatedObj "llm_valid") { [bool]$validatedObj.llm_valid } else { $false }
+    $llmFallbackFinal = if (Test-ObjectProperty $validatedObj "llm_fallback") { [bool]$validatedObj.llm_fallback } else { $true }
+    $llmRepairedFinal = if (Test-ObjectProperty $validatedObj "llm_repaired") { [bool]$validatedObj.llm_repaired } else { $false }
+    if ($llmValidFinal -and $llmRepairedFinal) {
+      $status = "VALIDATION_REPAREE"
+      $msg = "Passe 1 segment {0:D2}: validation réparée" -f ($i+1)
+    }
+    elseif ($llmValidFinal) {
+      $status = "VALIDATION_OK"
+      $msg = "Passe 1 segment {0:D2}: validation OK" -f ($i+1)
+    }
+    elseif ($llmFallbackFinal) {
+      $status = "FALLBACK"
+      $errsForLog = if (Test-ObjectProperty $validatedObj "llm_validation_errors") { (@($validatedObj.llm_validation_errors) -join " | ") } else { "erreur non renseignée" }
+      $msg = "Passe 1 segment {0:D2}: fallback utilisé ({1})" -f ($i+1), $errsForLog
+    }
+    else {
+      $status = "INVALID"
+      $msg = "Passe 1 segment {0:D2}: validation invalide sans fallback explicite" -f ($i+1)
+    }
+    Microsoft.PowerShell.Utility\Write-Host $msg
+    $msg | Add-Content $logFile
+    ("Segment {0:D2} {1}" -f ($i+1), $status) | Add-Content $logFile
+    continue
+
     #-----------------------------
     # Appel LLM
     #-----------------------------
@@ -3447,6 +3991,75 @@ for($i=0; $i -lt $segments.Count; $i++){
 
 
 # fin passe 1A et début passe 1B
+$pass1Qa = [pscustomobject]@{
+  segments_sans_analyse_llm_valide = @()
+  sorties_reparees = @()
+  sorties_fallback = @()
+  timecodes_llm_hors_intervalle = @()
+  summary = [pscustomobject]@{}
+  critical_warnings = @()
+}
+$segmentJsonPathsType = if ($null -eq $segmentJsonPaths) { "<null>" } else { $segmentJsonPaths.GetType().FullName }
+$segmentJsonPathList = Convert-ToSegmentPathList $segmentJsonPaths
+$segmentPathPreview = @($segmentJsonPathList | Select-Object -First 3)
+$segmentPathDebug = "Passe 1 QA: segmentJsonPaths type={0}; count={1}; first_paths={2}" -f $segmentJsonPathsType, $segmentJsonPathList.Count, ($segmentPathPreview -join " | ")
+Microsoft.PowerShell.Utility\Write-Host $segmentPathDebug
+$segmentPathDebug | Add-Content $logFile
+
+foreach ($p in $segmentJsonPathList) {
+  try {
+    $segQa = Get-Content $p -Raw | ConvertFrom-Json -Depth 80
+    $qaErrors = @()
+    if (-not (Test-ObjectProperty $segQa "llm_valid")) {
+      $qaErrors += "missing llm_valid in segment envelope"
+    }
+    if (-not (Test-ObjectProperty $segQa "llm_validation_errors")) {
+      $qaErrors += "missing llm_validation_errors in segment envelope"
+    }
+    $qaValid = if (Test-ObjectProperty $segQa "llm_valid") { [bool]$segQa.llm_valid } else { $false }
+    $qaSegmentId = if (Test-ObjectProperty $segQa "segment_id") { $segQa.segment_id } else { [System.IO.Path]::GetFileNameWithoutExtension([string]$p) }
+    $qaValidationErrors = if (Test-ObjectProperty $segQa "llm_validation_errors") { @($segQa.llm_validation_errors) } else { @() }
+    if (-not $qaValid) {
+      $pass1Qa.segments_sans_analyse_llm_valide += [pscustomobject]@{
+        segment_id = $qaSegmentId
+        errors = @($qaValidationErrors) + @($qaErrors)
+      }
+    }
+    if ((Test-ObjectProperty $segQa "llm_repaired") -and [bool]$segQa.llm_repaired) { $pass1Qa.sorties_reparees += $qaSegmentId }
+    if ((Test-ObjectProperty $segQa "llm_fallback") -and [bool]$segQa.llm_fallback) { $pass1Qa.sorties_fallback += $qaSegmentId }
+    foreach ($err in @($qaValidationErrors + $qaErrors)) {
+      if ([string]$err -like "*outside segment interval*") {
+        $pass1Qa.timecodes_llm_hors_intervalle += [pscustomobject]@{
+          segment_id = $qaSegmentId
+          error = [string]$err
+        }
+      }
+    }
+  } catch {
+    $pass1Qa.segments_sans_analyse_llm_valide += [pscustomobject]@{
+      segment_id = [System.IO.Path]::GetFileNameWithoutExtension([string]$p)
+      errors = @("QA read failed: $($_.Exception.Message)")
+    }
+  }
+}
+$pass1TotalSegments = $segmentJsonPathList.Count
+$pass1FallbackCount = @($pass1Qa.sorties_fallback).Count
+$pass1FallbackRatio = if ($pass1TotalSegments -gt 0) { [math]::Round(($pass1FallbackCount / [double]$pass1TotalSegments), 4) } else { 0.0 }
+$pass1Qa.summary = [pscustomobject]@{
+  segment_count = $pass1TotalSegments
+  fallback_count = $pass1FallbackCount
+  fallback_ratio = $pass1FallbackRatio
+}
+if ($pass1TotalSegments -gt 0 -and $pass1FallbackRatio -gt 0.5) {
+  $critical = "WARNING CRITIQUE QA: Passe 1 fallback sur {0}/{1} segments ({2:P0}). Le pipeline ne doit pas être considéré OK sans reprise." -f $pass1FallbackCount, $pass1TotalSegments, $pass1FallbackRatio
+  Write-Warning $critical
+  $critical | Add-Content $logFile
+  $CriticalQaWarnings.Add($critical) | Out-Null
+  $pass1Qa.critical_warnings += $critical
+}
+$pass1QaPath = Join-Path $OutDir "pass1_qa.json"
+[System.IO.File]::WriteAllText($pass1QaPath, ($pass1Qa | ConvertTo-Json -Depth 20), [System.Text.Encoding]::UTF8)
+Microsoft.PowerShell.Utility\Write-Host "QA Passe 1 -> $pass1QaPath"
 
 
 
@@ -3658,6 +4271,7 @@ Microsoft.PowerShell.Utility\Write-Host "Agrégation Passe 2A OK → $globalPath
 #-------------------------------------------------------------------------
 
 Microsoft.PowerShell.Utility\Write-Host "Passe 2B → Construction du GLOBAL réunion (par batches de $Pass2BatchSize segments)"
+Microsoft.PowerShell.Utility\Write-Host ("Pass2B utilise ModelReport={0} (ModelPass2={1} est utilisé par l'ancienne fusion Pass2)" -f $ModelReport, $ModelPass2)
 if ($OnlyPass2BBatches -and @($OnlyPass2BBatches).Count -gt 0) {
   Microsoft.PowerShell.Utility\Write-Host ("Pass2B reprise ciblée → batch(es) {0}" -f ((@($OnlyPass2BBatches) | Sort-Object -Unique) -join ","))
   if ($RebuildFromPass2B) {
@@ -3677,6 +4291,9 @@ if ($HasOnlySubjects) {
 
 $pass2BDir = Join-Path $OutDir "pass2B_batches"
 New-Item -ItemType Directory -Force -Path $pass2BDir | Out-Null
+$pass2BTimingLogDir = Join-Path $OutDir "logs"
+Ensure-Dir $pass2BTimingLogDir
+$script:Pass2BTimingEntries = New-Object System.Collections.Generic.List[object]
 
 # ---- Helpers (tolérance JSON / types) ---------------------------------
 
@@ -3849,6 +4466,126 @@ function New-Pass2BLocalFallback {
   return $fallback
 }
 
+function ConvertTo-Pass2BCompactSegment {
+  param([object] $Segment)
+
+  if (-not $Segment) { return $null }
+
+  $segmentId = if ($Segment.PSObject.Properties['segment_id']) { [string]$Segment.segment_id } else { "" }
+  $startHms = if ($Segment.PSObject.Properties['start_hms']) { [string]$Segment.start_hms } else { "" }
+  $endHms = if ($Segment.PSObject.Properties['end_hms']) { [string]$Segment.end_hms } else { "" }
+
+  $sujetsObj = $null
+  if ($Segment.PSObject.Properties['sujets'] -and $Segment.sujets) {
+    $sujetsObj = $Segment.sujets
+  }
+  elseif ($Segment.PSObject.Properties['llm_analysis'] -and $Segment.llm_analysis -and $Segment.llm_analysis.PSObject.Properties['sujets']) {
+    $sujetsObj = $Segment.llm_analysis.sujets
+  }
+
+  $sujetNums = New-Object System.Collections.Generic.List[string]
+  $points = New-Object System.Collections.Generic.List[object]
+  if ($sujetsObj) {
+    $pairs = @()
+    if ($sujetsObj -is [System.Collections.IDictionary]) {
+      $pairs = $sujetsObj.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Numero = [string]$_.Key; Items = $_.Value } }
+    } else {
+      $pairs = $sujetsObj.PSObject.Properties | ForEach-Object { [pscustomobject]@{ Numero = [string]$_.Name; Items = $_.Value } }
+    }
+    foreach ($pair in @($pairs)) {
+      if (-not [string]::IsNullOrWhiteSpace($pair.Numero)) { $sujetNums.Add($pair.Numero) | Out-Null }
+      foreach ($it in @($pair.Items)) {
+        if (-not $it) { continue }
+        $txt = if ($it.PSObject.Properties['texte']) { [string]$it.texte } else { [string]$it }
+        if ([string]::IsNullOrWhiteSpace($txt)) { continue }
+        $points.Add([pscustomobject]@{
+          sujet = $pair.Numero
+          timecode = if ($it.PSObject.Properties['timecode']) { [string]$it.timecode } else { $null }
+          auteur = if ($it.PSObject.Properties['auteur']) { [string]$it.auteur } else { $null }
+          texte = $txt
+        }) | Out-Null
+      }
+    }
+  }
+
+  $texteUtile = ""
+  if ($points.Count -gt 0) {
+    $texteUtile = (($points | Select-Object -First 12 | ForEach-Object { $_.texte }) -join "`n")
+  }
+  elseif ($Segment.PSObject.Properties['resume_segment'] -and $Segment.resume_segment) {
+    $texteUtile = [string]$Segment.resume_segment
+  }
+  elseif ($Segment.PSObject.Properties['texte_source'] -and $Segment.texte_source) {
+    $src = [string]$Segment.texte_source
+    $texteUtile = if ($src.Length -gt 1200) { $src.Substring(0, 1200) + "`n[...]" } else { $src }
+  }
+
+  return [pscustomobject]@{
+    segment_id = $segmentId
+    start_hms = $startHms
+    end_hms = $endHms
+    texte_source_utile = $texteUtile
+    sujets_detectes = @($sujetNums.ToArray() | Sort-Object -Unique)
+    points_cles = @($points.ToArray() | Select-Object -First 20)
+    demandes_actions = @()
+  }
+}
+
+function Add-Pass2BTimingEntry {
+  param([object] $Entry)
+  if (-not $script:Pass2BTimingEntries) {
+    $script:Pass2BTimingEntries = New-Object System.Collections.Generic.List[object]
+  }
+  $script:Pass2BTimingEntries.Add($Entry) | Out-Null
+}
+
+function Write-Pass2BTimingReport {
+  param(
+    [string] $LogsDir,
+    [string] $LogFile
+  )
+
+  if (-not $script:Pass2BTimingEntries) { return }
+  Ensure-Dir $LogsDir
+  $entries = @($script:Pass2BTimingEntries.ToArray())
+  $jsonPath = Join-Path $LogsDir "pass2b_timing.json"
+  $csvPath = Join-Path $LogsDir "pass2b_timing.csv"
+
+  $completed = @($entries | Where-Object { $_.final_status -ne "SKIPPED" })
+  $slowest = $completed | Sort-Object duration_sec -Descending | Select-Object -First 1
+  $largest = $completed | Sort-Object prompt_chars -Descending | Select-Object -First 1
+  $avgTokens = if ($completed.Count -gt 0) { [math]::Round((($completed | Measure-Object -Property estimated_input_tokens -Average).Average), 2) } else { 0 }
+  $avgDuration = if ($completed.Count -gt 0) { [math]::Round((($completed | Measure-Object -Property duration_sec -Average).Average), 2) } else { 0 }
+  $recommendations = New-Object System.Collections.Generic.List[string]
+  if ($largest -and [int]$largest.prompt_chars -gt $Pass2BPromptCharsLimit) {
+    $recommendations.Add(("Réduire le batch {0} ou renforcer la projection compacte: prompt_chars={1} > limite={2}." -f $largest.batch_id, $largest.prompt_chars, $Pass2BPromptCharsLimit)) | Out-Null
+  }
+  if ($slowest -and [double]$slowest.duration_sec -gt 180) {
+    $recommendations.Add(("Surveiller le batch {0}: durée {1}s pour {2} tokens estimés." -f $slowest.batch_id, $slowest.duration_sec, $slowest.estimated_input_tokens)) | Out-Null
+  }
+  if ($completed.Count -gt 0 -and $avgTokens -gt 0 -and $avgDuration -gt 0) {
+    $recommendations.Add(("Moyennes Pass2B: {0}s et {1} tokens estimés par tentative." -f $avgDuration, $avgTokens)) | Out-Null
+  }
+
+  $report = [pscustomobject]@{
+    generated_at = (Get-Date).ToString("o")
+    entries = $entries
+    qa = [pscustomobject]@{
+      batch_le_plus_lent = $slowest
+      batch_le_plus_volumineux = $largest
+      moyenne_duration_sec = $avgDuration
+      moyenne_estimated_input_tokens = $avgTokens
+      correlation_taille_duree = "Voir entries: comparer estimated_input_tokens/prompt_chars avec duration_sec."
+      recommendations = @($recommendations.ToArray())
+    }
+  }
+
+  [System.IO.File]::WriteAllText($jsonPath, ($report | ConvertTo-Json -Depth 50), [System.Text.Encoding]::UTF8)
+  $entries | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
+  Microsoft.PowerShell.Utility\Write-Host "QA timing Pass2B -> $jsonPath"
+  ("QA timing Pass2B -> {0}" -f $jsonPath) | Add-Content $LogFile
+}
+
 function Invoke-Pass2BBatchAttempt {
   param(
     [int] $BatchIndex,
@@ -3873,8 +4610,61 @@ function Invoke-Pass2BBatchAttempt {
   $metaPath   = "${attemptBase}_meta.json"
   $errorPath  = "${attemptBase}_error.txt"
 
-  $batchSegJson = $BatchSeg | ConvertTo-Json -Depth 50 -Compress
+  $batchSegmentIds = @($BatchSeg | ForEach-Object {
+    if ($_ -and $_.PSObject.Properties['segment_id']) { [string]$_.segment_id } else { "" }
+  } | Where-Object { $_ })
+  $compactBatchSeg = @($BatchSeg | ForEach-Object { ConvertTo-Pass2BCompactSegment $_ } | Where-Object { $_ })
+  $batchSegJson = $compactBatchSeg | ConvertTo-Json -Depth 20 -Compress
   $pass2BUser   = $Pass2BUserTemplate.Replace("{SEGMENTS_JSON}", $batchSegJson)
+  $promptCharsBeforeLimit = ([string]$Pass2BSystem).Length + ([string]$pass2BUser).Length
+  $estimatedTokensBeforeLimit = Estimate-Tokens (($Pass2BSystem) + "`n" + ($pass2BUser))
+  $budget = Get-ContextBudget $ModelReport
+  $maxTokensRequested = [int]$budget.MaxTok
+  $attemptStart = Get-Date
+
+  if ((@($BatchSeg).Count -gt 1) -and (($Pass2BPromptCharsLimit -gt 0 -and $promptCharsBeforeLimit -gt $Pass2BPromptCharsLimit) -or ($Pass2BEstimatedTokensLimit -gt 0 -and $estimatedTokensBeforeLimit -gt $Pass2BEstimatedTokensLimit))) {
+    $attemptEnd = Get-Date
+    $msg = "Pass2B batch {0:D2} [{1}]: prompt trop volumineux ({2} chars, {3} tokens estimés), découpe adaptative." -f $BatchIndex, $safeAttemptId, $promptCharsBeforeLimit, $estimatedTokensBeforeLimit
+    Write-Warning $msg
+    $msg | Add-Content $LogFile
+    Add-Pass2BTimingEntry ([pscustomobject]@{
+      batch_id = ("{0:D2}" -f $BatchIndex)
+      attempt_id = $safeAttemptId
+      segments_inclus = @($batchSegmentIds) -join ","
+      started_at = $attemptStart.ToString("o")
+      ended_at = $attemptEnd.ToString("o")
+      duration_sec = [math]::Round(($attemptEnd - $attemptStart).TotalSeconds, 3)
+      total_duration_sec = [math]::Round(($attemptEnd - $attemptStart).TotalSeconds, 3)
+      successful_attempt_duration_sec = $null
+      failed_attempts_count = 0
+      prompt_chars = $promptCharsBeforeLimit
+      estimated_input_tokens = $estimatedTokensBeforeLimit
+      max_tokens_demande = $maxTokensRequested
+      modele = $ModelReport
+      modele_reel_adapter = ""
+      response_chars = 0
+      retries = if ($safeAttemptId -eq "main") { 0 } else { 1 }
+      final_status = "PROMPT_TOO_LARGE"
+      segment_count = @($BatchSeg).Count
+      prompt_truncated = $true
+      output_truncated = $false
+      fallback_used = $false
+      llm_attempts = @()
+    })
+    return [pscustomobject]@{
+      BatchObj      = (Normalize-MeetingBatchObj $null)
+      WasTruncated  = $true
+      PromptTruncated = $true
+      OutputTruncated = $false
+      InputRich     = 1
+      ResultEmpty   = $true
+      SegmentCount  = @($BatchSeg).Count
+      AttemptId     = $safeAttemptId
+      OutputPath    = $attemptOut
+      Status        = "PROMPT_TOO_LARGE"
+    }
+  }
+
   $pass2BUser_Effective = Enforce-ContextLimit `
     -SystemPrompt $Pass2BSystem `
     -UserPrompt   $pass2BUser `
@@ -3883,6 +4673,8 @@ function Invoke-Pass2BBatchAttempt {
     -ModelName    $ModelReport
 
   $wasTruncated = ($pass2BUser_Effective -ne $pass2BUser)
+  $promptCharsEffective = ([string]$Pass2BSystem).Length + ([string]$pass2BUser_Effective).Length
+  $estimatedTokensEffective = Estimate-Tokens (($Pass2BSystem) + "`n" + ($pass2BUser_Effective))
 
   Write-ArtifactText -Path $promptPath -Text $pass2BUser_Effective -ModelName $ModelReport
   Write-ArtifactText -Path $systemPath -Text $Pass2BSystem -ModelName $ModelReport
@@ -3890,10 +4682,14 @@ function Invoke-Pass2BBatchAttempt {
   $meta = [pscustomobject]@{
     batch          = $BatchIndex
     attempt        = $safeAttemptId
+    segments       = @($batchSegmentIds)
     segment_count  = @($BatchSeg).Count
     model          = $ModelReport
     apiBase        = $ApiBase
     was_truncated  = $wasTruncated
+    prompt_chars   = $promptCharsEffective
+    estimated_input_tokens = $estimatedTokensEffective
+    max_tokens_requested = $maxTokensRequested
     timestamp      = (Get-Date).ToString("o")
   }
   [System.IO.File]::WriteAllText($metaPath, ($meta | ConvertTo-Json -Depth 10), $utf8NoBom)
@@ -3901,9 +4697,18 @@ function Invoke-Pass2BBatchAttempt {
   $batchObj = $null
   $raw = $null
   $outputTruncated = $false
+  $finalStatus = "OK"
+  $fallbackUsed = $false
+  $script:CurrentLLMTimingAttempts = New-Object System.Collections.Generic.List[object]
 
   try {
-    $raw = Invoke-LLM -system $Pass2BSystem -user $pass2BUser_Effective -model $ModelReport -DebugHttp:$DebugHttp
+    $attemptStart = Get-Date
+    $raw = Invoke-LLM `
+      -system $Pass2BSystem `
+      -user $pass2BUser_Effective `
+      -model $ModelReport `
+      -Label ("Pass2B batch {0:D2}" -f $BatchIndex) `
+      -DebugHttp:$DebugHttp
     if (-not $raw -or $raw.Trim().Length -eq 0) { throw "R?ponse LLM vide" }
     Write-ArtifactText -Path $rawPath -Text $raw -ModelName $ModelReport
   }
@@ -3916,6 +4721,8 @@ function Invoke-Pass2BBatchAttempt {
     Write-ArtifactText -Path $rawPath -Text $errTxt -ModelName $ModelReport
     Write-Warning ("Pass2B batch {0:D2} [{1}]: ?chec Invoke-LLM (voir {2})." -f $BatchIndex, $safeAttemptId, $errorPath)
     $raw = $null
+    $finalStatus = "FALLBACK"
+    $fallbackUsed = $true
   }
 
   if ($raw) {
@@ -3927,6 +4734,8 @@ function Invoke-Pass2BBatchAttempt {
       [IO.File]::WriteAllText($errorPath, $errTxt, [Text.Encoding]::UTF8)
       Write-Warning ("Pass2B batch {0:D2} [{1}]: JSON non parsable (voir {2})." -f $BatchIndex, $safeAttemptId, $errorPath)
       $batchObj = $null
+      $finalStatus = "FALLBACK"
+      $fallbackUsed = $true
     }
   }
 
@@ -3935,8 +4744,41 @@ function Invoke-Pass2BBatchAttempt {
   if ($diag.InputRich -gt 0 -and $diag.ResultEmpty) {
     $outputTruncated = $true
     Write-Warning ("Pass2B batch {0:D2} [{1}]: sortie vide malgré une entrée riche." -f $BatchIndex, $safeAttemptId)
+    $finalStatus = "FALLBACK"
+    $fallbackUsed = $true
   }
   [System.IO.File]::WriteAllText($attemptOut, ($batchObj | ConvertTo-Json -Depth 50), $utf8NoBom)
+  $attemptEnd = Get-Date
+  $llmAttempts = if ($script:CurrentLLMTimingAttempts) { @($script:CurrentLLMTimingAttempts.ToArray()) } else { @() }
+  $failedAttemptsCount = @($llmAttempts | Where-Object { $_.status -ne "OK" }).Count
+  $successAttempt = @($llmAttempts | Where-Object { $_.status -eq "OK" } | Select-Object -Last 1)
+  $successfulAttemptDuration = if (@($successAttempt).Count -gt 0) { [double]$successAttempt[-1].duration_sec } else { $null }
+  $actualResponseModel = if (@($successAttempt).Count -gt 0 -and $successAttempt[-1].response_model) { [string]$successAttempt[-1].response_model } else { "" }
+  Add-Pass2BTimingEntry ([pscustomobject]@{
+    batch_id = ("{0:D2}" -f $BatchIndex)
+    attempt_id = $safeAttemptId
+    segments_inclus = @($batchSegmentIds) -join ","
+    started_at = $attemptStart.ToString("o")
+    ended_at = $attemptEnd.ToString("o")
+    duration_sec = [math]::Round(($attemptEnd - $attemptStart).TotalSeconds, 3)
+    total_duration_sec = [math]::Round(($attemptEnd - $attemptStart).TotalSeconds, 3)
+    successful_attempt_duration_sec = $successfulAttemptDuration
+    failed_attempts_count = $failedAttemptsCount
+    prompt_chars = $promptCharsEffective
+    estimated_input_tokens = $estimatedTokensEffective
+    max_tokens_demande = $maxTokensRequested
+    modele = $ModelReport
+    modele_reel_adapter = $actualResponseModel
+    response_chars = if ($raw) { ([string]$raw).Length } else { 0 }
+    retries = $failedAttemptsCount
+    final_status = $finalStatus
+    segment_count = @($BatchSeg).Count
+    prompt_truncated = $wasTruncated
+    output_truncated = $outputTruncated
+    fallback_used = $fallbackUsed
+    llm_attempts = @($llmAttempts)
+  })
+  $script:CurrentLLMTimingAttempts = $null
 
   return [pscustomobject]@{
     BatchObj      = $batchObj
@@ -3948,6 +4790,7 @@ function Invoke-Pass2BBatchAttempt {
     SegmentCount  = @($BatchSeg).Count
     AttemptId     = $safeAttemptId
     OutputPath    = $attemptOut
+    Status        = $finalStatus
   }
 }
 
@@ -4391,6 +5234,33 @@ else {
 
     if ((Test-Path $batchOut) -and (-not $Force) -and (-not $selectedForPass2BRebuild)) {
       Microsoft.PowerShell.Utility\Write-Host "Pass2B: skip batch $batchIndex (existe) → $batchOut"
+      $existingSegments = @($segmentObjs[$from..$to] | ForEach-Object {
+        if ($_ -and $_.PSObject.Properties['segment_id']) { [string]$_.segment_id } else { "" }
+      } | Where-Object { $_ })
+      Add-Pass2BTimingEntry ([pscustomobject]@{
+        batch_id = ("{0:D2}" -f $batchIndex)
+        attempt_id = "main"
+        segments_inclus = @($existingSegments) -join ","
+        started_at = (Get-Date).ToString("o")
+        ended_at = (Get-Date).ToString("o")
+        duration_sec = 0
+        total_duration_sec = 0
+        successful_attempt_duration_sec = $null
+        failed_attempts_count = 0
+        prompt_chars = 0
+        estimated_input_tokens = 0
+        max_tokens_demande = (Get-ContextBudget $ModelReport).MaxTok
+        modele = $ModelReport
+        modele_reel_adapter = ""
+        response_chars = 0
+        retries = 0
+        final_status = "SKIPPED"
+        segment_count = @($existingSegments).Count
+        prompt_truncated = $false
+        output_truncated = $false
+        fallback_used = $false
+        llm_attempts = @()
+      })
       $batchPaths.Add($batchOut) | Out-Null
       continue
     }
@@ -4416,6 +5286,8 @@ else {
     [System.IO.File]::WriteAllText($batchOut, $json, $utf8NoBom)
     $batchPaths.Add($batchOut) | Out-Null
   }
+
+  Write-Pass2BTimingReport -LogsDir $pass2BTimingLogDir -LogFile $logFile
 
   # ---- 4) Fusion finale des batches
 
@@ -5157,6 +6029,45 @@ foreach ($sf in $sujetFiles) {
 }
 
 Microsoft.PowerShell.Utility\Write-Host ("Passe 2E terminée → {0} fichier(s) compact(s)" -f @($pass2EPaths).Count)
+
+$pass2EQa = [pscustomobject]@{
+  subject_count = @($pass2EPaths).Count
+  subjects_without_chunk = @()
+  critical_warnings = @()
+}
+foreach ($compactPath in @($pass2EPaths)) {
+  try {
+    $compactObj = Get-Content -LiteralPath $compactPath -Raw | ConvertFrom-Json -Depth 80
+    $chunkCount = 0
+    if ($compactObj.PSObject.Properties['stats'] -and $compactObj.stats -and $compactObj.stats.PSObject.Properties['chunk_count']) {
+      $chunkCount = [int]$compactObj.stats.chunk_count
+    }
+    if ($chunkCount -eq 0) {
+      $pass2EQa.subjects_without_chunk += [pscustomobject]@{
+        source_name = if ($compactObj.PSObject.Properties['source_name']) { $compactObj.source_name } else { [System.IO.Path]::GetFileNameWithoutExtension([string]$compactPath) }
+        path = [string]$compactPath
+      }
+    }
+  }
+  catch {
+    $pass2EQa.subjects_without_chunk += [pscustomobject]@{
+      source_name = [System.IO.Path]::GetFileNameWithoutExtension([string]$compactPath)
+      path = [string]$compactPath
+      error = "lecture compact impossible: $($_.Exception.Message)"
+    }
+  }
+}
+$pass2ENoChunkCount = @($pass2EQa.subjects_without_chunk).Count
+if ($pass2EQa.subject_count -gt 0 -and $pass2ENoChunkCount -eq $pass2EQa.subject_count) {
+  $critical = "WARNING CRITIQUE QA: Passe 2E a 100% des sujets sans chunk ({0}/{1}). Vérifier global.json / split_by_sujet avant de considérer le pipeline OK." -f $pass2ENoChunkCount, $pass2EQa.subject_count
+  Write-Warning $critical
+  $critical | Add-Content $logFile
+  $CriticalQaWarnings.Add($critical) | Out-Null
+  $pass2EQa.critical_warnings += $critical
+}
+$pass2EQaPath = Join-Path $OutDir "pass2e_qa.json"
+[System.IO.File]::WriteAllText($pass2EQaPath, ($pass2EQa | ConvertTo-Json -Depth 20), [System.Text.Encoding]::UTF8)
+Microsoft.PowerShell.Utility\Write-Host "QA Passe 2E -> $pass2EQaPath"
 
 # ── Fin Passe 2E : condensation par sujet (LLM) ─────────
 
@@ -6133,6 +7044,21 @@ $finalPath  = Join-Path $OutDir "global_final.json"
 )
 
 Microsoft.PowerShell.Utility\Write-Host "JSON FINAL → $finalPath"
+
+$pipelineQaPath = Join-Path $OutDir "pipeline_qa_status.json"
+$pipelineQaStatus = [pscustomobject]@{
+  ok = (@($CriticalQaWarnings).Count -eq 0)
+  critical_warning_count = @($CriticalQaWarnings).Count
+  critical_warnings = @($CriticalQaWarnings)
+}
+[System.IO.File]::WriteAllText($pipelineQaPath, ($pipelineQaStatus | ConvertTo-Json -Depth 20), $utf8NoBom)
+if (@($CriticalQaWarnings).Count -gt 0) {
+  $msg = "WARNING CRITIQUE QA: pipeline terminé avec alertes critiques; voir $pipelineQaPath"
+  Write-Warning $msg
+  $msg | Add-Content $logFile
+} else {
+  Microsoft.PowerShell.Utility\Write-Host "QA pipeline OK -> $pipelineQaPath"
+}
 
 "Done: $(Get-Date)" | Add-Content $logFile
 Microsoft.PowerShell.Utility\Write-Host "Pipeline terminé (full JSON)."
