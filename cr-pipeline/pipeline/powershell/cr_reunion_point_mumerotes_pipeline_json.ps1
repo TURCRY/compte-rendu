@@ -2303,10 +2303,142 @@ Renvoie uniquement le JSON "global réunion" conforme au schéma.
 
 # agregation hierarchique
 Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F13 - avant définition fonction Aggregate-Sujets" -ForegroundColor Yellow
+function Get-SubjectKeyFromPass1Title {
+  param([string] $Title, [int] $FallbackIndex = 0)
+
+  $t = if ($null -eq $Title) { "" } else { ([string]$Title).Trim() }
+  if ($t -match '^\s*(\d+)\b') { return [string]([int]$matches[1]) }
+  if ($FallbackIndex -gt 0) { return [string]$FallbackIndex }
+  return $null
+}
+
+function Get-OptionalProperty {
+  param(
+    [object] $Obj,
+    [string] $Name,
+    [object] $Default = $null
+  )
+
+  if ($null -eq $Obj -or [string]::IsNullOrWhiteSpace($Name)) { return $Default }
+  if ($Obj -is [System.Collections.IDictionary]) {
+    if ($Obj.Contains($Name)) { return $Obj[$Name] }
+    if ($Obj.ContainsKey($Name)) { return $Obj[$Name] }
+    return $Default
+  }
+  try {
+    $prop = $Obj.PSObject.Properties[$Name]
+    if ($null -ne $prop) { return $prop.Value }
+  } catch {}
+  return $Default
+}
+
+function Get-Pass1SegmentRowMap {
+  param([object] $Segment)
+
+  $map = @{}
+  $source = Get-OptionalProperty $Segment "texte_source" ""
+  if ([string]::IsNullOrWhiteSpace([string]$source)) { return $map }
+
+  foreach ($line in ([string]$source -split "\r?\n")) {
+    $trimmed = ([string]$line).Trim()
+    if ($trimmed -match '^\[ROW\s+(\d+)\]\s+\[(\d{2}:\d{2}:\d{2})\]\s+([^:]+):\s?(.*)$') {
+      $rowKey = [string]([int]$matches[1])
+      $map[$rowKey] = [pscustomobject]@{
+        row_ref = [int]$matches[1]
+        timecode = [string]$matches[2]
+        speaker = [string]$matches[3]
+        texte_source = [string]$matches[4]
+      }
+    }
+  }
+
+  return $map
+}
+
+function Get-Pass1SujetPairsForAggregation {
+  param(
+    [object] $Segment,
+    [System.Collections.IList] $QaEvents = $null
+  )
+
+  $segmentId = if ($Segment -and $Segment.PSObject.Properties['segment_id']) { [string]$Segment.segment_id } else { "" }
+  $sources = @()
+  if ($Segment -and $Segment.PSObject.Properties['sujets']) {
+    $sources += [pscustomobject]@{ Name = "segment.sujets"; Value = $Segment.sujets }
+  }
+  if ($Segment -and $Segment.PSObject.Properties['llm_analysis'] -and $Segment.llm_analysis -and $Segment.llm_analysis.PSObject.Properties['sujets']) {
+    $sources += [pscustomobject]@{ Name = "segment.llm_analysis.sujets"; Value = $Segment.llm_analysis.sujets }
+  }
+
+  $bestPairs = @()
+  $bestSource = ""
+  $sourceDiagnostics = @()
+
+  foreach ($src in @($sources)) {
+    $pairs = @()
+    $value = $src.Value
+    if ($null -eq $value) {
+      $sourceDiagnostics += [pscustomobject]@{ source = $src.Name; shape = "null"; pair_count = 0; intervention_count = 0 }
+      continue
+    }
+
+    if ($value -is [System.Collections.IDictionary]) {
+      $pairs = @($value.GetEnumerator() | ForEach-Object {
+        [pscustomobject]@{ Numero = [string]$_.Key; Interventions = $_.Value; Source = $src.Name }
+      })
+    }
+    elseif ($value -is [System.Collections.IEnumerable] -and $value -isnot [string]) {
+      $idx = 0
+      foreach ($subjectObj in @($value)) {
+        $idx++
+        if (-not $subjectObj) { continue }
+        $title = if ($subjectObj.PSObject.Properties['titre']) { [string]$subjectObj.titre } else { "" }
+        $key = Get-SubjectKeyFromPass1Title -Title $title -FallbackIndex $idx
+        if (-not $key) { continue }
+        $items = if ($subjectObj.PSObject.Properties['interventions']) { $subjectObj.interventions } else { @() }
+        $pairs += [pscustomobject]@{ Numero = $key; Interventions = $items; Source = $src.Name }
+      }
+    }
+    else {
+      $sourceDiagnostics += [pscustomobject]@{ source = $src.Name; shape = $value.GetType().FullName; pair_count = 0; intervention_count = 0 }
+      continue
+    }
+
+    $interventionCount = 0
+    foreach ($pair in @($pairs)) {
+      $interventionCount += @($pair.Interventions).Count
+    }
+    $sourceDiagnostics += [pscustomobject]@{
+      source = $src.Name
+      shape = $value.GetType().FullName
+      pair_count = @($pairs).Count
+      intervention_count = $interventionCount
+    }
+    if ($interventionCount -gt 0 -and ($bestPairs.Count -eq 0 -or $interventionCount -gt ($bestPairs | ForEach-Object { @($_.Interventions).Count } | Measure-Object -Sum).Sum)) {
+      $bestPairs = @($pairs)
+      $bestSource = $src.Name
+    }
+  }
+
+  if ($QaEvents) {
+    $QaEvents.Add([pscustomobject]@{
+      segment_id = $segmentId
+      selected_source = $bestSource
+      selected_pair_count = @($bestPairs).Count
+      selected_intervention_count = ($bestPairs | ForEach-Object { @($_.Interventions).Count } | Measure-Object -Sum).Sum
+      sources = @($sourceDiagnostics)
+      reason = if (@($bestPairs).Count -eq 0) { "no_subject_interventions_found" } else { "ok" }
+    }) | Out-Null
+  }
+
+  return @($bestPairs)
+}
+
 function Aggregate-Sujets {
   param(
     [object[]] $Segments,
-    [int] $MaxSec = 0
+    [int] $MaxSec = 0,
+    [System.Collections.IList] $QaEvents = $null
   )
 
   $bySujet = @{}
@@ -2314,21 +2446,11 @@ function Aggregate-Sujets {
   foreach ($seg in $Segments) {
     if (-not $seg) { continue }
 
-    $sujets = $seg.sujets
-    if (-not $sujets) { continue }
-
-    # 1) Paires numero -> interventions
-    $pairs = @()
-    if ($sujets -is [System.Collections.IDictionary]) {
-      $pairs = $sujets.GetEnumerator() | ForEach-Object {
-        [pscustomobject]@{ Numero = [string]$_.Key; Interventions = $_.Value }
-      }
-    }
-    else {
-      $pairs = $sujets.PSObject.Properties | ForEach-Object {
-        [pscustomobject]@{ Numero = [string]$_.Name; Interventions = $_.Value }
-      }
-    }
+    # 1) Paires numero -> interventions. Depuis la stabilisation Pass1,
+    # llm_analysis est la source principale; sujets reste une vue legacy.
+    $pairs = Get-Pass1SujetPairsForAggregation -Segment $seg -QaEvents $QaEvents
+    if (-not $pairs -or @($pairs).Count -eq 0) { continue }
+    $rowMap = Get-Pass1SegmentRowMap -Segment $seg
 
     foreach ($p in $pairs) {
       $numero = ([string]$p.Numero).Trim()
@@ -2351,7 +2473,17 @@ function Aggregate-Sujets {
       foreach ($iv in $interventions) {
         if (-not $iv) { continue }
 
-        $tcRaw = [string]$iv.timecode
+        $rowRef = Get-OptionalProperty $iv "row_ref" $null
+        $tcValue = Get-OptionalProperty $iv "timecode" $null
+        $tcRaw = if ($null -ne $tcValue) { [string]$tcValue } else { "" }
+        $timecodeSource = "llm"
+        if ([string]::IsNullOrWhiteSpace($tcRaw) -and $null -ne $rowRef) {
+          $rowKey = [string]$rowRef
+          if ($rowMap.ContainsKey($rowKey)) {
+            $tcRaw = [string]$rowMap[$rowKey].timecode
+            $timecodeSource = "row_ref"
+          }
+        }
         $tc = $tcRaw
 
         if ($MaxSec -gt 0) {
@@ -2361,14 +2493,19 @@ function Aggregate-Sujets {
             $tc = $null
           }
         }
+        if ($null -eq $tc -and $timecodeSource -eq "row_ref" -and $tcRaw -match '^\d{2}:\d{2}:\d{2}$') {
+          $tc = $tcRaw
+        }
 
         $bySujet[$numero].Add([pscustomobject]@{
-          segment_id    = $seg.segment_id
+          segment_id    = Get-OptionalProperty $seg "segment_id" $null
+          row_ref       = $rowRef
           timecode      = $tc          # HH:MM:SS ou $null
           timecode_raw  = $tcRaw       # ce que le LLM a produit
-          auteur        = $iv.auteur
-          role          = $iv.role
-          texte         = $iv.texte
+          timecode_source = $timecodeSource
+          auteur        = Get-OptionalProperty $iv "auteur" $null
+          role          = Get-OptionalProperty $iv "role" $null
+          texte         = Get-OptionalProperty $iv "texte" ""
         }) | Out-Null
 
       }
@@ -2381,6 +2518,68 @@ function Aggregate-Sujets {
   }
 
   return $bySujet
+}
+
+function Add-Pass2AProjectionClassification {
+  param(
+    [Parameter(Mandatory=$true)] [hashtable] $BySujet
+  )
+
+  $rowRefs = @{}
+  foreach ($subjectKey in @($BySujet.Keys)) {
+    foreach ($iv in @($BySujet[$subjectKey])) {
+      if (-not $iv -or -not $iv.PSObject.Properties['row_ref'] -or $null -eq $iv.row_ref) { continue }
+      $rowKey = [string]$iv.row_ref
+      if (-not $rowRefs.ContainsKey($rowKey)) {
+        $rowRefs[$rowKey] = [pscustomobject]@{
+          row_ref = $iv.row_ref
+          subjects = @{}
+          segment_ids = @{}
+          timecodes = @{}
+          texte = if ($iv.PSObject.Properties['texte']) { [string]$iv.texte } else { "" }
+        }
+      }
+      $rowRefs[$rowKey].subjects[[string]$subjectKey] = $true
+      if ($iv.PSObject.Properties['segment_id'] -and $iv.segment_id) { $rowRefs[$rowKey].segment_ids[[string]$iv.segment_id] = $true }
+      if ($iv.PSObject.Properties['timecode'] -and $iv.timecode) { $rowRefs[$rowKey].timecodes[[string]$iv.timecode] = $true }
+      if ([string]::IsNullOrWhiteSpace($rowRefs[$rowKey].texte) -and $iv.PSObject.Properties['texte']) {
+        $rowRefs[$rowKey].texte = [string]$iv.texte
+      }
+    }
+  }
+
+  foreach ($subjectKey in @($BySujet.Keys)) {
+    foreach ($iv in @($BySujet[$subjectKey])) {
+      if (-not $iv -or -not $iv.PSObject.Properties['row_ref'] -or $null -eq $iv.row_ref) { continue }
+      $rowKey = [string]$iv.row_ref
+      if (-not $rowRefs.ContainsKey($rowKey)) { continue }
+      $subjectCount = @($rowRefs[$rowKey].subjects.Keys).Count
+      $classification = if ($subjectCount -ge 4) { "contexte_global" } else { "specifique" }
+      $iv | Add-Member -Force NoteProperty projection_classification $classification
+      $iv | Add-Member -Force NoteProperty row_ref_subject_count $subjectCount
+    }
+  }
+
+  $multiRows = @()
+  foreach ($rowKey in @($rowRefs.Keys)) {
+    $info = $rowRefs[$rowKey]
+    $subjects = @($info.subjects.Keys | Sort-Object { [int]$_ })
+    $subjectCount = @($subjects).Count
+    if ($subjectCount -le 1) { continue }
+    $classification = if ($subjectCount -ge 4) { "contexte_global" } else { "specifique" }
+    $multiRows += [pscustomobject]@{
+      row_ref = $info.row_ref
+      subject_count = $subjectCount
+      sujets = @($subjects)
+      classification = $classification
+      texte = $info.texte
+      segment_ids = @($info.segment_ids.Keys | Sort-Object)
+      timecodes = @($info.timecodes.Keys | Sort-Object)
+      warning = if ($subjectCount -gt 3) { "row_ref rattache a plus de 3 sujets" } else { "" }
+    }
+  }
+
+  return @($multiRows | Sort-Object -Property @{Expression="subject_count";Descending=$true}, @{Expression="row_ref";Descending=$false})
 }
 
 Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F14 - avant définition fonction Inject-DebriefIntoBySujet" -ForegroundColor Yellow
@@ -4199,7 +4398,8 @@ if (-not $segmentsObjs -or $segmentsObjs.Count -eq 0) {
 }
 
 # Agrégation par numéro de sujet
-$bySujet = Aggregate-Sujets -Segments $segmentsObjs -MaxSec $maxSecInt
+$pass2AQaEvents = New-Object System.Collections.Generic.List[object]
+$bySujet = Aggregate-Sujets -Segments $segmentsObjs -MaxSec $maxSecInt -QaEvents $pass2AQaEvents
 
 if ($Sujets) {
   $bySujet = Add-MultiSubjectAssignments -BySujet $bySujet -Sujets $Sujets -LogFile $logFile
@@ -4222,7 +4422,13 @@ if ($Global:DebriefObj) {
   Microsoft.PowerShell.Utility\Write-Host "Débrief injecté dans bySujet (matière expert pour Pass3E)."
 }
 
-
+$pass2AMultiRowRefs = Add-Pass2AProjectionClassification -BySujet $bySujet
+$pass2AMultiRowWarnings = @($pass2AMultiRowRefs | Where-Object { $_.subject_count -gt 3 })
+foreach ($rowWarn in @($pass2AMultiRowWarnings)) {
+  $msg = "WARNING QA non critique: row_ref {0} rattache a {1} sujets ({2}); classification={3}" -f $rowWarn.row_ref, $rowWarn.subject_count, (@($rowWarn.sujets) -join ","), $rowWarn.classification
+  Write-Warning $msg
+  $msg | Add-Content $logFile
+}
 
 # Contrôle immédiatement après agrégation/injection
 if (-not ($bySujet -is [hashtable])) {
@@ -4263,6 +4469,35 @@ $globalPath = Join-Path $OutDir "global.json"
 
 $Global:logsDir = $logsDir
 Microsoft.PowerShell.Utility\Write-Host "Agrégation Passe 2A OK → $globalPath"
+
+$pass2ASubjectStats = @()
+foreach ($sj in @($Sujets)) {
+  if (-not $sj -or $null -eq $sj.Numero) { continue }
+  $numKey = [string]([int]$sj.Numero)
+  $count = if ($bySujet.ContainsKey($numKey)) { @($bySujet[$numKey]).Count } else { 0 }
+  $pass2ASubjectStats += [pscustomobject]@{
+    numero = [int]$sj.Numero
+    titre = [string]$sj.Titre
+    interventions_count = $count
+    matched = ($count -gt 0)
+  }
+}
+$pass2AQa = [pscustomobject]@{
+  generated_at = (Get-Date).ToString("o")
+  segment_count = @($segmentsObjs).Count
+  subjects_count = @($Sujets).Count
+  total_interventions = (($pass2ASubjectStats | Measure-Object -Property interventions_count -Sum).Sum)
+  subjects_without_match = @($pass2ASubjectStats | Where-Object { -not $_.matched })
+  multi_subject_row_refs = @($pass2AMultiRowRefs)
+  non_critical_warnings = @($pass2AMultiRowWarnings | ForEach-Object {
+    "row_ref {0} rattache a {1} sujets ({2})" -f $_.row_ref, $_.subject_count, (@($_.sujets) -join ",")
+  })
+  subject_stats = @($pass2ASubjectStats)
+  segment_source_diagnostics = @($pass2AQaEvents.ToArray())
+}
+$pass2AQaPath = Join-Path $OutDir "pass2a_subject_matching_qa.json"
+[System.IO.File]::WriteAllText($pass2AQaPath, ($pass2AQa | ConvertTo-Json -Depth 50), [System.Text.Encoding]::UTF8)
+Microsoft.PowerShell.Utility\Write-Host "QA Passe 2A sujets -> $pass2AQaPath"
 
 
 
@@ -5346,6 +5581,7 @@ try {
     "--global-json", "`"$globalJsonPath`"",
     "--sujets-ref",  "`"$sujetsRefPath`"",
     "--out",         "`"$splitOutDir`"",
+    "--qa-out",      "`"$(Join-Path $OutDir "split_by_sujet_qa.json")`"",
     "--target-kb",   "80",
     "--dedup"
   ) -join " "
@@ -5671,6 +5907,7 @@ Objectif :
 Règles rédactionnelles :
 - si le bloc mentionne qu’un point est corrigé, réglé, repris ou fait, le noter comme "déclaré repris", sans conclure à la conformité technique ;
 - distinguer ce qui est dit dans les échanges de ce qui est effectivement constaté ;
+- si une intervention porte "projection_classification":"contexte_global", l'utiliser comme contexte général commun aux sujets, pas comme preuve spécifique du sujet sauf corroboration par une intervention "specifique" ;
 - ne jamais inventer de constat matériel.
 
 $schemaHint

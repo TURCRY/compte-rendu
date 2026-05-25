@@ -104,6 +104,7 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--target-kb", type=int, default=80)
     ap.add_argument("--dedup", action="store_true")
+    ap.add_argument("--qa-out", default="")
     args = ap.parse_args()
 
     global_path = Path(args.global_json)
@@ -137,22 +138,39 @@ def main() -> int:
     target_bytes = max(10_000, int(args.target_kb) * 1024)
 
     index_items: List[Dict[str, Any]] = []
+    qa_subjects: List[Dict[str, Any]] = []
 
     for num_str in ordered_nums:
         meta = subjects[num_str]
-        raw_list = as_list(sujets_map.get(num_str))
+        has_raw_key = num_str in sujets_map
+        raw_value = sujets_map.get(num_str)
+        raw_list = as_list(raw_value)
 
         clean = []
+        rejected_non_object = 0
+        rejected_empty_text = 0
+        rejected_invalid_timecode = 0
         for iv in raw_list:
             if not isinstance(iv, dict):
+                rejected_non_object += 1
                 continue
+            texte = iv.get("texte")
+            if texte is None or not str(texte).strip():
+                rejected_empty_text += 1
+            if iv.get("timecode") and not norm_timecode(iv.get("timecode")):
+                rejected_invalid_timecode += 1
             item = {
                 "segment_id": iv.get("segment_id"),
+                "row_ref": iv.get("row_ref"),
                 "timecode": norm_timecode(iv.get("timecode")) or iv.get("timecode"),
                 "auteur": iv.get("auteur"),
                 "role": iv.get("role"),
                 "texte": iv.get("texte"),
             }
+            if "projection_classification" in iv:
+                item["projection_classification"] = iv.get("projection_classification")
+            if "row_ref_subject_count" in iv:
+                item["row_ref_subject_count"] = iv.get("row_ref_subject_count")
             if "source_sujet_principal" in iv:
                 item["source_sujet_principal"] = iv.get("source_sujet_principal")
             if "multi_subject_match" in iv:
@@ -164,7 +182,41 @@ def main() -> int:
             clean.append(item)
 
         if args.dedup:
+            before_dedup = len(clean)
             clean = dedup(clean)
+            dedup_removed = before_dedup - len(clean)
+        else:
+            dedup_removed = 0
+
+        reject_reasons = []
+        if not has_raw_key:
+            reject_reasons.append("subject_key_absent_from_global")
+        if has_raw_key and not raw_list:
+            reject_reasons.append("subject_key_present_but_empty")
+        if rejected_non_object:
+            reject_reasons.append(f"non_object_interventions={rejected_non_object}")
+        if rejected_empty_text:
+            reject_reasons.append(f"empty_text_interventions={rejected_empty_text}")
+        if rejected_invalid_timecode:
+            reject_reasons.append(f"invalid_timecode_interventions={rejected_invalid_timecode}")
+        if dedup_removed:
+            reject_reasons.append(f"dedup_removed={dedup_removed}")
+        if not clean:
+            reject_reasons.append("no_clean_interventions")
+
+        qa_subjects.append({
+            "numero": meta["numero"],
+            "titre": meta["titre"],
+            "global_key_present": has_raw_key,
+            "raw_type": type(raw_value).__name__ if has_raw_key else None,
+            "raw_count": len(raw_list) if has_raw_key else 0,
+            "clean_count": len(clean),
+            "dedup_removed": dedup_removed,
+            "rejected_non_object": rejected_non_object,
+            "rejected_empty_text": rejected_empty_text,
+            "rejected_invalid_timecode": rejected_invalid_timecode,
+            "reasons": reject_reasons,
+        })
 
         base_obj = {
             "numero": meta["numero"],
@@ -232,6 +284,26 @@ def main() -> int:
         "dedup": bool(args.dedup),
         "skipped_non_positive_subjects": skipped_non_positive,
     })
+
+    ref_keys = set(subjects.keys())
+    global_keys = {str(k) for k in sujets_map.keys()}
+    qa = {
+        "global_json": str(global_path),
+        "sujets_ref": str(sujets_ref_path),
+        "out_dir": str(out_dir),
+        "count_sujets_ref": len(subjects),
+        "global_subject_keys": sorted(global_keys, key=lambda x: int(x) if x.isdigit() else 10**9),
+        "unmatched_global_subject_keys": sorted(global_keys - ref_keys),
+        "subjects_without_match": [s for s in qa_subjects if s["clean_count"] == 0],
+        "subject_stats": qa_subjects,
+        "totals": {
+            "raw_interventions": sum(s["raw_count"] for s in qa_subjects),
+            "clean_interventions": sum(s["clean_count"] for s in qa_subjects),
+            "subjects_without_match": sum(1 for s in qa_subjects if s["clean_count"] == 0),
+        },
+    }
+    qa_path = Path(args.qa_out) if args.qa_out else out_dir / "split_qa.json"
+    dump_json(qa_path, qa)
 
     return 0
 

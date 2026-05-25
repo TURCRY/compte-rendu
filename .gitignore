@@ -34,3 +34,35 @@ Thumbs.db
 Scripts/manifest_*.json
 Scripts/merge_test_*/
 Scripts/*.docx
+
+# résultats benchmark / validation
+Scripts/a60_report_model_compare/
+
+# dossiers temporaires Windows 8.3 / artefacts SMB
+Scripts/_*/
+Scripts/[0-9]*/
+
+# dossiers de test locaux
+test/
+tests_output/
+tmp/
+temp/
+
+# sorties pipeline hors data/
+**/pass2B_batches/
+**/pass2E_sujets_compact/
+**/pass3E_sujets/
+**/segments/
+**/sujets/
+
+# fichiers QA générés
+**/*_qa.json
+
+# exports benchmark
+**/pass2b_timing.json
+**/pass2b_timing.csv
+
+# prompts/debug
+**/*_input.txt
+**/*_input_effective.txt
+**/*.source.txt
