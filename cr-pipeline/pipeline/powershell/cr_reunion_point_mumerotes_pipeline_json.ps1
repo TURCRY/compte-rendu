@@ -5178,9 +5178,10 @@ function Convert-DebriefToMeetingGlobal {
 
   # 5) Problems (depuis perspectives du debrief)
   if ($gd.PSObject.Properties['perspectives'] -and $gd.perspectives) {
+    $tmp = New-Object System.Collections.Generic.List[object]
     foreach ($p in @($gd.perspectives)) {
-    $pr = if ($p.PSObject.Properties['probleme']) { ([string]$p.probleme).Trim() } else { "" }
-    $so = if ($p.PSObject.Properties['solution']) { ([string]$p.solution).Trim() } else { $null }
+      $pr = if ($p.PSObject.Properties['probleme']) { ([string]$p.probleme).Trim() } else { "" }
+      $so = if ($p.PSObject.Properties['solution']) { ([string]$p.solution).Trim() } else { $null }
       if ($pr) {
         $tmp.Add([pscustomobject]@{ probleme = $pr; solution = $so }) | Out-Null
       }
