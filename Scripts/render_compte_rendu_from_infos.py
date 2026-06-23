@@ -158,7 +158,12 @@ def depseudonymize_final_payload(payload_text: str, *, pseudo_api_base: str, pse
     )
     response.raise_for_status()
     data = response.json() or {}
-    clear_text = data.get("text_depseudonymized") or data.get("text") or payload_text
+    clear_text = (
+        data.get("text_depseudonymized")
+        or data.get("text_clear")
+        or data.get("text")
+        or payload_text
+    )
     clear_text = (clear_text or "").lstrip("\ufeff").strip()
     return json.loads(clear_text)
 
