@@ -52,6 +52,18 @@ Le premier argument est obligatoire :
 
 - chemin hôte/NAS vers `infos_projet.json`
 
+### Miroir PC fixe
+
+Par defaut, tout DOCX genere sur le NAS est recopie vers le PC fixe apres generation reussie.
+
+Comportement :
+
+- `--no-mirror-pc` desactive explicitement cette copie NAS -> PC fixe pour le lancement courant.
+- `--mirror-pc` reste accepte pour compatibilite, mais il est maintenant inutile en usage normal puisque le miroir est deja actif par defaut.
+- `--mirror-pc-dry-run` active le miroir en simulation rsync, sans copie effective.
+
+La copie miroir utilise `rsync --update`, ne supprime rien, et ne copie que les livrables DOCX/PDF utiles.
+
 ### Lancement standard
 
 ```bash

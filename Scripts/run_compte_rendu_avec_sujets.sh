@@ -18,6 +18,14 @@ EXPLICIT_OUT_DIR=""
 REPRISE_PASS2B=0
 REUSE_EXISTING_RUN=0
 DOCX_ONLY=0
+ALLOW_CRITICAL_QA=0
+MIRROR_PC="${CR_MIRROR_PC:-1}"
+MIRROR_PC_DRY_RUN="${CR_MIRROR_PC_DRY_RUN:-0}"
+CR_MIRROR_PC_HOST="${CR_MIRROR_PC_HOST:-10.0.1.10}"
+CR_MIRROR_PC_PORT="${CR_MIRROR_PC_PORT:-2222}"
+CR_MIRROR_PC_USER="${CR_MIRROR_PC_USER:-sshsync}"
+CR_MIRROR_PC_KEY="${CR_MIRROR_PC_KEY:-/volume1/home/nicolas/.ssh/id_ed25519}"
+CR_MIRROR_PC_RSYNC_PATH="${CR_MIRROR_PC_RSYNC_PATH:-C:\\msys64\\usr\\bin\\rsync.exe}"
 RENDER_URL="${CR_RENDER_URL:-http://192.168.1.20:8081/render?format=docx}"
 
 
@@ -28,6 +36,10 @@ while [[ $# -gt 0 ]]; do
     --strict-sync) STRICT_SYNC=1; shift;;
     --no-force) FORCE=0; shift;;   # option explicite, utile en n8n
     --docx-only) DOCX_ONLY=1; shift;;
+    --allow-critical-qa) ALLOW_CRITICAL_QA=1; shift;;
+    --mirror-pc) MIRROR_PC=1; shift;;
+    --no-mirror-pc) MIRROR_PC=0; shift;;
+    --mirror-pc-dry-run) MIRROR_PC=1; MIRROR_PC_DRY_RUN=1; shift;;
     --only-pass2b-batches)
       REPRISE_PASS2B=1
       ONLY_PASS2B_BATCHES="${2:-}"
@@ -62,12 +74,12 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     -h|--help)
-      echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run] [--force|--no-force] [--docx-only] [--only-pass2b-batches \"9\"|\"7,9\"] [--only-subjects \"1,2,3\"] [--existing-run job_...] [--out-dir /chemin/run]"
+      echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run] [--force|--no-force] [--docx-only] [--allow-critical-qa] [--no-mirror-pc|--mirror-pc] [--mirror-pc-dry-run] [--only-pass2b-batches \"9\"|\"7,9\"] [--only-subjects \"1,2,3\"] [--existing-run job_...] [--out-dir /chemin/run]"
       exit 0
       ;;
     *)
       echo "Option inconnue: $1"
-      echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run] [--force|--no-force] [--docx-only] [--only-pass2b-batches \"9\"|\"7,9\"] [--only-subjects \"1,2,3\"] [--existing-run job_...] [--out-dir /chemin/run]"
+      echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run] [--force|--no-force] [--docx-only] [--allow-critical-qa] [--no-mirror-pc|--mirror-pc] [--mirror-pc-dry-run] [--only-pass2b-batches \"9\"|\"7,9\"] [--only-subjects \"1,2,3\"] [--existing-run job_...] [--out-dir /chemin/run]"
       echo "STRICT_SYNC : $([[ $STRICT_SYNC -eq 1 ]] && echo 'ON' || echo 'OFF')"
       exit 2
       ;;
@@ -75,7 +87,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$INFOS" ]]; then
-  echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run] [--force|--no-force] [--docx-only] [--only-pass2b-batches \"9\"|\"7,9\"] [--only-subjects \"1,2,3\"] [--existing-run job_...] [--out-dir /chemin/run]"
+  echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run] [--force|--no-force] [--docx-only] [--allow-critical-qa] [--no-mirror-pc|--mirror-pc] [--mirror-pc-dry-run] [--only-pass2b-batches \"9\"|\"7,9\"] [--only-subjects \"1,2,3\"] [--existing-run job_...] [--out-dir /chemin/run]"
   exit 2
 fi
 if [[ ! -f "$INFOS" ]]; then
@@ -171,6 +183,68 @@ to_unc_affaires_path() {
   echo "$p"
 }
 
+
+mirror_compte_rendu_livrables_to_pc() {
+  local host_source_dir="$1"
+  local affaire_id="$2"
+  local captation_id="$3"
+  local label="${4:-compte-rendu}"
+
+  if [[ "${MIRROR_PC:-0}" != "1" ]]; then
+    echo "mirror_pc: disabled ($label)"
+    return 0
+  fi
+
+  if [[ -z "$host_source_dir" || ! -d "$host_source_dir" ]]; then
+    echo "mirror_pc: skipped source_dir_missing label=$label source=$host_source_dir"
+    return 0
+  fi
+
+  if [[ "$affaire_id" == *"/"* || "$affaire_id" == *"\\"* || "$captation_id" == *"/"* || "$captation_id" == *"\\"* ]]; then
+    echo "mirror_pc: failed invalid_id label=$label affaire=$affaire_id captation=$captation_id"
+    return 0
+  fi
+
+  local dest="/c/Affaires/${affaire_id}/BE_Traitement_captations/${captation_id}/compte_rendu_LLM/"
+  local ssh_opts="-p ${CR_MIRROR_PC_PORT} -i ${CR_MIRROR_PC_KEY} -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=accept-new"
+  local dry_opts=()
+  if [[ "${MIRROR_PC_DRY_RUN:-0}" == "1" ]]; then
+    dry_opts+=(--dry-run)
+  fi
+
+  echo "mirror_pc: start label=$label source=$host_source_dir dest=${CR_MIRROR_PC_USER}@${CR_MIRROR_PC_HOST}:${dest} dry_run=${MIRROR_PC_DRY_RUN:-0}"
+
+  set +e
+  local output
+  output="$(rsync --old-args -avz --itemize-changes --partial --update "${dry_opts[@]}" \
+    --include='*/' \
+    --include='*.docx' --include='*.DOCX' \
+    --include='*.pdf' --include='*.PDF' \
+    --exclude='*' \
+    -e "ssh ${ssh_opts}" \
+    --rsync-path="${CR_MIRROR_PC_RSYNC_PATH}" \
+    "${host_source_dir%/}/" \
+    "${CR_MIRROR_PC_USER}@${CR_MIRROR_PC_HOST}:${dest}" 2>&1)"
+  local mirror_rc=$?
+  set -e
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      ">f"*) echo "mirror_pc: copied $line" ;;
+      ".f"*) echo "mirror_pc: skipped/no_change $line" ;;
+      *) echo "mirror_pc: rsync $line" ;;
+    esac
+  done <<< "$output"
+
+  if [[ $mirror_rc -ne 0 ]]; then
+    echo "mirror_pc: failed rc=$mirror_rc label=$label"
+  else
+    echo "mirror_pc: ok label=$label"
+  fi
+
+  return 0
+}
 uses_remote_llm() {
   local provider="${1,,}"
   shift || true
@@ -180,6 +254,232 @@ uses_remote_llm() {
     [[ "${model,,}" == *remote* ]] && return 0
   done
   return 1
+}
+
+print_sanitized_command() {
+  local redact_next=0
+  local arg=""
+  for arg in "$@"; do
+    if [[ $redact_next -eq 1 ]]; then
+      printf '%q ' "***"
+      redact_next=0
+      continue
+    fi
+    printf '%q ' "$arg"
+    case "$arg" in
+      -ApiKey|-PseudoApiKey)
+        redact_next=1
+        ;;
+    esac
+  done
+  echo
+}
+
+assert_pipeline_qa_ok_for_docx() {
+  local host_out_dir="$1"
+  local qa_file="${host_out_dir}/pipeline_qa_status.json"
+
+  if [[ ! -f "$qa_file" ]]; then
+    echo "QA DOCX: aucun pipeline_qa_status.json trouvé, rendu autorisé."
+    return 0
+  fi
+
+  python3 - "$qa_file" "$ALLOW_CRITICAL_QA" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+qa_path = Path(sys.argv[1])
+allow = sys.argv[2] == "1"
+try:
+    data = json.loads(qa_path.read_text(encoding="utf-8-sig"))
+except Exception as exc:
+    raise SystemExit(f"ERREUR: pipeline_qa_status.json illisible: {qa_path} ({exc})")
+
+if data.get("ok") is False:
+    warnings = data.get("critical_warnings") or []
+    msg = " ; ".join(str(w) for w in warnings) or "alerte critique non détaillée"
+    if allow:
+        print(f"WARNING: pipeline_qa_status.ok=false, contournement explicite --allow-critical-qa: {msg}")
+        raise SystemExit(0)
+    print(f"ERREUR: rendu DOCX bloqué car pipeline_qa_status.ok=false: {msg}")
+    print("Ajoutez --allow-critical-qa pour contourner explicitement ce blocage.")
+    raise SystemExit(31)
+
+print("QA DOCX: pipeline_qa_status ok.")
+PY
+}
+
+scan_placeholder_file() {
+  local payload_file="$1"
+  local label="$2"
+
+  python3 - "$payload_file" "$label" "${CR_PLACEHOLDER_ALLOWLIST:-}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+label = sys.argv[2]
+allowlist = {item.strip().upper().replace(" ", "") for item in sys.argv[3].split(",") if item.strip()}
+pattern = re.compile(r"(?i)\b(?:P\s*\d+|ENT\s*\d+)\b")
+
+text = path.read_text(encoding="utf-8-sig", errors="replace")
+hits = []
+for match in pattern.finditer(text):
+    token = match.group(0).upper().replace(" ", "")
+    if token in allowlist:
+        continue
+    start = max(0, match.start() - 70)
+    end = min(len(text), match.end() + 70)
+    context = text[start:end].replace("\n", " ")
+    hits.append((match.group(0), context))
+
+if hits:
+    print(f"ERREUR: placeholders résiduels dans {label}: {path}")
+    for token, context in hits[:40]:
+        print(f"- {token}: {context}")
+    if len(hits) > 40:
+        print(f"... {len(hits) - 40} occurrence(s) supplémentaire(s)")
+    raise SystemExit(32)
+
+print(f"QA placeholders OK: {label}")
+PY
+}
+
+scan_docx_placeholders() {
+  local docx_file="$1"
+
+  python3 - "$docx_file" "${CR_PLACEHOLDER_ALLOWLIST:-}" <<'PY'
+import re
+import sys
+import zipfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+docx_path = Path(sys.argv[1])
+allowlist = {item.strip().upper().replace(" ", "") for item in sys.argv[2].split(",") if item.strip()}
+pattern = re.compile(r"(?i)\b(?:P\s*\d+|ENT\s*\d+)\b")
+ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+hits = []
+
+with zipfile.ZipFile(docx_path) as archive:
+    names = [
+        name for name in archive.namelist()
+        if name.startswith("word/")
+        and name.endswith(".xml")
+        and ("document.xml" in name or "header" in name or "footer" in name)
+    ]
+    for name in names:
+        try:
+            root = ET.fromstring(archive.read(name))
+        except Exception:
+            continue
+        for idx, paragraph in enumerate(root.findall(".//w:p", ns), 1):
+            text = "".join(node.text or "" for node in paragraph.findall(".//w:t", ns))
+            if not text:
+                continue
+            for match in pattern.finditer(text):
+                token = match.group(0).upper().replace(" ", "")
+                if token in allowlist:
+                    continue
+                start = max(0, match.start() - 70)
+                end = min(len(text), match.end() + 70)
+                hits.append((name, idx, match.group(0), text[start:end]))
+
+if hits:
+    print(f"ERREUR: placeholders résiduels dans le DOCX: {docx_path}")
+    for part, idx, token, context in hits[:40]:
+        print(f"- {part} paragraphe {idx}, {token}: {context}")
+    if len(hits) > 40:
+        print(f"... {len(hits) - 40} occurrence(s) supplémentaire(s)")
+    raise SystemExit(33)
+
+print(f"QA placeholders OK: DOCX {docx_path}")
+PY
+}
+
+prepare_docx_payload() {
+  local host_out_dir="$1"
+  local source_json="$2"
+  local payload_json="$source_json"
+  local pseudo_root=""
+  local pseudo_context_file=""
+
+  assert_pipeline_qa_ok_for_docx "$host_out_dir" || return $?
+
+  if [[ $PSEUDONYMIZE_REMOTE -eq 1 ]]; then
+    if [[ "$host_out_dir" == */out/* ]]; then
+      pseudo_root="${host_out_dir%%/out/*}"
+      pseudo_context_file="${pseudo_root}/pseudo_context.json"
+      if [[ -f "$pseudo_context_file" ]]; then
+        while IFS=$'\t' read -r ctx_job_id ctx_api_base; do
+          [[ -n "$ctx_job_id" ]] && PSEUDO_JOB_ID="$ctx_job_id"
+          [[ -n "$ctx_api_base" ]] && PSEUDO_API_BASE="$ctx_api_base"
+        done < <(python3 - "$pseudo_context_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+except Exception:
+    data = {}
+print(f"{data.get('pseudo_job_id', '')}\t{data.get('pseudo_api_base', '')}")
+PY
+)
+        echo "Pseudo context DOCX utilisé : $pseudo_context_file"
+      fi
+    fi
+
+    if [[ "$source_json" == */global_final.json ]]; then
+      :
+    else
+      echo "ERREUR: en mode pseudonymisé, la source attendue est global_final.json: $source_json"
+      return 34
+    fi
+    if [[ -z "$PSEUDO_API_BASE" || -z "$PSEUDO_API_KEY" || -z "$PSEUDO_JOB_ID" ]]; then
+      echo "ERREUR: déseudonymisation DOCX impossible: PSEUDO_API_BASE, PSEUDO_API_KEY ou PSEUDO_JOB_ID absent."
+      return 35
+    fi
+
+    payload_json="${host_out_dir}/global_final_depseudonymized_for_docx.json"
+    echo "Déseudonymisation DOCX uniquement -> $payload_json"
+    python3 - "$SCRIPT_DIR" "$source_json" "$payload_json" "$PSEUDO_API_BASE" "$PSEUDO_API_KEY" "$PSEUDO_JOB_ID" <<'PY' || return $?
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1])
+source_path = Path(sys.argv[2])
+target_path = Path(sys.argv[3])
+pseudo_api_base = sys.argv[4]
+pseudo_api_key = sys.argv[5]
+job_id = sys.argv[6]
+
+module_path = script_dir / "render_compte_rendu_from_infos.py"
+spec = importlib.util.spec_from_file_location("render_compte_rendu_from_infos", module_path)
+module = importlib.util.module_from_spec(spec)
+assert spec and spec.loader
+spec.loader.exec_module(module)
+
+payload_text = source_path.read_text(encoding="utf-8")
+payload_json = module.depseudonymize_final_payload(
+    payload_text,
+    pseudo_api_base=pseudo_api_base,
+    pseudo_api_key=pseudo_api_key,
+    job_id=job_id,
+)
+target_path.write_text(json.dumps(payload_json, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+    scan_placeholder_file "$payload_json" "payload DOCX déseudonymisé" || return $?
+  else
+    scan_placeholder_file "$payload_json" "payload DOCX" || return $?
+  fi
+
+  PREPARED_DOCX_PAYLOAD="$payload_json"
 }
 
 
@@ -195,6 +495,11 @@ PROFILE="$(json_get profil_execution)"
 # ----------------------------
 CSV_PATH_RAW="$(json_get "${PROFILE}.fichier_transcription")"
 CSV_PATH="$(to_container_path "$CSV_PATH_RAW")"
+CSV_DEBRIEF_PATH_RAW="$(json_get "${PROFILE}.fichier_debrief")"
+if [[ -z "$CSV_DEBRIEF_PATH_RAW" ]]; then
+  CSV_DEBRIEF_PATH_RAW="$(json_get "fichier_debrief")"
+fi
+CSV_DEBRIEF_PATH="$(to_container_path "$CSV_DEBRIEF_PATH_RAW")"
 if [[ -z "$CSV_PATH" ]]; then
   echo "ERREUR: chemin manquant dans infos_projet.json (${PROFILE}.fichier_transcription)."
   exit 2
@@ -417,6 +722,9 @@ echo "=== Validation terminée ==="
 # ----------------------------
 echo "=== Vérifications (obligatoires) ==="
 echo "CSV     : $CSV_PATH"
+if [[ -n "$CSV_DEBRIEF_PATH" ]]; then
+  echo "DEBRIEF : $CSV_DEBRIEF_PATH"
+fi
 echo "CTX     : $CTX_PATH"
 echo "SUJETS  : $SUJETS_PATH"
 echo "PART    : $PART_PATH"
@@ -428,6 +736,9 @@ echo "MODE    : $([[ $DRY_RUN -eq 1 ]] && echo 'DRY-RUN' || echo 'RUN')"
 echo "FORCE   : $([[ $FORCE -eq 1 ]] && echo 'ON' || echo 'OFF')"
 
 docker exec cr-pipeline sh -lc "test -f \"$CSV_PATH\"    || (echo 'KO: CSV introuvable' && exit 2)"
+if [[ -n "$CSV_DEBRIEF_PATH" ]]; then
+  docker exec cr-pipeline sh -lc "test -f \"$CSV_DEBRIEF_PATH\" || (echo 'KO: CSV debrief introuvable' && exit 2)"
+fi
 docker exec cr-pipeline sh -lc "test -f \"$SUJETS_PATH\" || (echo 'KO: Sujets.xlsx introuvable (obligatoire)' && exit 2)"
 docker exec cr-pipeline sh -lc "test -f \"$PART_PATH\"   || (echo 'KO: Participants.xlsx introuvable (obligatoire)' && exit 2)"
 
@@ -507,6 +818,12 @@ ts="$(date '+%Y%m%d_%H%M%S')"
 log_file="$host_log_dir/run_${ts}.log"
 PSEUDO_JOB_ID="cr_${AFFAIRE_ID}_${CAPTATION_ID}_${RUN_JOB_ID}"
 PSEUDO_PART_PATH="$(to_unc_affaires_path "$PART_PATH")"
+PSEUDO_API_BASE="${PSEUDO_API_BASE:-http://192.168.0.155:5000}"
+PSEUDO_API_KEY="${LOCAL_LLM_API_KEY:-}"
+PSEUDONYMIZE_REMOTE=0
+if uses_remote_llm "$PROVIDER" "$MODEL_P1" "$MODEL_P2" "$MODEL_P3"; then
+  PSEUDONYMIZE_REMOTE=1
+fi
 
 # Tout ce qui suit est loggué
 exec > >(tee -a "$log_file") 2>&1
@@ -545,25 +862,22 @@ if [[ $DOCX_ONLY -eq 1 && ${#PASS2B_BATCHES_ARR[@]} -eq 0 ]]; then
     exit 6
   fi
 
-  echo "=== Commande DOCX ==="
-  echo "curl -fsS -X POST \"$RENDER_URL\" -H \"Content-Type: application/json\" --data-binary \"@${HOST_OUT_JSON}\" -o \"$HOST_DOCX_OUT\""
-
   if [[ $DRY_RUN -eq 1 ]]; then
     echo "DRY-RUN: aucune génération DOCX."
     echo "=== LOG END: $(date -Is) ==="
     exit 0
   fi
 
-  curl -fsS -X POST "$RENDER_URL" -H "Content-Type: application/json" --data-binary "@${HOST_OUT_JSON}" -o "$HOST_DOCX_OUT"
+  PREPARED_DOCX_PAYLOAD=""
+  prepare_docx_payload "$HOST_OUT_DIR" "$HOST_OUT_JSON"
+
+  echo "=== Commande DOCX ==="
+  echo "curl -fsS -X POST \"$RENDER_URL\" -H \"Content-Type: application/json\" --data-binary \"@${PREPARED_DOCX_PAYLOAD}\" -o \"$HOST_DOCX_OUT\""
+  curl -fsS -X POST "$RENDER_URL" -H "Content-Type: application/json" --data-binary "@${PREPARED_DOCX_PAYLOAD}" -o "$HOST_DOCX_OUT"
+  scan_docx_placeholders "$HOST_DOCX_OUT"
+  mirror_compte_rendu_livrables_to_pc "$HOST_OUT_DIR" "$AFFAIRE_ID" "$CAPTATION_ID" "docx-only"
   echo "=== FIN (exit=0): $(date -Is) ==="
   exit 0
-fi
-
-PSEUDO_API_BASE="${PSEUDO_API_BASE:-http://192.168.0.155:5000}"
-PSEUDO_API_KEY="${LOCAL_LLM_API_KEY:-}"
-PSEUDONYMIZE_REMOTE=0
-if uses_remote_llm "$PROVIDER" "$MODEL_P1" "$MODEL_P2" "$MODEL_P3"; then
-  PSEUDONYMIZE_REMOTE=1
 fi
 
 HOST_OUT_ROOT="/volume1/Affaires${OUT_ROOT#/data/Affaires}"
@@ -611,6 +925,7 @@ cat > "$METADATA_FILE" <<EOF
   "id_affaire": "$AFFAIRE_ID",
   "id_captation": "$CAPTATION_ID",
   "csv": { "path": "$CSV_PATH", "modified": "$CSV_DATE" },
+  "debrief": { "path": "$CSV_DEBRIEF_PATH" },
   "contexte": { "path": "$CTX_PATH", "modified": "$CTX_DATE" },
   "sujets": { "path": "$SUJETS_PATH", "modified": "$SUJ_DATE" },
   "participants": { "path": "$PART_PATH", "modified": "$PAR_DATE" },
@@ -679,6 +994,10 @@ cmd=(docker exec -it cr-pipeline pwsh /pipeline/powershell/cr_reunion_point_mume
   -Preset "$PRESET"
 )
 
+if [[ -n "$CSV_DEBRIEF_PATH" ]]; then
+  cmd+=(-CsvDebriefPath "$CSV_DEBRIEF_PATH")
+fi
+
 if [[ $PSEUDONYMIZE_REMOTE -eq 1 ]]; then
   if [[ -z "$PSEUDO_API_BASE" ]]; then
     echo "ERREUR: pseudonymisation distante active mais PSEUDO_API_BASE est vide."
@@ -716,8 +1035,7 @@ if [[ -n "$ONLY_SUBJECTS" ]]; then
 fi
 
 echo "=== Commande ==="
-printf '%q ' "${cmd[@]}"
-echo
+print_sanitized_command "${cmd[@]}"
 echo "=== Log file ==="
 echo "$log_file"
 
@@ -757,8 +1075,21 @@ if [[ ! -s "$HOST_OUT_JSON" ]]; then
   rc=6
 else
   echo "Generation DOCX -> $HOST_DOCX_OUT"
-  echo "curl -fsS -X POST \"$RENDER_URL\" -H \"Content-Type: application/json\" --data-binary \"@${HOST_OUT_JSON}\" -o \"$HOST_DOCX_OUT\""
-  curl -fsS -X POST "$RENDER_URL" -H "Content-Type: application/json" --data-binary "@${HOST_OUT_JSON}" -o "$HOST_DOCX_OUT" || rc=$?
+  PREPARED_DOCX_PAYLOAD=""
+  if prepare_docx_payload "$HOST_OUT_DIR" "$HOST_OUT_JSON"; then
+    echo "curl -fsS -X POST \"$RENDER_URL\" -H \"Content-Type: application/json\" --data-binary \"@${PREPARED_DOCX_PAYLOAD}\" -o \"$HOST_DOCX_OUT\""
+    if curl -fsS -X POST "$RENDER_URL" -H "Content-Type: application/json" --data-binary "@${PREPARED_DOCX_PAYLOAD}" -o "$HOST_DOCX_OUT"; then
+      if scan_docx_placeholders "$HOST_DOCX_OUT"; then
+        mirror_compte_rendu_livrables_to_pc "$HOST_OUT_DIR" "$AFFAIRE_ID" "$CAPTATION_ID" "pipeline-final"
+      else
+        rc=$?
+      fi
+    else
+      rc=$?
+    fi
+  else
+    rc=$?
+  fi
 
   required_jsons=(global.json global_meeting.json global_by_sujet.json global_final.json)
   mkdir -p "$HOST_OUT_ROOT"
