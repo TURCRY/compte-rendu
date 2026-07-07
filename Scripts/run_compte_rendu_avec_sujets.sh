@@ -818,7 +818,7 @@ ts="$(date '+%Y%m%d_%H%M%S')"
 log_file="$host_log_dir/run_${ts}.log"
 PSEUDO_JOB_ID="cr_${AFFAIRE_ID}_${CAPTATION_ID}_${RUN_JOB_ID}"
 PSEUDO_PART_PATH="$(to_unc_affaires_path "$PART_PATH")"
-PSEUDO_API_BASE="${PSEUDO_API_BASE:-http://192.168.0.155:5000}"
+PSEUDO_API_BASE="${PSEUDO_API_BASE:-http://192.168.0.120:5050}"
 PSEUDO_API_KEY="${LOCAL_LLM_API_KEY:-}"
 PSEUDONYMIZE_REMOTE=0
 if uses_remote_llm "$PROVIDER" "$MODEL_P1" "$MODEL_P2" "$MODEL_P3"; then
