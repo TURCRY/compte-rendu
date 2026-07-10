@@ -148,6 +148,19 @@ print("" if cur is None else cur)
 PY
 }
 
+json_get_first() {
+  local value=""
+  local key=""
+  for key in "$@"; do
+    value="$(json_get "$key")"
+    if [[ -n "$value" ]]; then
+      echo "$value"
+      return
+    fi
+  done
+  echo ""
+}
+
 # ----------------------------
 # Windows -> conteneur
 # C:\Affaires\...  => /data/Affaires/...
@@ -560,12 +573,19 @@ fi
 # ----------------------------
 # Valeurs LLM (défauts stack)
 # ----------------------------
-PROVIDER="$(json_get provider)";        [[ -z "$PROVIDER" ]] && PROVIDER="openai"
-API_BASE="$(json_get api_base)";        [[ -z "$API_BASE" ]] && API_BASE="http://openai-adapter:5055"
-MODEL_P1="$(json_get model_pass1)";     [[ -z "$MODEL_P1" ]] && MODEL_P1="annoter_segments_remote"
-MODEL_P2="$(json_get model_pass2)";     [[ -z "$MODEL_P2" ]] && MODEL_P2="annoter_segments_remote"
-MODEL_P3="$(json_get model_pass3)";     [[ -z "$MODEL_P3" ]] && MODEL_P3="annoter_segments_remote_alt"
-PRESET="$(json_get preset)";            [[ -z "$PRESET" ]] && PRESET="equilibre"
+PROVIDER="$(json_get_first compte_rendu.provider provider)";                [[ -z "$PROVIDER" ]] && PROVIDER="openai"
+API_BASE="$(json_get_first compte_rendu.api_base api_base)";                [[ -z "$API_BASE" ]] && API_BASE="http://openai-adapter:5055"
+MODEL_P1="$(json_get_first compte_rendu.model_pass1 model_pass1)";          [[ -z "$MODEL_P1" ]] && MODEL_P1="annoter_segments_remote"
+MODEL_P2="$(json_get_first compte_rendu.model_pass2 model_pass2)";          [[ -z "$MODEL_P2" ]] && MODEL_P2="annoter_segments_remote"
+MODEL_REPORT="$(json_get_first compte_rendu.model_report model_report)";    [[ -z "$MODEL_REPORT" ]] && MODEL_REPORT="report_remote"
+MODEL_P2E="$(json_get_first compte_rendu.model_pass2e model_pass2e)";       [[ -z "$MODEL_P2E" ]] && MODEL_P2E="annoter_segments_remote_alt"
+MODEL_P3="$(json_get_first compte_rendu.model_pass3 model_pass3)";          [[ -z "$MODEL_P3" ]] && MODEL_P3="annoter_segments_remote_alt"
+MODEL_P3E="$(json_get_first compte_rendu.model_pass3e model_pass3e)";       [[ -z "$MODEL_P3E" ]] && MODEL_P3E="pass3e_remote"
+MODEL_P3A="$(json_get_first compte_rendu.model_pass3a model_pass3a)";       [[ -z "$MODEL_P3A" ]] && MODEL_P3A="pass3a_remote"
+MODEL_P3B="$(json_get_first compte_rendu.model_pass3b model_pass3b)";       [[ -z "$MODEL_P3B" ]] && MODEL_P3B="pass3b_remote"
+MODEL_P3C="$(json_get_first compte_rendu.model_pass3c model_pass3c)";       [[ -z "$MODEL_P3C" ]] && MODEL_P3C="pass3c_remote"
+MODEL_P3D="$(json_get_first compte_rendu.model_pass3d model_pass3d)";       [[ -z "$MODEL_P3D" ]] && MODEL_P3D="pass3d_remote"
+PRESET="$(json_get_first compte_rendu.preset preset)";                      [[ -z "$PRESET" ]] && PRESET="equilibre"
 
 OUT_ROOT="/data/Affaires/${AFFAIRE_ID}/BE_Traitement_captations/${CAPTATION_ID}/compte_rendu_LLM"
 RUN_JOB_ID="job_$(date +%Y%m%d_%H%M%S_%N)_$$"
@@ -822,7 +842,7 @@ PSEUDO_PART_PATH="$(to_unc_affaires_path "$PART_PATH")"
 PSEUDO_API_BASE="${PSEUDO_API_BASE:-http://10.0.1.10:5050}"
 PSEUDO_API_KEY="${LOCAL_LLM_API_KEY:-}"
 PSEUDONYMIZE_REMOTE=0
-if uses_remote_llm "$PROVIDER" "$MODEL_P1" "$MODEL_P2" "$MODEL_P3"; then
+if uses_remote_llm "$PROVIDER" "$MODEL_P1" "$MODEL_P2" "$MODEL_REPORT" "$MODEL_P2E" "$MODEL_P3" "$MODEL_P3E" "$MODEL_P3A" "$MODEL_P3B" "$MODEL_P3C" "$MODEL_P3D"; then
   PSEUDONYMIZE_REMOTE=1
 fi
 
@@ -843,8 +863,16 @@ echo "Provider: $PROVIDER"
 echo "ApiBase : $API_BASE"
 echo "ModelP1 : $MODEL_P1"
 echo "ModelP2 : $MODEL_P2"
+echo "ModelReport: $MODEL_REPORT"
+echo "ModelP2E: $MODEL_P2E"
 echo "ModelP3 : $MODEL_P3"
+echo "ModelP3E: $MODEL_P3E"
+echo "ModelP3A: $MODEL_P3A"
+echo "ModelP3B: $MODEL_P3B"
+echo "ModelP3C: $MODEL_P3C"
+echo "ModelP3D: $MODEL_P3D"
 echo "Preset : $PRESET"
+echo "Priorite configuration: infos_projet.json (compte_rendu.* puis legacy top-level) -> arguments transmis au PS1 par ce .sh -> parametres par defaut du PS1 -> resolution adapter.py"
 
 if [[ $DOCX_ONLY -eq 1 && ${#PASS2B_BATCHES_ARR[@]} -eq 0 ]]; then
   HOST_OUT_DIR="/volume1/Affaires${OUT_DIR#/data/Affaires}"
@@ -934,7 +962,14 @@ cat > "$METADATA_FILE" <<EOF
   "api_base": "$API_BASE",
   "model_pass1": "$MODEL_P1",
   "model_pass2": "$MODEL_P2",
+  "model_report": "$MODEL_REPORT",
+  "model_pass2e": "$MODEL_P2E",
   "model_pass3": "$MODEL_P3",
+  "model_pass3e": "$MODEL_P3E",
+  "model_pass3a": "$MODEL_P3A",
+  "model_pass3b": "$MODEL_P3B",
+  "model_pass3c": "$MODEL_P3C",
+  "model_pass3d": "$MODEL_P3D",
   "preset": "$PRESET",
   "pseudonymize_remote": $PSEUDONYMIZE_REMOTE,
   "pseudo_api_base": "$PSEUDO_API_BASE",
@@ -944,7 +979,7 @@ EOF
 
 echo "Metadata écrit dans: $METADATA_FILE"
 
-python3 - <<'PY' "$PSEUDO_CONTEXT_FILE" "$PSEUDO_CONTEXT_HISTORY" "$AFFAIRE_ID" "$CAPTATION_ID" "$PSEUDO_JOB_ID" "$PSEUDO_API_BASE" "$PROVIDER" "$MODEL_P1" "$MODEL_P2" "$MODEL_P3" "$PRESET" "$PSEUDONYMIZE_REMOTE"
+python3 - <<'PY' "$PSEUDO_CONTEXT_FILE" "$PSEUDO_CONTEXT_HISTORY" "$AFFAIRE_ID" "$CAPTATION_ID" "$PSEUDO_JOB_ID" "$PSEUDO_API_BASE" "$PROVIDER" "$MODEL_P1" "$MODEL_P2" "$MODEL_REPORT" "$MODEL_P2E" "$MODEL_P3" "$MODEL_P3E" "$MODEL_P3A" "$MODEL_P3B" "$MODEL_P3C" "$MODEL_P3D" "$PRESET" "$PSEUDONYMIZE_REMOTE"
 import json
 import sys
 from datetime import datetime, timezone
@@ -960,9 +995,16 @@ payload = {
     "provider": sys.argv[7],
     "model_pass1": sys.argv[8],
     "model_pass2": sys.argv[9],
-    "model_pass3": sys.argv[10],
-    "preset": sys.argv[11],
-    "pseudonymize_remote": sys.argv[12] == "1",
+    "model_report": sys.argv[10],
+    "model_pass2e": sys.argv[11],
+    "model_pass3": sys.argv[12],
+    "model_pass3e": sys.argv[13],
+    "model_pass3a": sys.argv[14],
+    "model_pass3b": sys.argv[15],
+    "model_pass3c": sys.argv[16],
+    "model_pass3d": sys.argv[17],
+    "preset": sys.argv[18],
+    "pseudonymize_remote": sys.argv[19] == "1",
     "created_at": datetime.now(timezone.utc).isoformat(),
 }
 for path in (current_path, history_path):
@@ -991,7 +1033,14 @@ cmd=(docker exec -it cr-pipeline pwsh /pipeline/powershell/cr_reunion_point_mume
   -ApiBase "$API_BASE"
   -ModelPass1 "$MODEL_P1"
   -ModelPass2 "$MODEL_P2"
+  -ModelReport "$MODEL_REPORT"
+  -ModelPass2E "$MODEL_P2E"
   -ModelPass3 "$MODEL_P3"
+  -ModelPass3E "$MODEL_P3E"
+  -ModelPass3A "$MODEL_P3A"
+  -ModelPass3B "$MODEL_P3B"
+  -ModelPass3C "$MODEL_P3C"
+  -ModelPass3D "$MODEL_P3D"
   -Preset "$PRESET"
 )
 
@@ -1037,6 +1086,20 @@ fi
 
 echo "=== Commande ==="
 print_sanitized_command "${cmd[@]}"
+echo "=== Alias LLM transmis au PS1 ==="
+echo "Provider=$PROVIDER"
+echo "ApiBase=$API_BASE"
+echo "ModelPass1=$MODEL_P1"
+echo "ModelPass2=$MODEL_P2"
+echo "ModelReport=$MODEL_REPORT"
+echo "ModelPass2E=$MODEL_P2E"
+echo "ModelPass3=$MODEL_P3"
+echo "ModelPass3E=$MODEL_P3E"
+echo "ModelPass3A=$MODEL_P3A"
+echo "ModelPass3B=$MODEL_P3B"
+echo "ModelPass3C=$MODEL_P3C"
+echo "ModelPass3D=$MODEL_P3D"
+echo "Preset=$PRESET"
 echo "=== Log file ==="
 echo "$log_file"
 
