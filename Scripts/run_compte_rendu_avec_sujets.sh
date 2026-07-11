@@ -165,6 +165,7 @@ json_get_first() {
 # Windows -> conteneur
 # C:\Affaires\...  => /data/Affaires/...
 # \\192.168.1.20\Affaires\... => /data/Affaires/...
+# anciens UNC PC fixe (.120/.155/VPN) => /data/Affaires/...
 # ----------------------------
 to_container_path() {
   local p="$1"
@@ -174,8 +175,12 @@ to_container_path() {
     p="/data/Affaires/${p#C:\\Affaires\\}"
   elif [[ "$p" == \\\\192.168.1.20\\Affaires\\* ]]; then
     p="/data/Affaires/${p#\\\\192.168.1.20\\Affaires\\}"
+  elif [[ "$p" == \\\\192.168.0.120\\Affaires\\* ]]; then
+    p="/data/Affaires/${p#\\\\192.168.0.120\\Affaires\\}"
   elif [[ "$p" == \\\\192.168.0.155\\Affaires\\* ]]; then
     p="/data/Affaires/${p#\\\\192.168.0.155\\Affaires\\}"
+  elif [[ "$p" == \\\\10.0.1.10\\Affaires\\* ]]; then
+    p="/data/Affaires/${p#\\\\10.0.1.10\\Affaires\\}"
   elif [[ "$p" == /volume1/Affaires/* ]]; then
     p="/data/Affaires/${p#/volume1/Affaires/}"
   fi
@@ -184,16 +189,10 @@ to_container_path() {
   echo "$p"
 }
 
-to_unc_affaires_path() {
+to_pseudo_participants_path() {
   local p="$1"
   [[ -z "$p" ]] && echo "" && return
-
-  if [[ "$p" == /data/Affaires/* ]]; then
-    p="\\\\192.168.0.155\\Affaires\\${p#/data/Affaires/}"
-    p="${p//\//\\}"
-  fi
-
-  echo "$p"
+  to_container_path "$p"
 }
 
 
@@ -837,7 +836,7 @@ mkdir -p "$host_log_dir"
 ts="$(date '+%Y%m%d_%H%M%S')"
 log_file="$host_log_dir/run_${ts}.log"
 PSEUDO_JOB_ID="cr_${AFFAIRE_ID}_${CAPTATION_ID}_${RUN_JOB_ID}"
-PSEUDO_PART_PATH="$(to_unc_affaires_path "$PART_PATH")"
+PSEUDO_PART_PATH="$(to_pseudo_participants_path "$PART_PATH")"
 # Fallback NAS futur: http://10.0.1.10:5050 -> http://192.168.0.120:5050 -> http://192.168.0.155:5050
 PSEUDO_API_BASE="${PSEUDO_API_BASE:-http://10.0.1.10:5050}"
 PSEUDO_API_KEY="${LOCAL_LLM_API_KEY:-}"

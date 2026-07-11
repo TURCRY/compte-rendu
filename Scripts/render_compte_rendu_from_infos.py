@@ -510,7 +510,9 @@ def win_to_container_affaires_path(host_path: Path, root_affaires: Path) -> str:
 
     patterns = [
         re.compile(r"^[A-Za-z]:\\Affaires\\(?P<rel>.+)$", re.I),
+        re.compile(r"^\\\\192\.168\.0\.120\\Affaires\\(?P<rel>.+)$", re.I),
         re.compile(r"^\\\\192\.168\.0\.155\\Affaires\\(?P<rel>.+)$", re.I),
+        re.compile(r"^\\\\10\.0\.1\.10\\Affaires\\(?P<rel>.+)$", re.I),
         re.compile(r"^\\\\192\.168\.1\.20\\Affaires\\(?P<rel>.+)$", re.I),
     ]
     for pattern in patterns:
