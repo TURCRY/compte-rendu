@@ -7,6 +7,17 @@ set -euo pipefail
 INFOS="${1:-}"
 shift || true
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ENV_FILE="${COMPTE_RENDU_ENV_FILE:-$PROJECT_ROOT/.env}"
+ENV_LOADED=0
+
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+  ENV_LOADED=1
+fi
 
 DRY_RUN=0
 FORCE=0
@@ -192,7 +203,16 @@ to_container_path() {
 to_pseudo_participants_path() {
   local p="$1"
   [[ -z "$p" ]] && echo "" && return
-  to_container_path "$p"
+
+  p="$(to_container_path "$p")"
+  if [[ "$p" == /data/Affaires/* ]]; then
+    p="${p#/data/Affaires/}"
+    p="${p//\//\\}"
+    printf 'C:\Affaires\%s\n' "$p"
+    return
+  fi
+
+  echo "$p"
 }
 
 
@@ -849,6 +869,10 @@ fi
 exec > >(tee -a "$log_file") 2>&1
 
 echo "=== LOG START: $(date -Is) ==="
+echo ".env charge : $([[ $ENV_LOADED -eq 1 ]] && echo oui || echo non)"
+echo "LOCAL_LLM_API_KEY disponible : $([[ -n "${LOCAL_LLM_API_KEY:-}" ]] && echo oui || echo non)"
+echo "ParticipantsPath conteneur : $PART_PATH"
+echo "PseudoParticipantsPath PC fixe : $PSEUDO_PART_PATH"
 echo "Infos JSON: $INFOS"
 echo "Profil: $PROFILE"
 if [[ -n "$RESUME_RUN_MSG" ]]; then
@@ -1021,7 +1045,7 @@ echo "Pseudo context historique écrit dans: $PSEUDO_CONTEXT_HISTORY"
 # ----------------------------
 API_KEY='*CRpy#VrWz#5zh&F%ww6zY24U'
 
-cmd=(docker exec -it cr-pipeline pwsh /pipeline/powershell/cr_reunion_point_mumerotes_pipeline_json.ps1
+cmd=(docker exec cr-pipeline pwsh /pipeline/powershell/cr_reunion_point_mumerotes_pipeline_json.ps1
   -CsvPath "$CSV_PATH"
   -OutDir "$OUT_DIR"
   -ContextJsonPath "$CTX_PATH"
