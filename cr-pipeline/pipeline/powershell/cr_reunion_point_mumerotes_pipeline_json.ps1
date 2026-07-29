@@ -40,6 +40,7 @@ param(
   [string] $ModelPass3E = "pass3e_remote",  # Passe 3E : synthèse par sujet (LOCAL)
   # Modèle rédactionnel (2B / MergeGlobal UNIQUEMENT) 
   [string] $ModelReport = "report_remote",
+  [string] $ModelDebrief = "report_debrief_remote",
   [string] $ModelPass3A = "pass3a_remote",
   [string] $ModelPass3B = "pass3b_remote",
   [string] $ModelPass3C = "pass3c_remote",
@@ -197,6 +198,7 @@ $modelGuard = @{
   ModelPass2E = $ModelPass2E
   ModelPass3E = $ModelPass3E
   ModelReport = $ModelReport
+  ModelDebrief = $ModelDebrief
 }
 foreach ($kv in $modelGuard.GetEnumerator()) {
   if ([string]$kv.Value -match '^\d+$') {
@@ -227,6 +229,7 @@ Microsoft.PowerShell.Utility\Write-Host ("ModelPass2E    = {0}" -f $ModelPass2E)
 Microsoft.PowerShell.Utility\Write-Host ("ModelPass3     = {0}" -f $ModelPass3)
 Microsoft.PowerShell.Utility\Write-Host ("ModelPass3E    = {0}" -f $ModelPass3E)
 Microsoft.PowerShell.Utility\Write-Host ("ModelReport    = {0}" -f $ModelReport)
+Microsoft.PowerShell.Utility\Write-Host ("ModelDebrief   = {0}" -f $ModelDebrief)
 Microsoft.PowerShell.Utility\Write-Host ("Pass2BatchSize = {0}" -f $Pass2BatchSize)
 Microsoft.PowerShell.Utility\Write-Host ("Pass2BPromptCharsLimit = {0}" -f $Pass2BPromptCharsLimit)
 Microsoft.PowerShell.Utility\Write-Host ("Pass2BEstimatedTokensLimit = {0}" -f $Pass2BEstimatedTokensLimit)
@@ -1957,15 +1960,22 @@ Cette transcription contient :
 - tes commentaires pour guider la rédaction du compte rendu,
 - tes idées de demandes de documents ou pièces complémentaires.
 
-Tu disposes aussi de la liste numérotée des SUJETS (Numero + Titre).
+Tu disposes aussi de la liste numérotée des SUJETS (Numero + Titre). Cette liste sert uniquement au rattachement, à la numérotation et au titrage des rubriques ; elle ne constitue pas une source de faits métier.
 
 Tâches :
-1) Pour chaque sujet explicite ou implicite dans le débrief :
+1) Extraire fidèlement les éléments métier présents dans le débrief, même s'ils
+   reprennent ou complètent des points déjà évoqués dans la réunion.
+
+2) Pour chaque sujet explicite ou implicite dans le débrief :
    - résumer en quelques phrases l’ORIENTATION que tu veux donner dans le rapport,
    - extraire les demandes de documents clairement rattachées à ce sujet.
 
-2) Extraire aussi les demandes de documents qui ne se rattachent pas clairement à un sujet
+3) Extraire aussi les demandes de documents qui ne se rattachent pas clairement à un sujet
    (les mettre dans "demandes_documents_hors_sujet").
+
+4) Conserver dans "global_debrief" les observations transversales utiles :
+   points de vigilance, contradictions, calendrier, méthode, pièces, incidents,
+   engagements, demandes de documents, orientations techniques et suites à donner.
 
 Détermination du mode :
 - Si la transcription de la réunion est complète et exploitable → mode_debrief = "complement".
@@ -2012,18 +2022,30 @@ Sortie STRICTEMENT JSON :
   }
 
 }
+
+Règles impératives :
+- N'utilise pas l'ancien schéma global du compte rendu à la racine
+  ("resume_global", "themes", "demandes_documents_globales", "problems").
+- La racine JSON doit contenir exactement les familles attendues du débrief :
+  "mode_debrief", "sujets", "demandes_documents_hors_sujet", "global_debrief".
+- Si la transcription contient du texte métier exploitable, la sortie ne doit
+  pas être entièrement vide : renseigne au minimum "global_debrief.resume" et
+  au moins un élément dans "global_debrief.themes_abordes" ou dans "sujets".
+- Les listes vides sont autorisées uniquement pour les rubriques réellement
+  absentes du débrief.
+- Les difficultés et suites techniques vont dans "global_debrief.perspectives" ;
+  ne crée pas de champ racine "problems".
+- N'invente aucun fait absent de la transcription du débrief.
+- Les faits, noms propres, documents, montants, dates, constats et demandes doivent être appuyés par les lignes du débrief.
+- N'introduis pas un document, une date, un nom propre ou un montant uniquement parce qu'il figure dans le contexte général ou dans la description d'un sujet.
+- La liste des sujets peut seulement aider à choisir le numero et le titre de rattachement.
 '@
 
 Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F02 - avant branche Debrief_System selon GlobalContext" -ForegroundColor Yellow
 if ($GlobalContext) {
-    $Debrief_System = @"
-$ContextSystem
-
-Mission générale de l'analyse (à respecter strictement) :
-$ContextMission
-$EtatBlock
-$BaseDebrief_System
-"@
+    # Passe 1B: le contexte général peut contenir des faits non présents dans le débrief.
+    # On le retire de l'appel LLM pour éviter toute introduction non sourcée.
+    $Debrief_System = $BaseDebrief_System
 }
 else {
     $Debrief_System = $BaseDebrief_System
@@ -2032,29 +2054,32 @@ else {
 Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F03 - avant branche Debrief_User_Template selon ContextUser" -ForegroundColor Yellow
 if ($ContextUser) {
     $Debrief_User_Template = @"
-Contexte général de l’affaire (ne pas réécrire, ne pas inventer d’éléments nouveaux) :
-$ContextUser
-
-Liste des sujets numérotés (JSON) :
+Liste des sujets numérotés (JSON ; Numero + Titre uniquement, non source de faits) :
 {SUJETS_JSON}
 
 Transcription complète du débrief de l'expert (lignes chronologiques) :
 
 {DEBRIEF_LINES}
 
-Renvoie uniquement le JSON conforme au schéma.
+Renvoie uniquement le JSON conforme au schéma de débrief expert :
+racine = mode_debrief, sujets, demandes_documents_hors_sujet, global_debrief.
+N'utilise pas l'ancien schéma resume_global/themes/actions à la racine.
+Si les lignes de débrief contiennent du texte métier exploitable, ne renvoie pas un JSON entièrement vide.
 "@
 }
 else {
     $Debrief_User_Template = @'
-Liste des sujets numérotés (JSON) :
+Liste des sujets numérotés (JSON ; Numero + Titre uniquement, non source de faits) :
 {SUJETS_JSON}
 
 Transcription complète du débrief de l'expert (lignes chronologiques) :
 
 {DEBRIEF_LINES}
 
-Renvoie uniquement le JSON conforme au schéma.
+Renvoie uniquement le JSON conforme au schéma de débrief expert :
+racine = mode_debrief, sujets, demandes_documents_hors_sujet, global_debrief.
+N'utilise pas l'ancien schéma resume_global/themes/actions à la racine.
+Si les lignes de débrief contiennent du texte métier exploitable, ne renvoie pas un JSON entièrement vide.
 '@
 }
 
@@ -2131,7 +2156,7 @@ if ($ContextUser) {
 Contexte général de l’affaire (ne pas le réécrire, ne pas inventer d’éléments nouveaux) :
 $ContextUser
 
-Liste des sujets numérotés (JSON) :
+Liste des sujets numérotés (JSON ; Numero + Titre uniquement, non source de faits) :
 {SUJETS_JSON}
 
 Liste des participants (JSON) :
@@ -2148,7 +2173,7 @@ Renvoie uniquement le JSON conforme au schéma.
 }
 else {
     $Pass1_User_Template = @'
-Liste des sujets numérotés (JSON) :
+Liste des sujets numérotés (JSON ; Numero + Titre uniquement, non source de faits) :
 {SUJETS_JSON}
 
 Liste des participants (JSON) :
@@ -4306,7 +4331,13 @@ if ($CsvDebriefPath) {
                 }
             } | Out-String
 
-            $sujetsJson = $Sujets | ConvertTo-Json -Depth 10
+            $sujetsDebrief = @($Sujets | ForEach-Object {
+                [pscustomobject]@{
+                    Numero = $_.Numero
+                    Titre  = $_.Titre
+                }
+            })
+            $sujetsJson = $sujetsDebrief | ConvertTo-Json -Depth 5
 
             $debriefUser = $Debrief_User_Template.
                 Replace("{SUJETS_JSON}",   $sujetsJson).
@@ -4316,23 +4347,23 @@ if ($CsvDebriefPath) {
             $debriefPromptPath = Join-Path $logsDir "debrief_prompt.txt"
             $debriefSystemPath = Join-Path $logsDir "debrief_system.txt"
 
-            Write-ArtifactText -Path $debriefPromptPath -Text $debriefUser -ModelName $ModelReport
+            Write-ArtifactText -Path $debriefPromptPath -Text $debriefUser -ModelName $ModelDebrief
 
-            Write-ArtifactText -Path $debriefSystemPath -Text $Debrief_System -ModelName $ModelReport
+            Write-ArtifactText -Path $debriefSystemPath -Text $Debrief_System -ModelName $ModelDebrief
             # Contrôle n_ctx
             $debriefUser_Effective = Enforce-ContextLimit `
                 -SystemPrompt $Debrief_System `
                 -UserPrompt   $debriefUser `
                 -Label        "Debrief expert" `
                 -LogFile      $logFile `
-                -ModelName    $ModelReport
+                -ModelName    $ModelDebrief
 
             $debriefEffPath = Join-Path $logsDir "debrief_prompt_effective.txt"
-            Write-ArtifactText -Path $debriefEffPath -Text $debriefUser_Effective -ModelName $ModelReport
+            Write-ArtifactText -Path $debriefEffPath -Text $debriefUser_Effective -ModelName $ModelDebrief
 
             # Appel LLM (on utilise le modèle "remote" de passe 3 pour ce travail global)
-            $debriefRaw = Invoke-LLM -system $Debrief_System -user $debriefUser_Effective -model $ModelReport -DebugHttp:$DebugHttp
-            Write-ArtifactText -Path (Join-Path $logsDir "debrief_raw.txt") -Text $debriefRaw -ModelName $ModelReport
+            $debriefRaw = Invoke-LLM -system $Debrief_System -user $debriefUser_Effective -model $ModelDebrief -DebugHttp:$DebugHttp
+            Write-ArtifactText -Path (Join-Path $logsDir "debrief_raw.txt") -Text $debriefRaw -ModelName $ModelDebrief
 
             try {
                 $DebriefObj = Parse-LlmJsonStrict -RawText $debriefRaw -Label "Debrief" -LogFile $logFile

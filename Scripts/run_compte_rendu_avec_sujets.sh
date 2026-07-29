@@ -597,6 +597,7 @@ API_BASE="$(json_get_first compte_rendu.api_base api_base)";                [[ -
 MODEL_P1="$(json_get_first compte_rendu.model_pass1 model_pass1)";          [[ -z "$MODEL_P1" ]] && MODEL_P1="annoter_segments_remote"
 MODEL_P2="$(json_get_first compte_rendu.model_pass2 model_pass2)";          [[ -z "$MODEL_P2" ]] && MODEL_P2="annoter_segments_remote"
 MODEL_REPORT="$(json_get_first compte_rendu.model_report model_report)";    [[ -z "$MODEL_REPORT" ]] && MODEL_REPORT="report_remote"
+MODEL_DEBRIEF="$(json_get_first compte_rendu.model_debrief model_debrief)"; [[ -z "$MODEL_DEBRIEF" ]] && MODEL_DEBRIEF="report_debrief_remote"
 MODEL_P2E="$(json_get_first compte_rendu.model_pass2e model_pass2e)";       [[ -z "$MODEL_P2E" ]] && MODEL_P2E="annoter_segments_remote_alt"
 MODEL_P3="$(json_get_first compte_rendu.model_pass3 model_pass3)";          [[ -z "$MODEL_P3" ]] && MODEL_P3="annoter_segments_remote_alt"
 MODEL_P3E="$(json_get_first compte_rendu.model_pass3e model_pass3e)";       [[ -z "$MODEL_P3E" ]] && MODEL_P3E="pass3e_remote"
@@ -861,7 +862,7 @@ PSEUDO_PART_PATH="$(to_pseudo_participants_path "$PART_PATH")"
 PSEUDO_API_BASE="${PSEUDO_API_BASE:-http://10.0.1.10:5050}"
 PSEUDO_API_KEY="${LOCAL_LLM_API_KEY:-}"
 PSEUDONYMIZE_REMOTE=0
-if uses_remote_llm "$PROVIDER" "$MODEL_P1" "$MODEL_P2" "$MODEL_REPORT" "$MODEL_P2E" "$MODEL_P3" "$MODEL_P3E" "$MODEL_P3A" "$MODEL_P3B" "$MODEL_P3C" "$MODEL_P3D"; then
+if uses_remote_llm "$PROVIDER" "$MODEL_P1" "$MODEL_P2" "$MODEL_REPORT" "$MODEL_DEBRIEF" "$MODEL_P2E" "$MODEL_P3" "$MODEL_P3E" "$MODEL_P3A" "$MODEL_P3B" "$MODEL_P3C" "$MODEL_P3D"; then
   PSEUDONYMIZE_REMOTE=1
 fi
 
@@ -887,6 +888,7 @@ echo "ApiBase : $API_BASE"
 echo "ModelP1 : $MODEL_P1"
 echo "ModelP2 : $MODEL_P2"
 echo "ModelReport: $MODEL_REPORT"
+echo "ModelDebrief: $MODEL_DEBRIEF"
 echo "ModelP2E: $MODEL_P2E"
 echo "ModelP3 : $MODEL_P3"
 echo "ModelP3E: $MODEL_P3E"
@@ -986,6 +988,7 @@ cat > "$METADATA_FILE" <<EOF
   "model_pass1": "$MODEL_P1",
   "model_pass2": "$MODEL_P2",
   "model_report": "$MODEL_REPORT",
+  "model_debrief": "$MODEL_DEBRIEF",
   "model_pass2e": "$MODEL_P2E",
   "model_pass3": "$MODEL_P3",
   "model_pass3e": "$MODEL_P3E",
@@ -1002,7 +1005,7 @@ EOF
 
 echo "Metadata écrit dans: $METADATA_FILE"
 
-python3 - <<'PY' "$PSEUDO_CONTEXT_FILE" "$PSEUDO_CONTEXT_HISTORY" "$AFFAIRE_ID" "$CAPTATION_ID" "$PSEUDO_JOB_ID" "$PSEUDO_API_BASE" "$PROVIDER" "$MODEL_P1" "$MODEL_P2" "$MODEL_REPORT" "$MODEL_P2E" "$MODEL_P3" "$MODEL_P3E" "$MODEL_P3A" "$MODEL_P3B" "$MODEL_P3C" "$MODEL_P3D" "$PRESET" "$PSEUDONYMIZE_REMOTE"
+python3 - <<'PY' "$PSEUDO_CONTEXT_FILE" "$PSEUDO_CONTEXT_HISTORY" "$AFFAIRE_ID" "$CAPTATION_ID" "$PSEUDO_JOB_ID" "$PSEUDO_API_BASE" "$PROVIDER" "$MODEL_P1" "$MODEL_P2" "$MODEL_REPORT" "$MODEL_DEBRIEF" "$MODEL_P2E" "$MODEL_P3" "$MODEL_P3E" "$MODEL_P3A" "$MODEL_P3B" "$MODEL_P3C" "$MODEL_P3D" "$PRESET" "$PSEUDONYMIZE_REMOTE"
 import json
 import sys
 from datetime import datetime, timezone
@@ -1019,15 +1022,16 @@ payload = {
     "model_pass1": sys.argv[8],
     "model_pass2": sys.argv[9],
     "model_report": sys.argv[10],
-    "model_pass2e": sys.argv[11],
-    "model_pass3": sys.argv[12],
-    "model_pass3e": sys.argv[13],
-    "model_pass3a": sys.argv[14],
-    "model_pass3b": sys.argv[15],
-    "model_pass3c": sys.argv[16],
-    "model_pass3d": sys.argv[17],
-    "preset": sys.argv[18],
-    "pseudonymize_remote": sys.argv[19] == "1",
+    "model_debrief": sys.argv[11],
+    "model_pass2e": sys.argv[12],
+    "model_pass3": sys.argv[13],
+    "model_pass3e": sys.argv[14],
+    "model_pass3a": sys.argv[15],
+    "model_pass3b": sys.argv[16],
+    "model_pass3c": sys.argv[17],
+    "model_pass3d": sys.argv[18],
+    "preset": sys.argv[19],
+    "pseudonymize_remote": sys.argv[20] == "1",
     "created_at": datetime.now(timezone.utc).isoformat(),
 }
 for path in (current_path, history_path):
@@ -1057,6 +1061,7 @@ cmd=(docker exec cr-pipeline pwsh /pipeline/powershell/cr_reunion_point_mumerote
   -ModelPass1 "$MODEL_P1"
   -ModelPass2 "$MODEL_P2"
   -ModelReport "$MODEL_REPORT"
+  -ModelDebrief "$MODEL_DEBRIEF"
   -ModelPass2E "$MODEL_P2E"
   -ModelPass3 "$MODEL_P3"
   -ModelPass3E "$MODEL_P3E"
@@ -1115,6 +1120,7 @@ echo "ApiBase=$API_BASE"
 echo "ModelPass1=$MODEL_P1"
 echo "ModelPass2=$MODEL_P2"
 echo "ModelReport=$MODEL_REPORT"
+echo "ModelDebrief=$MODEL_DEBRIEF"
 echo "ModelPass2E=$MODEL_P2E"
 echo "ModelPass3=$MODEL_P3"
 echo "ModelPass3E=$MODEL_P3E"
