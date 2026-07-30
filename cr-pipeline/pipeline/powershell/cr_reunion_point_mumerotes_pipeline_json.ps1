@@ -35,7 +35,7 @@ param(
   # Modèles par passe
   [string] $ModelPass1 = "annoter_segments_local",   # Passe 1 : segments → LOCAL + Passe 2A
   [string] $ModelPass2 = "report_remote",  # Passe 2 : fusion → REMOTE
-  [string] $ModelPass2E = "annoter_segments_remote_alt",
+  [string] $ModelPass2E = "pass2e_remote",
   [string] $ModelPass3 = "pass3_remote",  # # Passes 3, 3A/B/C/D, MergeGlobal
   [string] $ModelPass3E = "pass3e_remote",  # Passe 3E : synthèse par sujet (LOCAL)
   # Modèle rédactionnel (2B / MergeGlobal UNIQUEMENT) 
@@ -3384,6 +3384,20 @@ Règles impératives :
 - ne pas reformuler de manière extensive ;
 - ne pas introduire d’analyse juridique ;
 - si un champ ne contient aucun élément exploitable, renvoyer un tableau vide ;
+- ne renvoie pas un objet entierement vide si au moins une intervention contient un fait exploitable ;
+- si la matiere est faible mais factuelle, produire un compact court et proportionne ;
+- distinguer clairement "matiere faible" de "aucun element exploitable" ;
+- ne pas rattacher automatiquement une mesure numerique au qualificatif voisin ;
+- distinguer les mesures de distance, hauteur, profondeur, duree et quantite ;
+- conserver separement les propositions independantes lorsque leur relation semantique n'est pas certaine ;
+- respecter les marqueurs d'approximation comme "environ" ou "a peu pres" ;
+- respecter les positions relatives comme "plus haut" ou "en contrebas" sans les convertir en altitude chiffree ;
+- si la ponctuation ASR est incertaine, produire une formulation prudente plutot qu'une relation causale ou quantitative inventee ;
+- si une phrase ASR juxtapose un marqueur spatial comme "la-haut" ou "plus haut" avec une mesure comme "a 400 metres", ne jamais transformer cette mesure en hauteur, altitude, profondeur ou etendue de dommage ;
+- dans ce cas, restituer separement la distance approximative et la position relative, ou indiquer que le lien exact est incertain ;
+- si le referent de la mesure est ambigu, ne pas attribuer la mesure aux dommages, fissures, pierres ou ouvrages ; parler prudemment d'un lieu, secteur ou point evoque ;
+- les champs titre, localisation et description servent au rattachement du sujet ; ne pas les utiliser comme preuve d'un fait absent des interventions ;
+- n'utiliser "Aucun element relatif a ce point n'a ete identifie dans les echanges analyses." que si les interventions sont vides, purement techniques ou sans fait rattachable au sujet ;
 - le champ "resume_factuel" doit rester sobre, factuel et synthétique.
 
 Réponds STRICTEMENT au format JSON (aucun texte hors JSON) :
@@ -3396,6 +3410,25 @@ Réponds STRICTEMENT au format JSON (aucun texte hors JSON) :
   "documents_demandes": ["string"],
   "elements_techniques": ["string"]
 }
+
+N'utilise pas l'ancien schema de passe segment :
+{
+  "resume_segment": "...",
+  "themes": [],
+  "problems": []
+}
+
+Si au moins une intervention contient un fait exploitable, remplis au minimum
+"resume_factuel" et/ou "points_cles". Un compact court est attendu lorsque la
+matiere est faible.
+
+Controle des mesures et de la ponctuation ASR :
+- interdiction de transformer une distance en hauteur, altitude, profondeur, duree ou quantite ;
+- si une phrase juxtapose "la-haut" ou "plus haut" et "a N metres", traiter "N metres" comme une distance approximative sauf preuve explicite du contraire ;
+- ne jamais ecrire "N metres de hauteur" ou "hauteur de N metres" si ces mots ne sont pas explicitement lies dans la source ;
+- conserver separement la distance approximative et la position relative ;
+- si le referent de la mesure est ambigu, ne pas attribuer la mesure aux dommages, fissures, pierres ou ouvrages ; parler prudemment d'un lieu, secteur ou point evoque ;
+- exemple de prudence : "un secteur situe dans les parages, a environ N metres, et dans une partie legerement plus haute".
 
 Normalisation des dates :
 - ne pas écrire de dates au format "YYYY-MM-DD" dans les champs textuels ;
@@ -5922,6 +5955,25 @@ Schéma attendu :
   "documents_demandes": ["string"],
   "elements_techniques": ["string"]
 }
+
+N'utilise pas l'ancien schema de passe segment :
+{
+  "resume_segment": "...",
+  "themes": [],
+  "problems": []
+}
+
+Si au moins une intervention contient un fait exploitable, remplis au minimum
+"resume_factuel" et/ou "points_cles". Un compact court est attendu lorsque la
+matiere est faible.
+
+Controle des mesures et de la ponctuation ASR :
+- interdiction de transformer une distance en hauteur, altitude, profondeur, duree ou quantite ;
+- si une phrase juxtapose "la-haut" ou "plus haut" et "a N metres", traiter "N metres" comme une distance approximative sauf preuve explicite du contraire ;
+- ne jamais ecrire "N metres de hauteur" ou "hauteur de N metres" si ces mots ne sont pas explicitement lies dans la source ;
+- conserver separement la distance approximative et la position relative ;
+- si le referent de la mesure est ambigu, ne pas attribuer la mesure aux dommages, fissures, pierres ou ouvrages ; parler prudemment d'un lieu, secteur ou point evoque ;
+- exemple de prudence : "un secteur situe dans les parages, a environ N metres, et dans une partie legerement plus haute".
 "@
 
     $chunkJson = $ChunkObj | ConvertTo-Json -Depth 50 -Compress
@@ -5998,6 +6050,25 @@ Schéma attendu :
   "documents_demandes": ["string"],
   "elements_techniques": ["string"]
 }
+
+N'utilise pas l'ancien schema de passe segment :
+{
+  "resume_segment": "...",
+  "themes": [],
+  "problems": []
+}
+
+Si au moins une intervention contient un fait exploitable, remplis au minimum
+"resume_factuel" et/ou "points_cles". Un compact court est attendu lorsque la
+matiere est faible.
+
+Controle des mesures et de la ponctuation ASR :
+- interdiction de transformer une distance en hauteur, altitude, profondeur, duree ou quantite ;
+- si une phrase juxtapose "la-haut" ou "plus haut" et "a N metres", traiter "N metres" comme une distance approximative sauf preuve explicite du contraire ;
+- ne jamais ecrire "N metres de hauteur" ou "hauteur de N metres" si ces mots ne sont pas explicitement lies dans la source ;
+- conserver separement la distance approximative et la position relative ;
+- si le referent de la mesure est ambigu, ne pas attribuer la mesure aux dommages, fissures, pierres ou ouvrages ; parler prudemment d'un lieu, secteur ou point evoque ;
+- exemple de prudence : "un secteur situe dans les parages, a environ N metres, et dans une partie legerement plus haute".
 "@
 
     $partialsJson = $Partials | ConvertTo-Json -Depth 50 -Compress
