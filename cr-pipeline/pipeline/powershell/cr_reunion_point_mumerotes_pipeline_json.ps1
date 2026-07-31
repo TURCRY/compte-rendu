@@ -3290,6 +3290,10 @@ Règles rédactionnelles autonomes :
   "Aucun élément relatif à ce point n’a été identifié dans les échanges analysés."
 - Ne jamais inventer de constat matériel.
 - Distinguer ce qui est dit dans les échanges de ce qui est effectivement constaté.
+- Ne pas écrire "Aucun élément" lorsque la synthèse Pass2E fournie contient au moins un fait, une action, un désaccord, une demande de document ou un élément technique exploitable.
+- Conserver les désaccords, réserves, actions, documents demandés et éléments techniques présents dans l’entrée Pass2E.
+- Ne pas transformer une action proposée ou une demande en décision acquise.
+- Préserver les incertitudes et formuler prudemment les conclusions.
 
 Réponds STRICTEMENT au format JSON (aucun texte hors JSON) :
 
@@ -6439,6 +6443,84 @@ function _GetField($o, [string]$k) {
 
 Microsoft.PowerShell.Utility\Write-Host "Passe 3E → Synthèses par sujet (à partir des compacts 2E)"
 
+
+function Get-Pass3EListCount {
+  param([object]$Value)
+  if ($null -eq $Value) { return 0 }
+  if ($Value -is [string]) { if ($Value.Trim()) { return 1 } else { return 0 } }
+  return @($Value).Count
+}
+
+function Get-Pass3ESourceInterventionCount {
+  param([string]$OutDir, [int]$Numero)
+  $subjectPath = Join-Path (Join-Path $OutDir "sujets") ("sujet_{0:D3}.json" -f $Numero)
+  if (-not (Test-Path $subjectPath)) { return 0 }
+  try {
+    $subjectObj = Get-Content -LiteralPath $subjectPath -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 80
+    if ($subjectObj -and $subjectObj.PSObject.Properties['interventions']) { return @($subjectObj.interventions).Count }
+  } catch {}
+  return 0
+}
+
+function Get-Pass3ECompactDiagnostics {
+  param([object]$CompactSynth, [int]$SourceInterventions)
+  $resume = ""
+  if ($CompactSynth -and $CompactSynth.PSObject.Properties['resume_factuel']) { $resume = [string]$CompactSynth.resume_factuel }
+  $counts = [ordered]@{
+    points_cles = 0
+    actions = 0
+    desaccords = 0
+    documents_demandes = 0
+    elements_techniques = 0
+  }
+  foreach ($k in @($counts.Keys)) {
+    if ($CompactSynth -and $CompactSynth.PSObject.Properties[$k]) { $counts[$k] = Get-Pass3EListCount $CompactSynth.$k }
+  }
+  $nonEmptyFields = 0
+  if ($resume.Trim()) { $nonEmptyFields++ }
+  foreach ($k in @($counts.Keys)) { if ([int]$counts[$k] -gt 0) { $nonEmptyFields++ } }
+  $totalItems = 0
+  foreach ($k in @($counts.Keys)) { $totalItems += [int]$counts[$k] }
+  $insufficient = ([int]$SourceInterventions -gt 0 -and $nonEmptyFields -eq 0 -and $totalItems -eq 0)
+  [pscustomobject]@{
+    source_interventions = [int]$SourceInterventions
+    semantic_non_empty_fields = [int]$nonEmptyFields
+    total_semantic_items = [int]$totalItems
+    has_resume_factuel = [bool]$resume.Trim()
+    points_cles = [int]$counts['points_cles']
+    actions = [int]$counts['actions']
+    desaccords = [int]$counts['desaccords']
+    documents_demandes = [int]$counts['documents_demandes']
+    elements_techniques = [int]$counts['elements_techniques']
+    status = if ($insufficient) { "PASS2E_INSUFFICIENT" } else { "PASS2E_OK" }
+  }
+}
+
+function New-Pass3EDebugAttemptDir {
+  param([string]$OutDir, [int]$Numero)
+  $subjectDebugDir = Join-Path (Join-Path $OutDir "pass3E_debug") ("sujet_{0:D3}" -f $Numero)
+  Ensure-Dir $subjectDebugDir
+  $stamp = Get-Date -Format "yyyyMMdd_HHmmss_fff"
+  $attemptDir = Join-Path $subjectDebugDir ("attempt_{0}" -f $stamp)
+  $suffix = 1
+  while (Test-Path $attemptDir) {
+    $attemptDir = Join-Path $subjectDebugDir ("attempt_{0}_{1:D2}" -f $stamp, $suffix)
+    $suffix++
+  }
+  Ensure-Dir $attemptDir
+  return $attemptDir
+}
+
+function Write-Pass3EDebugText {
+  param([string]$AttemptDir, [string]$Name, [string]$Text)
+  [IO.File]::WriteAllText((Join-Path $AttemptDir $Name), [string]$Text, $utf8NoBom)
+}
+
+function Write-Pass3EDebugJson {
+  param([string]$AttemptDir, [string]$Name, [object]$Obj)
+  $json = $Obj | ConvertTo-Json -Depth 100
+  [IO.File]::WriteAllText((Join-Path $AttemptDir $Name), $json, $utf8NoBom)
+}
 trap {
   Microsoft.PowerShell.Utility\Write-Host "[ERR] $($_.Exception.Message)"
   Microsoft.PowerShell.Utility\Write-Host "[ERR] Position: $($_.InvocationInfo.PositionMessage)"
@@ -6516,33 +6598,70 @@ else {
         $compactSynth = $compactObj.synthese_intermediaire
       }
 
-      if (-not $compactSynth) {
+      $sourceInterventions = Get-Pass3ESourceInterventionCount -OutDir $OutDir -Numero $num
+      $compactDiagnostics = Get-Pass3ECompactDiagnostics -CompactSynth $compactSynth -SourceInterventions $sourceInterventions
+      $attemptDir = New-Pass3EDebugAttemptDir -OutDir $OutDir -Numero $num
+      Write-Pass3EDebugText -AttemptDir $attemptDir -Name "system_prompt.txt" -Text $Pass3E_System
+      Write-Pass3EDebugJson -AttemptDir $attemptDir -Name "compact_diagnostics.json" -Obj $compactDiagnostics
+      Write-Pass3EDebugJson -AttemptDir $attemptDir -Name "input_compact.json" -Obj $compactObj
+
+      if ([string]$compactDiagnostics.status -eq "PASS2E_INSUFFICIENT") {
+        $msg = "PASS2E_INSUFFICIENT: le sujet contient des interventions sources mais le compact Pass2E ne contient aucun champ sémantique exploitable. Rebuild Pass2E ciblé requis avant Pass3E."
+        Write-Warning ("Pass3E: sujet {0:D3} marqué PASS2E_INSUFFICIENT." -f $num)
         $finalOne = [pscustomobject]@{
           numero = $num
           titre  = $titre
           localisation = $localisation
           description  = $description
           avis_participants = @()
-          synthese_echanges = "Aucun élément relatif à ce point n’a été identifié dans les échanges analysés."
-          conclusion_expert = "Aucune conclusion technique ne peut être formulée à partir des échanges analysés."
+          synthese_echanges = $msg
+          conclusion_expert = "Aucune conclusion technique ne peut être formulée tant que le compact Pass2E n'est pas reconstruit."
+          pass3e_status = "PASS2E_INSUFFICIENT"
         }
+        Write-Pass3EDebugText -AttemptDir $attemptDir -Name "user_prompt.txt" -Text ""
+        Write-Pass3EDebugJson -AttemptDir $attemptDir -Name "request.json" -Obj ([pscustomobject]@{ alias=$ModelPass3E; fallback_alias=$ModelPass3; api_base=$ApiBase; provider=$Provider; skipped=$true; reason="PASS2E_INSUFFICIENT" })
+        Write-Pass3EDebugText -AttemptDir $attemptDir -Name "raw_response.txt" -Text ""
+        Write-Pass3EDebugJson -AttemptDir $attemptDir -Name "meta.json" -Obj ([pscustomobject]@{ status="PASS2E_INSUFFICIENT"; error=$msg; attempt_dir=$attemptDir })
+        Write-Pass3EDebugJson -AttemptDir $attemptDir -Name "parsed_before_normalization.json" -Obj $finalOne
+      }
+      elseif (-not $compactSynth) {
+        $finalOne = [pscustomobject]@{
+          numero = $num
+          titre  = $titre
+          localisation = $localisation
+          description  = $description
+          avis_participants = @()
+          synthese_echanges = "PASS2E_INSUFFICIENT: aucun compact Pass2E exploitable n'a été trouvé pour ce sujet."
+          conclusion_expert = "Aucune conclusion technique ne peut être formulée tant que le compact Pass2E n'est pas disponible."
+          pass3e_status = "PASS2E_INSUFFICIENT"
+        }
+        Write-Pass3EDebugText -AttemptDir $attemptDir -Name "user_prompt.txt" -Text ""
+        Write-Pass3EDebugJson -AttemptDir $attemptDir -Name "request.json" -Obj ([pscustomobject]@{ alias=$ModelPass3E; fallback_alias=$ModelPass3; api_base=$ApiBase; provider=$Provider; skipped=$true; reason="NO_PASS2E_COMPACT" })
+        Write-Pass3EDebugText -AttemptDir $attemptDir -Name "raw_response.txt" -Text ""
+        Write-Pass3EDebugJson -AttemptDir $attemptDir -Name "meta.json" -Obj ([pscustomobject]@{ status="PASS2E_INSUFFICIENT"; error="NO_PASS2E_COMPACT"; attempt_dir=$attemptDir })
+        Write-Pass3EDebugJson -AttemptDir $attemptDir -Name "parsed_before_normalization.json" -Obj $finalOne
       }
       else {
         $user = @"
     Sujet :
     $($meta | ConvertTo-Json -Depth 10)
 
-    Synthèse intermédiaire 2E :
+    Synthèse intermédiaire Pass2E à utiliser exclusivement :
     $($compactSynth | ConvertTo-Json -Depth 50)
 
     À partir de cette synthèse intermédiaire, produis la synthèse finale du sujet.
 
     Règles :
-    - Si des échanges sont identifiés, produire une synthèse factuelle.
-    - Si le sujet est évoqué comme corrigé, réglé, repris ou fait, écrire qu’il est "déclaré repris", sans conclure à la conformité technique.
-    - Si aucun échange n’est identifié, utiliser exactement : "Aucun élément relatif à ce point n’a été identifié dans les échanges analysés."
+    - Utiliser exclusivement la synthèse Pass2E fournie ; ne pas ajouter de faits absents.
+    - Si des échanges ou éléments exploitables sont identifiés, produire une synthèse factuelle.
+    - Conserver les désaccords, réserves, actions, documents demandés et éléments techniques.
+    - Ne pas écrire "Aucun élément" si un champ Pass2E contient une information exploitable.
+    - Si le sujet est évoqué comme corrigé, réglé, repris ou fait, écrire qu'il est "déclaré repris", sans conclure à la conformité technique.
+    - Si aucun échange n'est identifié, utiliser exactement : "Aucun élément relatif à ce point n'a été identifié dans les échanges analysés."
     - Ne jamais inventer de constat matériel.
     - Distinguer ce qui est dit dans les échanges de ce qui est effectivement constaté.
+    - Distinguer avis ou positions des participants, synthèse factuelle des échanges, et conclusion de l'expert.
+    - Préserver les incertitudes et ne pas transformer une action proposée en décision acquise.
 
     Renvoie uniquement le JSON conforme au schéma.
 "@
@@ -6554,25 +6673,44 @@ else {
           -LogFile      $logFile `
           -ModelName    $ModelPass3E
 
+        Write-Pass3EDebugText -AttemptDir $attemptDir -Name "user_prompt.txt" -Text $userEff
+        Write-Pass3EDebugJson -AttemptDir $attemptDir -Name "request.json" -Obj ([pscustomobject]@{ alias=$ModelPass3E; fallback_alias=$ModelPass3; api_base=$ApiBase; provider=$Provider; debug_http=[bool]$DebugHttp })
+
         $raw = $null
         $finalOne = $null
+        $parsedBeforeNormalization = $null
+        $pass3eFallbackUsed = $false
+        $pass3eError = ""
+        $swPass3E = [System.Diagnostics.Stopwatch]::StartNew()
 
         try {
           $raw = Invoke-LLM -system $Pass3E_System -user $userEff -model $ModelPass3E -DebugHttp:$DebugHttp
           $raw = Unwrap-AdapterText $raw
-          $finalOne = Parse-LlmJsonStrict -RawText $raw -Label ("Pass3E sujet {0:D3}" -f $num) -LogFile $logFile
+          $parsedBeforeNormalization = Parse-LlmJsonStrict -RawText $raw -Label ("Pass3E sujet {0:D3}" -f $num) -LogFile $logFile
+          $finalOne = $parsedBeforeNormalization
         }
         catch {
+          $pass3eFallbackUsed = $true
+          $pass3eError = $_.Exception.Message
           Write-Warning ("Pass3E: échec modèle local sur sujet {0:D3} → fallback ModelPass3." -f $num)
           try {
             $raw = Invoke-LLM -system $Pass3E_System -user $userEff -model $ModelPass3 -DebugHttp:$DebugHttp
             $raw = Unwrap-AdapterText $raw
-            $finalOne = Parse-LlmJsonStrict -RawText $raw -Label ("Pass3E(FB) sujet {0:D3}" -f $num) -LogFile $logFile
+            $parsedBeforeNormalization = Parse-LlmJsonStrict -RawText $raw -Label ("Pass3E(FB) sujet {0:D3}" -f $num) -LogFile $logFile
+            $finalOne = $parsedBeforeNormalization
           }
           catch {
+            $pass3eError = ($pass3eError + " | fallback: " + $_.Exception.Message).Trim(" |".ToCharArray())
             $finalOne = $null
           }
         }
+        finally {
+          $swPass3E.Stop()
+        }
+
+        Write-Pass3EDebugText -AttemptDir $attemptDir -Name "raw_response.txt" -Text ([string]$raw)
+        Write-Pass3EDebugJson -AttemptDir $attemptDir -Name "parsed_before_normalization.json" -Obj ($(if ($parsedBeforeNormalization) { $parsedBeforeNormalization } else { [pscustomobject]@{} }))
+        Write-Pass3EDebugJson -AttemptDir $attemptDir -Name "meta.json" -Obj ([pscustomobject]@{ status=$(if ($finalOne) { "OK" } else { "LLM_OUTPUT_UNUSABLE" }); alias=$ModelPass3E; fallback_alias=$ModelPass3; fallback_used=$pass3eFallbackUsed; duration_ms=$swPass3E.ElapsedMilliseconds; error=$pass3eError; attempt_dir=$attemptDir })
 
         if (-not $finalOne) {
           $finalOne = [pscustomobject]@{
@@ -6583,10 +6721,10 @@ else {
             avis_participants = @()
             synthese_echanges = "Synthèse indisponible (échec LLM)."
             conclusion_expert = "Conclusion prudente : sortie LLM non exploitable ; à reprendre."
+            pass3e_status = "LLM_OUTPUT_UNUSABLE"
           }
         }
       }
-
       if (-not $finalOne) {
         $finalOne = [pscustomobject]@{}
       }
@@ -6694,6 +6832,20 @@ else {
       }   
 
 
+      if ($attemptDir) {
+        Write-Pass3EDebugJson -AttemptDir $attemptDir -Name "normalized.json" -Obj $finalOne
+        $hasAucun = $false
+        try { $hasAucun = (([string]$finalOne.synthese_echanges) -like "Aucun élément*") } catch {}
+        Write-Pass3EDebugJson -AttemptDir $attemptDir -Name "validation.json" -Obj ([pscustomobject]@{
+          status = $(if ($finalOne.PSObject.Properties['pass3e_status']) { [string]$finalOne.pass3e_status } else { "PASS3E_NORMALIZED" })
+          compact_status = [string]$compactDiagnostics.status
+          source_interventions = [int]$compactDiagnostics.source_interventions
+          semantic_non_empty_fields = [int]$compactDiagnostics.semantic_non_empty_fields
+          total_semantic_items = [int]$compactDiagnostics.total_semantic_items
+          synthese_aucun_element = [bool]$hasAucun
+          warning = $(if ($hasAucun -and [int]$compactDiagnostics.total_semantic_items -gt 0) { "Pass3E a produit Aucun élément malgré un compact Pass2E exploitable." } else { "" })
+        })
+      }
       # Puis seulement maintenant sérialiser
       $jsonOne = $finalOne | ConvertTo-Json -Depth 50
       [IO.File]::WriteAllText($outOne, $jsonOne, $utf8NoBom)
