@@ -7348,6 +7348,37 @@ if ($null -eq $partDObj.demandes_documents_globales) {
 }
 Ensure-List $partDObj "demandes_documents_globales"
 
+function Copy-ObjectWithOrigin {
+    param(
+        [Parameter(Mandatory=$true)] [object] $Obj,
+        [Parameter(Mandatory=$true)] [string] $Origin,
+        [switch] $ReplaceExistingOrigin
+    )
+
+    $copy = [ordered]@{}
+    $originSeen = $false
+    foreach ($prop in @($Obj.PSObject.Properties)) {
+        if ($prop.Name -ieq "origine") {
+            $originSeen = $true
+            if ($ReplaceExistingOrigin) {
+                $copy["origine"] = $Origin
+            }
+            else {
+                $copy[$prop.Name] = $prop.Value
+            }
+            continue
+        }
+        $copy[$prop.Name] = $prop.Value
+    }
+
+    if (-not $originSeen) {
+        $copy["origine"] = $Origin
+    }
+
+    return [pscustomobject]$copy
+}
+
+
 # (3) Rattachement des demandes (d’abord par numero, puis fallback texte)
 foreach ($s in $finalObj.sujets) {
   if (-not $s.PSObject.Properties['numero']) { continue }
@@ -7399,12 +7430,7 @@ foreach ($s in $finalObj.sujets) {
     }
 
     if ($matched) {
-      if ($doc.PSObject.Properties['origine']) {
-        $doc.origine = "reunion"
-        $new2 = $doc
-      } else {
-        $new2 = $doc | Select-Object *, @{ Name="origine"; Expression={ "reunion" } }
-      }
+      $new2 = Copy-ObjectWithOrigin -Obj $doc -Origin "reunion"
 
     
 
@@ -7458,7 +7484,7 @@ foreach ($s in $finalObj.sujets) {
                 $s | Add-Member -Force -NotePropertyName demandes_documents -NotePropertyValue @()
               }
 
-              $new = $d | Select-Object *, @{ Name="origine"; Expression={ "debrief_expert" } }
+              $new = Copy-ObjectWithOrigin -Obj $d -Origin "debrief_expert" -ReplaceExistingOrigin
 
               # dédup simple (clé JSON compressée)
               $kdoc = $null
