@@ -28,6 +28,8 @@ EXISTING_RUN=""
 EXPLICIT_OUT_DIR=""
 REPRISE_PASS2B=0
 REUSE_EXISTING_RUN=0
+RESUME_LATEST=0
+PLAN_ONLY=0
 DOCX_ONLY=0
 ALLOW_CRITICAL_QA=0
 MIRROR_PC="${CR_MIRROR_PC:-1}"
@@ -38,15 +40,30 @@ CR_MIRROR_PC_USER="${CR_MIRROR_PC_USER:-sshsync}"
 CR_MIRROR_PC_KEY="${CR_MIRROR_PC_KEY:-/volume1/home/nicolas/.ssh/id_ed25519}"
 CR_MIRROR_PC_RSYNC_PATH="${CR_MIRROR_PC_RSYNC_PATH:-C:\\msys64\\usr\\bin\\rsync.exe}"
 RENDER_URL="${CR_RENDER_URL:-http://192.168.1.20:8081/render?format=docx}"
-
+CURL_BIN="${CURL_BIN:-}"
+if [[ -z "$CURL_BIN" ]]; then
+  CURL_BIN="$(command -v curl || true)"
+fi
+if [[ -z "$CURL_BIN" && -x /usr/bin/curl ]]; then
+  CURL_BIN="/usr/bin/curl"
+fi
+RSYNC_BIN="${RSYNC_BIN:-}"
+if [[ -z "$RSYNC_BIN" ]]; then
+  RSYNC_BIN="$(command -v rsync || true)"
+fi
+if [[ -z "$RSYNC_BIN" && -x /usr/bin/rsync ]]; then
+  RSYNC_BIN="/usr/bin/rsync"
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift;;
+    --plan-only|--dry-run-dependencies) PLAN_ONLY=1; shift;;
     --force)   FORCE=1; shift;;
     --strict-sync) STRICT_SYNC=1; shift;;
     --no-force) FORCE=0; shift;;   # option explicite, utile en n8n
     --docx-only) DOCX_ONLY=1; shift;;
+    --resume-latest) RESUME_LATEST=1; shift;;
     --allow-critical-qa) ALLOW_CRITICAL_QA=1; shift;;
     --mirror-pc) MIRROR_PC=1; shift;;
     --no-mirror-pc) MIRROR_PC=0; shift;;
@@ -85,12 +102,12 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     -h|--help)
-      echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run] [--force|--no-force] [--docx-only] [--allow-critical-qa] [--no-mirror-pc|--mirror-pc] [--mirror-pc-dry-run] [--only-pass2b-batches \"9\"|\"7,9\"] [--only-subjects \"1,2,3\"] [--existing-run job_...] [--out-dir /chemin/run]"
+      echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run|--plan-only] [--force|--no-force] [--docx-only] [--resume-latest] [--allow-critical-qa] [--no-mirror-pc|--mirror-pc] [--mirror-pc-dry-run] [--only-pass2b-batches \"9\"|\"7,9\"] [--only-subjects \"1,2,3\"] [--existing-run job_...] [--out-dir /chemin/run]"
       exit 0
       ;;
     *)
       echo "Option inconnue: $1"
-      echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run] [--force|--no-force] [--docx-only] [--allow-critical-qa] [--no-mirror-pc|--mirror-pc] [--mirror-pc-dry-run] [--only-pass2b-batches \"9\"|\"7,9\"] [--only-subjects \"1,2,3\"] [--existing-run job_...] [--out-dir /chemin/run]"
+      echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run|--plan-only] [--force|--no-force] [--docx-only] [--resume-latest] [--allow-critical-qa] [--no-mirror-pc|--mirror-pc] [--mirror-pc-dry-run] [--only-pass2b-batches \"9\"|\"7,9\"] [--only-subjects \"1,2,3\"] [--existing-run job_...] [--out-dir /chemin/run]"
       echo "STRICT_SYNC : $([[ $STRICT_SYNC -eq 1 ]] && echo 'ON' || echo 'OFF')"
       exit 2
       ;;
@@ -98,7 +115,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$INFOS" ]]; then
-  echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run] [--force|--no-force] [--docx-only] [--allow-critical-qa] [--no-mirror-pc|--mirror-pc] [--mirror-pc-dry-run] [--only-pass2b-batches \"9\"|\"7,9\"] [--only-subjects \"1,2,3\"] [--existing-run job_...] [--out-dir /chemin/run]"
+  echo "Usage: $0 \"/chemin/vers/infos_projet.json\" [--dry-run|--plan-only] [--force|--no-force] [--docx-only] [--resume-latest] [--allow-critical-qa] [--no-mirror-pc|--mirror-pc] [--mirror-pc-dry-run] [--only-pass2b-batches \"9\"|\"7,9\"] [--only-subjects \"1,2,3\"] [--existing-run job_...] [--out-dir /chemin/run]"
   exit 2
 fi
 if [[ ! -f "$INFOS" ]]; then
@@ -136,6 +153,19 @@ if [[ $DOCX_ONLY -eq 1 && ( -n "$ONLY_PASS2B_BATCHES" || -n "$ONLY_SUBJECTS" ) ]
 fi
 if [[ -n "$ONLY_PASS2B_BATCHES" && -n "$ONLY_SUBJECTS" ]]; then
   echo "ERREUR: utilisez soit --only-pass2b-batches, soit --only-subjects, pas les deux."
+  exit 2
+fi
+
+resume_selector_count=0
+[[ -n "$EXISTING_RUN" ]] && ((resume_selector_count+=1))
+[[ -n "$EXPLICIT_OUT_DIR" ]] && ((resume_selector_count+=1))
+[[ $RESUME_LATEST -eq 1 ]] && ((resume_selector_count+=1))
+if (( resume_selector_count > 1 )); then
+  echo "ERREUR: utilisez un seul sélecteur de reprise parmi --existing-run, --out-dir et --resume-latest."
+  exit 2
+fi
+if [[ ( $DOCX_ONLY -eq 1 || ${#PASS2B_BATCHES_ARR[@]} -gt 0 || ${#ONLY_SUBJECTS_ARR[@]} -gt 0 ) && $resume_selector_count -eq 0 ]]; then
+  echo "ERREUR: ce mode de reprise exige --existing-run, --out-dir ou --resume-latest explicitement."
   exit 2
 fi
 
@@ -224,16 +254,19 @@ mirror_compte_rendu_livrables_to_pc() {
 
   if [[ "${MIRROR_PC:-0}" != "1" ]]; then
     echo "mirror_pc: disabled ($label)"
+    echo "docx_mirrored_to_pc: disabled label=$label"
     return 0
   fi
 
   if [[ -z "$host_source_dir" || ! -d "$host_source_dir" ]]; then
     echo "mirror_pc: skipped source_dir_missing label=$label source=$host_source_dir"
+    echo "docx_mirrored_to_pc: skipped source_dir_missing label=$label source=$host_source_dir"
     return 0
   fi
 
   if [[ "$affaire_id" == *"/"* || "$affaire_id" == *"\\"* || "$captation_id" == *"/"* || "$captation_id" == *"\\"* ]]; then
     echo "mirror_pc: failed invalid_id label=$label affaire=$affaire_id captation=$captation_id"
+    echo "docx_mirrored_to_pc: failed invalid_id label=$label affaire=$affaire_id captation=$captation_id"
     return 0
   fi
 
@@ -248,7 +281,7 @@ mirror_compte_rendu_livrables_to_pc() {
 
   set +e
   local output
-  output="$(rsync --old-args -avz --itemize-changes --partial --update "${dry_opts[@]}" \
+  output="$(${RSYNC_BIN:-rsync} --old-args -avz --itemize-changes --partial --update "${dry_opts[@]}" \
     --include='*/' \
     --include='*.docx' --include='*.DOCX' \
     --include='*.pdf' --include='*.PDF' \
@@ -271,11 +304,55 @@ mirror_compte_rendu_livrables_to_pc() {
 
   if [[ $mirror_rc -ne 0 ]]; then
     echo "mirror_pc: failed rc=$mirror_rc label=$label"
+    echo "docx_mirrored_to_pc: failed rc=$mirror_rc label=$label"
   else
     echo "mirror_pc: ok label=$label"
+    echo "docx_mirrored_to_pc: ok label=$label"
   fi
 
   return 0
+}
+
+publish_docx_to_canonical_dir() {
+  local source_docx="$1"
+  local canonical_dir="$2"
+  local target_docx=""
+  local tmp_docx=""
+  local backup_docx=""
+  local backup_ts=""
+
+  if [[ -z "$source_docx" || ! -s "$source_docx" ]]; then
+    echo "ERREUR: DOCX source absent ou vide pour publication canonique: $source_docx"
+    return 41
+  fi
+  if [[ -z "$canonical_dir" ]]; then
+    echo "ERREUR: dossier canonique DOCX vide"
+    return 42
+  fi
+
+  mkdir -p "$canonical_dir" || return $?
+  target_docx="${canonical_dir%/}/$(basename "$source_docx")"
+
+  if [[ -f "$target_docx" ]] && cmp -s "$source_docx" "$target_docx"; then
+    echo "docx_published_to_canonical_dir: already_published source=$source_docx target=$target_docx"
+    return 0
+  fi
+
+  if [[ -e "$target_docx" ]]; then
+    backup_ts="$(date +%Y%m%d_%H%M%S)"
+    backup_docx="${target_docx}.bak_${backup_ts}"
+    mv "$target_docx" "$backup_docx" || return $?
+    echo "docx_published_to_canonical_dir: backup_existing target=$target_docx backup=$backup_docx"
+  fi
+
+  tmp_docx="${target_docx}.tmp.$$"
+  if ! cp -f "$source_docx" "$tmp_docx"; then
+    rm -f "$tmp_docx"
+    return 43
+  fi
+  touch -r "$source_docx" "$tmp_docx" 2>/dev/null || true
+  mv -f "$tmp_docx" "$target_docx" || return $?
+  echo "docx_published_to_canonical_dir: ok source=$source_docx target=$target_docx"
 }
 uses_remote_llm() {
   local provider="${1,,}"
@@ -429,6 +506,21 @@ if hits:
 
 print(f"QA placeholders OK: DOCX {docx_path}")
 PY
+}
+
+update_dependency_delivery_state() {
+  local -a state_cmd=(docker exec cr-pipeline pwsh /pipeline/powershell/dependency_state_update.ps1
+    -CsvPath "$CSV_PATH" -OutDir "$OUT_DIR" -ContextJsonPath "$CTX_PATH"
+    -SujetsPath "$SUJETS_PATH" -ParticipantsPath "$PART_PATH"
+    -Provider "$PROVIDER" -ModelPass1 "$MODEL_P1" -ModelDebrief "$MODEL_DEBRIEF"
+    -ModelReport "$MODEL_REPORT" -ModelPass2E "$MODEL_P2E" -ModelPass3 "$MODEL_P3"
+    -ModelPass3E "$MODEL_P3E" -ModelPass3A "$MODEL_P3A" -ModelPass3B "$MODEL_P3B"
+    -ModelPass3C "$MODEL_P3C" -ModelPass3D "$MODEL_P3D" -Preset "$PRESET"
+    -PseudoJobId "$PSEUDO_JOB_ID" -RenderUrl "$RENDER_URL"
+  )
+  [[ -n "$CSV_DEBRIEF_PATH" ]] && state_cmd+=(-CsvDebriefPath "$CSV_DEBRIEF_PATH")
+  [[ $PSEUDONYMIZE_REMOTE -eq 1 ]] && state_cmd+=(-PseudonymizeRemote)
+  "${state_cmd[@]}"
 }
 
 prepare_docx_payload() {
@@ -629,41 +721,21 @@ elif [[ -n "$EXPLICIT_OUT_DIR" ]]; then
   OUT_DIR="$(to_container_path "$EXPLICIT_OUT_DIR")"
   RUN_JOB_ID="$(basename "$OUT_DIR")"
   REUSE_EXISTING_RUN=1
-elif [[ $DOCX_ONLY -eq 1 ]]; then
-  OUT_DIR="$(docker exec cr-pipeline sh -lc "ls -1td \"$OUT_ROOT\"/out/job_* 2>/dev/null | while IFS= read -r d; do if [ -s \"\$d/global_final.json\" ]; then echo \"\$d\"; break; fi; done")"
+elif [[ $RESUME_LATEST -eq 1 ]]; then
+  if [[ $DOCX_ONLY -eq 1 ]]; then
+    latest_predicate='[ -s "$d/global_final.json" ]'
+  elif [[ ${#PASS2B_BATCHES_ARR[@]} -gt 0 ]]; then
+    latest_predicate='[ -d "$d/segments" ] && [ -d "$d/pass2B_batches" ] && [ -f "$d/global.json" ]'
+  else
+    latest_predicate='[ -d "$d/segments" ] || [ -f "$d/global.json" ]'
+  fi
+  OUT_DIR="$(docker exec cr-pipeline sh -lc "ls -1td \"$OUT_ROOT\"/out/job_* 2>/dev/null | while IFS= read -r d; do if $latest_predicate; then echo \"\$d\"; break; fi; done")"
   if [[ -z "$OUT_DIR" ]]; then
     echo "ERREUR: aucun run existant exploitable trouvé dans ${OUT_ROOT}/out/job_*"
-    echo "Attendu: global_final.json non vide"
     exit 2
   fi
   RUN_JOB_ID="$(basename "$OUT_DIR")"
   REUSE_EXISTING_RUN=1
-elif [[ ${#PASS2B_BATCHES_ARR[@]} -gt 0 ]]; then
-  REPRISE_PASS2B=1
-  OUT_DIR="$(docker exec cr-pipeline sh -lc "ls -1td \"$OUT_ROOT\"/out/job_* 2>/dev/null | while IFS= read -r d; do if [ -d \"\$d/segments\" ] && [ -d \"\$d/pass2B_batches\" ] && [ -f \"\$d/global.json\" ]; then echo \"\$d\"; break; fi; done")"
-  if [[ -z "$OUT_DIR" ]]; then
-    echo "ERREUR: aucun run existant exploitable trouvé dans ${OUT_ROOT}/out/job_*"
-    echo "Attendu: segments/, pass2B_batches/ et global.json"
-    exit 2
-  fi
-  RUN_JOB_ID="$(basename "$OUT_DIR")"
-  REUSE_EXISTING_RUN=1
-elif [[ ${#ONLY_SUBJECTS_ARR[@]} -gt 0 ]]; then
-  OUT_DIR="$(docker exec cr-pipeline sh -lc "ls -1td \"$OUT_ROOT\"/out/job_* 2>/dev/null | while IFS= read -r d; do if [ -d \"\$d/segments\" ] && [ -f \"\$d/global.json\" ]; then echo \"\$d\"; break; fi; done")"
-  if [[ -z "$OUT_DIR" ]]; then
-    echo "ERREUR: aucun run existant exploitable trouvé dans ${OUT_ROOT}/out/job_*"
-    echo "Attendu: segments/ et global.json"
-    exit 2
-  fi
-  RUN_JOB_ID="$(basename "$OUT_DIR")"
-  REUSE_EXISTING_RUN=1
-elif [[ $FORCE -eq 0 ]]; then
-  EXISTING_OUT_DIR="$(docker exec cr-pipeline sh -lc "ls -1td \"$OUT_ROOT\"/out/job_* 2>/dev/null | while IFS= read -r d; do if [ -f \"\$d/global.json\" ] || [ -d \"\$d/segments\" ]; then echo \"\$d\"; break; fi; done")"
-  if [[ -n "$EXISTING_OUT_DIR" ]]; then
-    OUT_DIR="$EXISTING_OUT_DIR"
-    RUN_JOB_ID="$(basename "$OUT_DIR")"
-    REUSE_EXISTING_RUN=1
-  fi
 fi
 
 if [[ $REUSE_EXISTING_RUN -eq 1 ]]; then
@@ -677,7 +749,7 @@ if [[ $REUSE_EXISTING_RUN -eq 1 ]]; then
     RESUME_RUN_MSG="Reprise sur run existant : $OUT_DIR"
   fi
 else
-  RESUME_RUN_MSG="Nouveau run créé : $OUT_DIR (force=$FORCE ou aucun run existant)"
+  RESUME_RUN_MSG="Nouveau run créé : $OUT_DIR (aucune reprise explicite)"
 fi
 if [[ "$OUT_DIR" != /data/Affaires/* ]]; then
   echo "ERREUR: OUT_DIR doit pointer dans /data/Affaires: $OUT_DIR"
@@ -781,6 +853,41 @@ if [[ -n "$CSV_DEBRIEF_PATH" ]]; then
 fi
 docker exec cr-pipeline sh -lc "test -f \"$SUJETS_PATH\" || (echo 'KO: Sujets.xlsx introuvable (obligatoire)' && exit 2)"
 docker exec cr-pipeline sh -lc "test -f \"$PART_PATH\"   || (echo 'KO: Participants.xlsx introuvable (obligatoire)' && exit 2)"
+
+# Le plan de dépendances doit rester strictement en lecture seule.
+if [[ $PLAN_ONLY -eq 1 ]]; then
+  plan_cmd=(docker exec cr-pipeline pwsh /pipeline/powershell/cr_reunion_point_mumerotes_pipeline_json.ps1
+    -CsvPath "$CSV_PATH"
+    -OutDir "$OUT_DIR"
+    -ContextJsonPath "$CTX_PATH"
+    -SujetsPath "$SUJETS_PATH"
+    -ParticipantsPath "$PART_PATH"
+    -Provider "$PROVIDER"
+    -ModelPass1 "$MODEL_P1"
+    -ModelPass2 "$MODEL_P2"
+    -ModelReport "$MODEL_REPORT"
+    -ModelDebrief "$MODEL_DEBRIEF"
+    -ModelPass2E "$MODEL_P2E"
+    -ModelPass3 "$MODEL_P3"
+    -ModelPass3E "$MODEL_P3E"
+    -ModelPass3A "$MODEL_P3A"
+    -ModelPass3B "$MODEL_P3B"
+    -ModelPass3C "$MODEL_P3C"
+    -ModelPass3D "$MODEL_P3D"
+    -Preset "$PRESET"
+    -PlanOnly
+  )
+  if [[ -n "$CSV_DEBRIEF_PATH" ]]; then
+    plan_cmd+=(-CsvDebriefPath "$CSV_DEBRIEF_PATH")
+  fi
+  if [[ $PSEUDONYMIZE_REMOTE -eq 1 ]]; then
+    plan_cmd+=(-PseudonymizeRemote -PseudoJobId "$PSEUDO_JOB_ID")
+  fi
+  echo "=== Plan de dépendances (aucun appel LLM, aucune écriture) ==="
+  print_sanitized_command "${plan_cmd[@]}"
+  "${plan_cmd[@]}"
+  exit $?
+fi
 
 # Créer OutDir + dossier logs
 if [[ $DOCX_ONLY -eq 1 && ${#PASS2B_BATCHES_ARR[@]} -eq 0 ]]; then
@@ -904,6 +1011,7 @@ if [[ $DOCX_ONLY -eq 1 && ${#PASS2B_BATCHES_ARR[@]} -eq 0 ]]; then
   HOST_OUT_JSON="${HOST_OUT_DIR}/global_final.json"
   DOCX_TS="$(date +%Y%m%d_%H%M%S)"
   HOST_DOCX_OUT="${HOST_OUT_DIR}/compte_rendu_${AFFAIRE_ID}_${CAPTATION_ID}_V_${DOCX_TS}.docx"
+  HOST_OUT_ROOT="/volume1/Affaires${OUT_ROOT#/data/Affaires}"
 
   echo "=== Mode DOCX uniquement ==="
   echo "Run output    : $HOST_OUT_DIR"
@@ -927,9 +1035,12 @@ if [[ $DOCX_ONLY -eq 1 && ${#PASS2B_BATCHES_ARR[@]} -eq 0 ]]; then
 
   echo "=== Commande DOCX ==="
   echo "curl -fsS -X POST \"$RENDER_URL\" -H \"Content-Type: application/json\" --data-binary \"@${PREPARED_DOCX_PAYLOAD}\" -o \"$HOST_DOCX_OUT\""
-  curl -fsS -X POST "$RENDER_URL" -H "Content-Type: application/json" --data-binary "@${PREPARED_DOCX_PAYLOAD}" -o "$HOST_DOCX_OUT"
+  "$CURL_BIN" -fsS -X POST "$RENDER_URL" -H "Content-Type: application/json" --data-binary "@${PREPARED_DOCX_PAYLOAD}" -o "$HOST_DOCX_OUT"
   scan_docx_placeholders "$HOST_DOCX_OUT"
-  mirror_compte_rendu_livrables_to_pc "$HOST_OUT_DIR" "$AFFAIRE_ID" "$CAPTATION_ID" "docx-only"
+  echo "docx_generated_in_job_dir: $HOST_DOCX_OUT"
+  update_dependency_delivery_state
+  publish_docx_to_canonical_dir "$HOST_DOCX_OUT" "$HOST_OUT_ROOT"
+  mirror_compte_rendu_livrables_to_pc "$HOST_OUT_ROOT" "$AFFAIRE_ID" "$CAPTATION_ID" "docx-only"
   echo "=== FIN (exit=0): $(date -Is) ==="
   exit 0
 fi
@@ -1151,13 +1262,6 @@ set -e
 # ----------------------------
 HOST_OUT_DIR="/volume1/Affaires${OUT_DIR#/data/Affaires}"
 
-# 1) Normaliser les mtimes (pour éviter les inversions de sens côté rsync)
-#    Attention: on parenthèse bien les -o avec find
-if [[ -d "$HOST_OUT_DIR" ]]; then
-  find "$HOST_OUT_DIR" -type f \( -name "*.csv" -o -name "*.json" -o -name "*.docx" \) -print0 \
-    | xargs -0 -I{} touch -m "{}"
-fi
-
 echo "=== Generation DOCX final ==="
 HOST_OUT_JSON="${HOST_OUT_DIR}/global_final.json"
 DOCX_TS="$(date +%Y%m%d_%H%M%S)"
@@ -1171,9 +1275,15 @@ else
   PREPARED_DOCX_PAYLOAD=""
   if prepare_docx_payload "$HOST_OUT_DIR" "$HOST_OUT_JSON"; then
     echo "curl -fsS -X POST \"$RENDER_URL\" -H \"Content-Type: application/json\" --data-binary \"@${PREPARED_DOCX_PAYLOAD}\" -o \"$HOST_DOCX_OUT\""
-    if curl -fsS -X POST "$RENDER_URL" -H "Content-Type: application/json" --data-binary "@${PREPARED_DOCX_PAYLOAD}" -o "$HOST_DOCX_OUT"; then
+    if "$CURL_BIN" -fsS -X POST "$RENDER_URL" -H "Content-Type: application/json" --data-binary "@${PREPARED_DOCX_PAYLOAD}" -o "$HOST_DOCX_OUT"; then
       if scan_docx_placeholders "$HOST_DOCX_OUT"; then
-        mirror_compte_rendu_livrables_to_pc "$HOST_OUT_DIR" "$AFFAIRE_ID" "$CAPTATION_ID" "pipeline-final"
+        echo "docx_generated_in_job_dir: $HOST_DOCX_OUT"
+        update_dependency_delivery_state
+        if publish_docx_to_canonical_dir "$HOST_DOCX_OUT" "$HOST_OUT_ROOT"; then
+          mirror_compte_rendu_livrables_to_pc "$HOST_OUT_ROOT" "$AFFAIRE_ID" "$CAPTATION_ID" "pipeline-final"
+        else
+          rc=$?
+        fi
       else
         rc=$?
       fi
