@@ -10,6 +10,12 @@ from pathlib import Path
 
 import requests
 
+PIPELINE_PYTHON_DIR = Path(__file__).resolve().parents[1] / "cr-pipeline" / "pipeline" / "python"
+if str(PIPELINE_PYTHON_DIR) not in os.sys.path:
+    os.sys.path.insert(0, str(PIPELINE_PYTHON_DIR))
+
+from context_resolution import resolve_compte_rendu_context
+
 DEFAULT_RENDER_URL = "http://192.168.1.20:8081/render?format=docx"
 DEFAULT_CONTAINER = "cr-pipeline"
 DEFAULT_PIPELINE_SCRIPT = "/pipeline/powershell/cr_reunion_point_mumerotes_pipeline_json.ps1"
@@ -458,24 +464,15 @@ def resolve_csv_path(infos: dict, infos_path: Path, override: str) -> Path:
 
 
 def resolve_context_path(infos: dict, infos_path: Path, csv_path: Path, override: str) -> Path:
-    candidates: list[Path] = []
     if override:
-        candidates.append(resolve_path_like(override, base_dir=infos_path.parent))
-    for raw in (
-        infos.get("fichier_contexte_general"),
-        (infos.get("pcfixe") or {}).get("fichier_contexte_general"),
-    ):
-        if raw:
-            candidates.append(resolve_path_like(str(raw), base_dir=infos_path.parent))
-
-    csv_dir = csv_path.parent
-    candidates.append(csv_dir / "contexte_general_compte_rendu.json")
-    candidates.append(csv_dir / "contexte_general.json")
-
-    context_path = choose_first_existing(candidates)
-    if not context_path:
-        raise FileNotFoundError("Contexte JSON introuvable (override, infos_projet.json ou dossier du CSV).")
-    return context_path
+        print("--context est ignoré: résolution canonique contexte_general_compte_rendu.json -> contexte_general.json -> infos_projet.json.")
+    resolved = resolve_compte_rendu_context(
+        infos_path=infos_path,
+        csv_path=csv_path,
+        materialize_dir=csv_path.parent,
+    )
+    print(f"Contexte compte-rendu retenu: {resolved.source} -> {resolved.path}")
+    return resolved.path
 
 
 def resolve_excel_path(infos: dict, infos_path: Path, csv_path: Path, override: str, keys: tuple[str, ...], fallback_name: str) -> Path:

@@ -646,9 +646,23 @@ fi
 SUJETS_PATH="${CSV_DIR}/Sujets.xlsx"
 PART_PATH="${CSV_DIR}/Participants.xlsx"
 
-# Contexte (priorité stricte, à côté du CSV)
-CTX_CR="${CSV_DIR}/contexte_general_compte_rendu.json"
-CTX_FALLBACK="${CSV_DIR}/contexte_general.json"
+# Contexte (priorite stricte et validation JSON dans le conteneur)
+INFOS_CONTAINER="$(to_container_path "$INFOS")"
+CTX_RESOLUTION="$(
+  docker exec cr-pipeline python3 /pipeline/python/context_resolution.py \
+    --infos "$INFOS_CONTAINER" \
+    --csv "$CSV_PATH" \
+    --materialize-dir "$CSV_DIR" \
+    --shell
+)"
+CTX_PATH="$(printf '%s\n' "$CTX_RESOLUTION" | sed -n 's/^context_path=//p')"
+CTX_SOURCE="$(printf '%s\n' "$CTX_RESOLUTION" | sed -n 's/^context_source=//p')"
+CTX_REASON="$(printf '%s\n' "$CTX_RESOLUTION" | sed -n 's/^context_reason=//p')"
+if [[ -z "$CTX_PATH" ]]; then
+  echo "ERREUR: resolution du contexte compte-rendu vide."
+  echo "$CTX_RESOLUTION"
+  exit 2
+fi
 
 
 # OutDir : 
@@ -757,17 +771,9 @@ if [[ "$OUT_DIR" != /data/Affaires/* ]]; then
 fi
 
 
-# Résolution du contexte via tests dans le conteneur
-if docker exec cr-pipeline sh -lc "test -f \"$CTX_CR\""; then
-  CTX_PATH="$CTX_CR"
-elif docker exec cr-pipeline sh -lc "test -f \"$CTX_FALLBACK\""; then
-  CTX_PATH="$CTX_FALLBACK"
-else
-  echo "KO: aucun contexte général trouvé."
-  echo "  Attendus (dans $CSV_DIR) :"
-  echo "   - contexte_general_compte_rendu.json (prioritaire)"
-  echo "   - contexte_general.json (fallback)"
-  exit 2
+echo "Contexte compte-rendu retenu: $CTX_SOURCE -> $CTX_PATH"
+if [[ -n "$CTX_REASON" && "$CTX_REASON" != "valid" ]]; then
+  echo "Détail résolution contexte: $CTX_REASON"
 fi
 
 # ----------------------------
