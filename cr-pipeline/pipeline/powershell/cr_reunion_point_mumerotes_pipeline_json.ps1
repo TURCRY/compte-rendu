@@ -74,11 +74,45 @@ param(
   [int[]] $OnlySubjects = @(),
   [string] $OnlySubjectsCsv = "",
   [switch] $RunInternalSelfTests,
+  [switch] $PlanOnly,
   [int] $MaxSegmentSeconds = 600,
   [int] $MaxAsrGapSeconds = 120,
   [switch] $Force
 
 )
+$dependencyPlanModule = Join-Path $PSScriptRoot "dependency_plan.psm1"
+if (-not (Test-Path -LiteralPath $dependencyPlanModule)) { throw "Module de dépendances introuvable: $dependencyPlanModule" }
+Import-Module $dependencyPlanModule -Force
+$PipelineVersion = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+$DependencyParameters = @{
+  pipeline_schema = "dependency-state-v1"
+  provider = $Provider
+  model_pass1 = $ModelPass1
+  model_debrief = $ModelDebrief
+  model_report = $ModelReport
+  model_pass2e = $ModelPass2E
+  model_pass3 = $ModelPass3
+  model_pass3e = $ModelPass3E
+  model_pass3a = $ModelPass3A
+  model_pass3b = $ModelPass3B
+  model_pass3c = $ModelPass3C
+  model_pass3d = $ModelPass3D
+  preset = $Preset
+  pass2_batch_size = $Pass2BatchSize
+  pass2b_prompt_chars_limit = $Pass2BPromptCharsLimit
+  pass2b_estimated_tokens_limit = $Pass2BEstimatedTokensLimit
+  max_segment_seconds = $MaxSegmentSeconds
+  max_asr_gap_seconds = $MaxAsrGapSeconds
+  pseudonymize_remote = [bool]$PseudonymizeRemote
+  pseudo_job_id = $PseudoJobId
+}
+$DependencyPlan = @(Get-CrDependencyPlan -CsvPath $CsvPath -OutDir $OutDir -CsvDebriefPath $CsvDebriefPath -ContextJsonPath $ContextJsonPath -SujetsPath $SujetsPath -ParticipantsPath $ParticipantsPath -PipelineVersion $PipelineVersion -Parameters $DependencyParameters)
+if ($PlanOnly) {
+  Write-CrDependencyPlan -Plan $DependencyPlan
+  return
+}
+$DependencyPlanByName = @{}
+foreach($dependencyDecision in $DependencyPlan){$DependencyPlanByName[[string]$dependencyDecision.name]=$dependencyDecision}
 [int[]] $OnlySubjectsEffective = @()
 if (-not [string]::IsNullOrWhiteSpace($OnlySubjectsCsv)) {
   $OnlySubjectsEffective = @(
@@ -814,12 +848,33 @@ function Update-ContexteGeneralFromCsv {
     $ctx | Add-Member -Force NoteProperty meta ([pscustomobject]@{})
   }
 
+  $resolvedCsvPath = ((Resolve-Path $CsvPath).Path)
+  $contextIsCurrent = (
+    $ctx.meta.PSObject.Properties['duree_reunion_seconds'] -and [int]$ctx.meta.duree_reunion_seconds -eq $durationSec -and
+    $ctx.meta.PSObject.Properties['duree_reunion_hms'] -and [string]$ctx.meta.duree_reunion_hms -eq (Convert-SecondsToHms $durationSec) -and
+    $ctx.meta.PSObject.Properties['csv_time_min_seconds'] -and [int]$ctx.meta.csv_time_min_seconds -eq [int][math]::Floor($minStart) -and
+    $ctx.meta.PSObject.Properties['csv_time_max_seconds'] -and [int]$ctx.meta.csv_time_max_seconds -eq $maxSecInt -and
+    $ctx.meta.PSObject.Properties['csv_path'] -and [string]$ctx.meta.csv_path -eq $resolvedCsvPath -and
+    $ctx.PSObject.Properties['duree_reunion_estimee_sec'] -and [int]$ctx.duree_reunion_estimee_sec -eq $durationSec -and
+    $ctx.PSObject.Properties['csv_max_end_sec'] -and [int]$ctx.csv_max_end_sec -eq $maxSecInt
+  )
+  if ($contextIsCurrent) {
+    Microsoft.PowerShell.Utility\Write-Host ("Contexte déjà à jour, mtime conservé : {0}" -f $ContexteJsonPath)
+    return [pscustomobject]@{
+      durationSec = $durationSec
+      durationHms = (Convert-SecondsToHms $durationSec)
+      minStartSec = [int][math]::Floor($minStart)
+      maxSec = $maxSecInt
+      wrote = $null
+    }
+  }
+
   # Écriture propre dans meta
   $ctx.meta | Add-Member -Force NoteProperty duree_reunion_seconds  $durationSec
   $ctx.meta | Add-Member -Force NoteProperty duree_reunion_hms      (Convert-SecondsToHms $durationSec)
   $ctx.meta | Add-Member -Force NoteProperty csv_time_min_seconds   ([int][math]::Floor($minStart))
   $ctx.meta | Add-Member -Force NoteProperty csv_time_max_seconds   $maxSecInt
-  $ctx.meta | Add-Member -Force NoteProperty csv_path               ((Resolve-Path $CsvPath).Path)
+  $ctx.meta | Add-Member -Force NoteProperty csv_path               $resolvedCsvPath
   $ctx.meta | Add-Member -Force NoteProperty source_duree           "csv"
   $ctx.meta | Add-Member -Force NoteProperty updated_at             ((Get-Date).ToString("yyyy-MM-ddTHH:mm:ssK"))
 
@@ -3990,8 +4045,8 @@ for($i=0; $i -lt $segments.Count; $i++){
     $rowStart = [int]$seg[0].__row_index
     $rowEnd = [int]$seg[-1].__row_index
 
-    if((Test-Path $segOut) -and (-not $Force)){
-        Microsoft.PowerShell.Utility\Write-Host "Skip segment $($i+1) (existe) → $segOut"
+    if((-not $Force) -and $DependencyPlanByName["Pass1 segments"].action -eq "REUSE"){
+        Microsoft.PowerShell.Utility\Write-Host "Skip segment $($i+1) (manifest SHA256 conforme) → $segOut"
         $segmentJsonPaths.Add($segOut)
         continue
     }
@@ -5526,6 +5581,9 @@ else {
     $selectedForPass2BRebuild = ($RebuildPass2BOnly -or ($hasOnlyPass2B -and $onlyPass2BSet.ContainsKey($batchIndex)))
 
     if ($hasOnlyPass2B -and (-not $selectedForPass2BRebuild)) {
+      if ($DependencyPlanByName["Pass2B"].action -ne "REUSE") {
+        throw "Pass2B: impossible de conserver un batch hors cible sans manifest SHA256 conforme. Relancer un run complet."
+      }
       Microsoft.PowerShell.Utility\Write-Host "Pass2B: skip batch $batchIndex (hors reprise ciblée) → $batchOut"
       if (Test-Path $batchOut) {
         $batchPaths.Add($batchOut) | Out-Null
@@ -5536,8 +5594,8 @@ else {
       continue
     }
 
-    if ((Test-Path $batchOut) -and (-not $Force) -and (-not $selectedForPass2BRebuild)) {
-      Microsoft.PowerShell.Utility\Write-Host "Pass2B: skip batch $batchIndex (existe) → $batchOut"
+    if ((-not $Force) -and (-not $selectedForPass2BRebuild) -and $DependencyPlanByName["Pass2B"].action -eq "REUSE") {
+      Microsoft.PowerShell.Utility\Write-Host "Pass2B: skip batch $batchIndex (manifest SHA256 conforme) → $batchOut"
       $existingSegments = @($segmentObjs[$from..$to] | ForEach-Object {
         if ($_ -and $_.PSObject.Properties['segment_id']) { [string]$_.segment_id } else { "" }
       } | Where-Object { $_ })
@@ -6571,8 +6629,8 @@ else {
       $selectedForSubjectRebuild = ($HasOnlySubjects -and $onlySubjectsSet.ContainsKey($num))
       $outOne = Join-Path $pass3EDir ("sujet_{0:D3}_synthese.json" -f $num)
 
-      if ((Test-Path $outOne) -and (-not $Force) -and (-not $RebuildFromPass2B) -and (-not $selectedForSubjectRebuild)) {
-        Microsoft.PowerShell.Utility\Write-Host ("Pass3E: skip sujet {0:D3} (existe) → {1}" -f $num, $outOne)
+      if ((-not $Force) -and (-not $RebuildFromPass2B) -and (-not $selectedForSubjectRebuild) -and $DependencyPlanByName["Pass3E"].action -eq "REUSE") {
+        Microsoft.PowerShell.Utility\Write-Host ("Pass3E: skip sujet {0:D3} (manifest SHA256 conforme) → {1}" -f $num, $outOne)
         try {
           $o = (Get-Content $outOne -Raw) | ConvertFrom-Json -Depth 50
           if ($o) { $pass3eResults.Add($o) | Out-Null }
@@ -7578,6 +7636,12 @@ if (@($CriticalQaWarnings).Count -gt 0) {
   Microsoft.PowerShell.Utility\Write-Host "QA pipeline OK -> $pipelineQaPath"
 }
 
+if (-not $HasOnlyPass2BBatches -and -not $HasOnlySubjects) {
+  $dependencyStatePath = Write-CrDependencyState -CsvPath $CsvPath -OutDir $OutDir -CsvDebriefPath $CsvDebriefPath -ContextJsonPath $ContextJsonPath -SujetsPath $SujetsPath -ParticipantsPath $ParticipantsPath -PipelineVersion $PipelineVersion -Parameters $DependencyParameters -ExcludePasses @("JSON depseudonymized","DOCX")
+  Microsoft.PowerShell.Utility\Write-Host "État des dépendances SHA256 → $dependencyStatePath"
+} else {
+  Microsoft.PowerShell.Utility\Write-Host "État des dépendances non réécrit après reprise ciblée."
+}
+
 "Done: $(Get-Date)" | Add-Content $logFile
 Microsoft.PowerShell.Utility\Write-Host "Pipeline terminé (full JSON)."
-
