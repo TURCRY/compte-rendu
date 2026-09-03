@@ -2980,6 +2980,9 @@ Paragraphes (obligatoire) :
 - Interdit : utiliser \n seul.
 - Interdit : utiliser des listes à puces ou numérotées dans "resume" (pas de -, pas de •, pas de 1)).
 - Le champ "resume" doit contenir exactement 5 paragraphes séparés par \n\n : 1) cadrage, 2) position dans l’expertise (sans date), 3) objectifs, 4) constats/points évoqués, 5) suites envisagées.
+- Interdiction absolue d’étiqueter les paragraphes : ne créer aucune nouvelle étiquette, aucun préfixe, aucune référence et aucun identifiant de type "Pxxx", "ENTxxx" ou équivalent (ex. interdit : "P131 : suites envisagées : ...").
+- Les paragraphes sont délimités uniquement par la séquence \n\n : aucun en-tête, aucun numéro, aucun code d’identification ne doit les introduire.
+- Les pseudonymes déjà présents dans les données sources (par exemple "P12") peuvent être repris s’ils sont nécessaires au récit, mais il est interdit d’en inventer de nouveaux ou d’en déduire par continuité numérique.
 
 Contraintes de sortie :
 - Aucune phrase hors JSON.

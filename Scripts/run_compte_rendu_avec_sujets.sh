@@ -423,89 +423,13 @@ scan_placeholder_file() {
   local payload_file="$1"
   local label="$2"
 
-  python3 - "$payload_file" "$label" "${CR_PLACEHOLDER_ALLOWLIST:-}" <<'PY'
-import re
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-label = sys.argv[2]
-allowlist = {item.strip().upper().replace(" ", "") for item in sys.argv[3].split(",") if item.strip()}
-pattern = re.compile(r"(?i)\b(?:P\s*\d+|ENT\s*\d+)\b")
-
-text = path.read_text(encoding="utf-8-sig", errors="replace")
-hits = []
-for match in pattern.finditer(text):
-    token = match.group(0).upper().replace(" ", "")
-    if token in allowlist:
-        continue
-    start = max(0, match.start() - 70)
-    end = min(len(text), match.end() + 70)
-    context = text[start:end].replace("\n", " ")
-    hits.append((match.group(0), context))
-
-if hits:
-    print(f"ERREUR: placeholders résiduels dans {label}: {path}")
-    for token, context in hits[:40]:
-        print(f"- {token}: {context}")
-    if len(hits) > 40:
-        print(f"... {len(hits) - 40} occurrence(s) supplémentaire(s)")
-    raise SystemExit(32)
-
-print(f"QA placeholders OK: {label}")
-PY
+  python3 "$SCRIPT_DIR/placeholder_scan.py" json "$payload_file" "$label" "${CR_PLACEHOLDER_ALLOWLIST:-}"
 }
 
 scan_docx_placeholders() {
   local docx_file="$1"
 
-  python3 - "$docx_file" "${CR_PLACEHOLDER_ALLOWLIST:-}" <<'PY'
-import re
-import sys
-import zipfile
-import xml.etree.ElementTree as ET
-from pathlib import Path
-
-docx_path = Path(sys.argv[1])
-allowlist = {item.strip().upper().replace(" ", "") for item in sys.argv[2].split(",") if item.strip()}
-pattern = re.compile(r"(?i)\b(?:P\s*\d+|ENT\s*\d+)\b")
-ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-hits = []
-
-with zipfile.ZipFile(docx_path) as archive:
-    names = [
-        name for name in archive.namelist()
-        if name.startswith("word/")
-        and name.endswith(".xml")
-        and ("document.xml" in name or "header" in name or "footer" in name)
-    ]
-    for name in names:
-        try:
-            root = ET.fromstring(archive.read(name))
-        except Exception:
-            continue
-        for idx, paragraph in enumerate(root.findall(".//w:p", ns), 1):
-            text = "".join(node.text or "" for node in paragraph.findall(".//w:t", ns))
-            if not text:
-                continue
-            for match in pattern.finditer(text):
-                token = match.group(0).upper().replace(" ", "")
-                if token in allowlist:
-                    continue
-                start = max(0, match.start() - 70)
-                end = min(len(text), match.end() + 70)
-                hits.append((name, idx, match.group(0), text[start:end]))
-
-if hits:
-    print(f"ERREUR: placeholders résiduels dans le DOCX: {docx_path}")
-    for part, idx, token, context in hits[:40]:
-        print(f"- {part} paragraphe {idx}, {token}: {context}")
-    if len(hits) > 40:
-        print(f"... {len(hits) - 40} occurrence(s) supplémentaire(s)")
-    raise SystemExit(33)
-
-print(f"QA placeholders OK: DOCX {docx_path}")
-PY
+  python3 "$SCRIPT_DIR/placeholder_scan.py" docx "$docx_file" "${CR_PLACEHOLDER_ALLOWLIST:-}"
 }
 
 update_dependency_delivery_state() {
