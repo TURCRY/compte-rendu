@@ -15,6 +15,7 @@ cr-pipeline/data/**/segments/
 # environnement
 .env
 .env.*
+*.env
 
 ~$*.docx
 ~$*.dotx
@@ -66,3 +67,13 @@ temp/
 **/*_input.txt
 **/*_input_effective.txt
 **/*.source.txt
+
+
+# Sauvegardes manuelles
+*.bak_*
+*.bak
+
+# Documents opérationnels locaux non versionnés
+local/
+*.local.txt
+*.local.md
