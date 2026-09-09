@@ -18,3 +18,29 @@ tail -f /volume1/Affaires/2025-J37/AF_Expert_ASR/transcriptions/accedit-2025-09-
 
 
 Si l’exécution réelle plante, collez simplement la fin du log (tail -n 80 …) et on corrigera précisément (sans relancer tout le pipeline inutilement).
+
+
+cd /volume1/home/nicolas/Docker/compte-rendu/Scripts
+
+./run_compte_rendu_avec_sujets.sh \
+  "/volume1/Affaires/2025-J46/AF_Expert_ASR/transcriptions/accedit-2025-11-06/infos_projet.json" \
+  --docx-only
+
+Reprise sur run existant : ...
+
+./run_compte_rendu_avec_sujets.sh \
+  "/volume1/Affaires/2025-J38/AF_Expert_ASR/transcriptions/accedit-2025-07-03/infos_projet.json"
+
+Et pour un recalcul complet :
+
+./run_compte_rendu_avec_sujets.sh \
+  "/volume1/Affaires/2025-J37/AF_Expert_ASR/transcriptions/accedit-2025-09-02/infos_projet.json" \
+  --force
+
+Vous pouvez donc générer le DOCX seul :
+
+./run_compte_rendu_avec_sujets.sh \
+  "/volume1/Affaires/2025-J38/AF_Expert_ASR/transcriptions/accedit-2025-07-03/infos_projet.json" \
+  --docx-only \
+  --existing-run job_20260429_105314_404634387_21158
+
