@@ -98,7 +98,7 @@ param(
   [string] $TestPass3CRawPath = "",
   [switch] $TestPass3RefereErrorCounters,
   # REFERE-E2E-2 : mode de production unique (aucun autre switch de passe active).
-  # -RunReferePipeline          : chaine complete Pass2F + Pass2B_2F 36 batches + 6G + 3A-D + 3E + DOCX.
+  # -RunReferePipeline          : chaine complete Pass2F + Pass2B_2F batches dynamiques + 6G + 3A-D + 3E + DOCX.
   # -RunReferePipelinePlanOnly  : meme resolution, budgets et artefacts de plan, AUCUN appel LLM/HTTP.
   [switch] $RunReferePipeline,
   [switch] $RunReferePipelinePlanOnly,
@@ -133,6 +133,7 @@ $script:AdapterAlias   = 'pass2f_local'
 $script:LlmTimeoutSec  = 900
 $script:LastHttpStatus = 0
 $script:RefereE2E2OrchestratorLoaded = $false
+$script:RefereProgress = $null
 
 # LOT 2F-6C2C : -ExecuteLlm autorise UNIQUEMENT en mode controle (<=3 appels logiques,
 # chunks imposes via -ChunkSelect 'sujet:chunk'). Aucun changement du mode DryRun 2F-6C2B.
@@ -676,19 +677,142 @@ function Resolve-ReferePreventifPaths {
   return $paths
 }
 
+function Get-CrLeafName {
+  <#
+    Basename portable Windows/Linux.
+    Ne pas utiliser [System.IO.Path]::GetFileName() sur une chaine UNC Windows
+    executee sous Linux : sur Linux '\' n'est pas un separateur et GetFileName
+    renverrait le chemin complet (bug confirme dans le conteneur cr-pipeline).
+  #>
+  param([string] $Value)
+  $s = [string]$Value
+  if (-not $s) { return '' }
+  $s = $s.Trim().Trim('"')
+  $s = $s -replace '\\', '/'
+  $s = $s.TrimEnd('/')
+  $i = $s.LastIndexOf('/')
+  if ($i -ge 0) { $s = $s.Substring($i + 1) }
+  return $s
+}
+
+function ConvertTo-ContainerAsrPath {
+  <#
+    Windows/UNC -> chemin conteneur. Meme logique que to_container_path de
+    Scripts/run_compte_rendu_avec_sujets.sh (C:\Affaires, UNC NAS / PC fixe /
+    VPN, /volume1/Affaires -> /data/Affaires). Entree inchangee si aucun
+    prefixe connu ne correspond.
+  #>
+  param([string] $Value)
+  $s = [string]$Value
+  if (-not $s) { return '' }
+  $s = $s.Trim().Trim('"')
+  if (-not $s) { return '' }
+  $s = $s -replace '\\', '/'
+  $prefixes = @(
+    'C:/Affaires/',
+    '//192.168.1.20/Affaires/',
+    '//192.168.0.120/Affaires/',
+    '//192.168.0.155/Affaires/',
+    '//10.0.1.10/Affaires/',
+    '/volume1/Affaires/'
+  )
+  foreach ($prefix in $prefixes) {
+    if ($s.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+      return '/data/Affaires/' + $s.Substring($prefix.Length)
+    }
+  }
+  return $s
+}
+
+function Test-IsPhotoAsrCsvName {
+  <#
+    Exclusion explicite des variantes photo, comme le grep -v (photo) du
+    generaliste (Scripts/run_compte_rendu_avec_sujets.sh).
+  #>
+  param([string] $Name)
+  return ([string]$Name).ToLowerInvariant().Contains('(photo)')
+}
+
+function Get-AsrCsvPartKey {
+  <#
+    Cle de partie d'un CSV ASR : nom sans le marqueur (wav) ni l'extension.
+    Evite de compter deux fois la meme partie (X_mono16_16000Hz.csv et
+    X_mono16_16000Hz(wav).csv) tout en distinguant part 1 / part 2.
+  #>
+  param([string] $Name)
+  $k = [string]$Name
+  $k = $k -replace '\(wav\)', ''
+  $k = $k -replace '\.csv$', ''
+  return $k.Trim()
+}
+
 function Resolve-AsrCsvPath {
+  <#
+    Resolution du CSV ASR principal, portable Windows/Linux. Priorite :
+      1) basename de infos.fichier_transcription (fichier precis) ; si ce chemin
+         designe un dossier, prendre le .csv non (photo) le plus recent
+         (logique ls -1t + grep -v (photo) du generaliste) ;
+      2) CSV agrege/legacy explicitement complet (*_complet_*.csv) ;
+      3) CSV principal actuel ..._mono16_16000Hz(wav).csv (ou legacy sans (wav)) ;
+      4) plusieurs parties distinctes sans agregat -> erreur explicite, aucune
+         selection arbitraire.
+    Les (photo).csv sont exclus a chaque etape.
+  #>
   param($Paths, $Infos)
+
+  $dir = [string]$Paths.TranscriptionDir
+
+  $allCsv = @()
+  if ($dir -and (Test-Path -LiteralPath $dir -PathType Container)) {
+    $allCsv = @(Get-ChildItem -LiteralPath $dir -Filter '*.csv' -File -ErrorAction SilentlyContinue)
+  }
+  $nonPhoto = @($allCsv | Where-Object { $_ -and (-not (Test-IsPhotoAsrCsvName $_.Name)) })
+  $sortSpec = @{ Expression = 'LastWriteTime'; Descending = $true }, @{ Expression = 'Name'; Descending = $false }
+  $aggregated = @($nonPhoto | Where-Object { $_.Name -like '*_complet_*' } | Sort-Object -Property $sortSpec)
+  $mainParts = @($nonPhoto | Where-Object { $_.Name -like '*_mono16_16000Hz*' -and $_.Name -notlike '*_complet_*' } | Sort-Object -Property $sortSpec)
+
   $ft = ''
   if ($Infos -and $Infos.fichier_transcription) { $ft = [string]$Infos.fichier_transcription }
+  $ft = ([string]$ft).Trim().Trim('"')
+
+  # --- 1) fichier_transcription : fichier precis, puis dossier ---
   if ($ft) {
-    $name = [System.IO.Path]::GetFileName($ft)
-    $cand = Join-Path $Paths.TranscriptionDir $name
-    if (Test-Path -LiteralPath $cand -PathType Leaf) { return $cand }
+    $leaf = Get-CrLeafName $ft
+    if ($leaf -and -not (Test-IsPhotoAsrCsvName $leaf)) {
+      $cand = Join-Path $dir $leaf
+      if ($dir -and (Test-Path -LiteralPath $cand -PathType Leaf)) {
+        # Garde-fou : un part N explicite ne doit pas tronquer une captation
+        # dont un CSV agrege existe.
+        if (($leaf -notlike '*_complet_*') -and ($mainParts.Count -gt 1) -and ($aggregated.Count -ge 1)) {
+          Write-CrWarn ("[Resolve-AsrCsvPath] fichier_transcription pointe une partie (" + $leaf + ") alors qu un CSV agrege existe ; agregat prefere : " + $aggregated[0].FullName)
+          return $aggregated[0].FullName
+        }
+        return $cand
+      }
+    }
+    $ftDir = ConvertTo-ContainerAsrPath $ft
+    if ($ftDir -and (Test-Path -LiteralPath $ftDir -PathType Container)) {
+      $dirCsv = @(Get-ChildItem -LiteralPath $ftDir -Filter '*.csv' -File -ErrorAction SilentlyContinue |
+                  Where-Object { $_ -and (-not (Test-IsPhotoAsrCsvName $_.Name)) } |
+                  Sort-Object -Property $sortSpec)
+      if ($dirCsv.Count -gt 0) { return $dirCsv[0].FullName }
+      throw "[Resolve-AsrCsvPath] dossier fichier_transcription sans .csv exploitable (hors (photo)) : $ftDir"
+    }
   }
-  $g1 = @(Get-ChildItem -LiteralPath $Paths.TranscriptionDir -Filter '*_complet_*.csv' -File -ErrorAction SilentlyContinue)
-  if ($g1.Count -gt 0) { return $g1[0].FullName }
-  $g2 = @(Get-ChildItem -LiteralPath $Paths.TranscriptionDir -Filter '*_mono16_16000Hz.csv' -File -ErrorAction SilentlyContinue)
-  if ($g2.Count -gt 0) { return $g2[0].FullName }
+
+  # --- 2) CSV agrege/legacy explicitement complet ---
+  if ($aggregated.Count -ge 1) { return $aggregated[0].FullName }
+
+  # --- 3) CSV principal actuel (ou legacy sans (wav)) ---
+  $partKeys = @($mainParts | ForEach-Object { Get-AsrCsvPartKey $_.Name } | Sort-Object -Unique)
+  if ($partKeys.Count -eq 1) { return $mainParts[0].FullName }
+
+  # --- 4) plusieurs parties distinctes sans agregat : blocage explicite ---
+  if ($partKeys.Count -gt 1) {
+    $names = (@($mainParts | ForEach-Object { $_.Name }) -join ' | ')
+    throw ("[Resolve-AsrCsvPath] captation multi-parties sans CSV agrege : " + $mainParts.Count + " candidats ASR non (photo) dans " + $dir + " -> " + $names + " . Fournir un CSV agrege (*_complet_*.csv) ou pointer infos_projet.fichier_transcription sur le fichier a utiliser ; aucune selection arbitraire.")
+  }
+
   return ''
 }
 
@@ -4214,6 +4338,10 @@ function Invoke-Pass2B2FCallAndValidate {
       max_tokens = $maxOut
       stream = $false
     }
+    if ($null -ne $script:RefereProgress) {
+      $script:RefereProgress.llm_calls++
+      $script:RefereProgress.http_calls++
+    }
     $resp = Invoke-LLM-OpenAICompat -Endpoint $endpoint -Body $body -TimeoutSec $script:LlmTimeoutSec -MaxRetries 0
     $entry.duree_sec = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2)
     $entry.http_status = $script:LastHttpStatus
@@ -4291,6 +4419,134 @@ function Invoke-Pass2B2FCallAndValidate {
     throw ('[cr_refere_preventif] Pass2B_2F consolidation : echec (error=' + [string]$entry.error + ') - aucun retry, aucune ecriture canonique.')
   }
 }
+
+function Get-Pass2B2FHierarchicalBatchPlan {
+  param(
+    [string] $BatchOutputsDir,
+    [string] $BatchEntriesJsonPath = '',
+    [string] $LotLabel = '2B2F-12'
+  )
+  $lot = ([string]$LotLabel).Trim()
+  if (-not $lot) { $lot = '2B2F-12' }
+  if (-not $BatchOutputsDir -or -not (Test-Path -LiteralPath $BatchOutputsDir -PathType Container)) {
+    throw ('[cr_refere_preventif] LOT ' + $lot + ' : -Pass2B2FBatchOutputsDir invalide : ' + [string]$BatchOutputsDir)
+  }
+
+  $diskNums = @(
+    Get-ChildItem -LiteralPath $BatchOutputsDir -Filter 'batch_*_response.json' -File -ErrorAction SilentlyContinue |
+      ForEach-Object {
+        $m = [regex]::Match($_.Name, '^batch_0*(\d+)_response\.json$')
+        if ($m.Success) { [int]$m.Groups[1].Value }
+      } |
+      Sort-Object -Unique
+  )
+
+  if (-not $BatchEntriesJsonPath) {
+    $parentDir = Split-Path $BatchOutputsDir -Parent
+    $candidate = Join-Path $parentDir 'entries.json'
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) { $BatchEntriesJsonPath = $candidate }
+  }
+
+  $entriesRoot = $null
+  $source = 'parsed_outputs'
+  $batchNums = @()
+  if ($BatchEntriesJsonPath -and (Test-Path -LiteralPath $BatchEntriesJsonPath -PathType Leaf)) {
+    $entriesRoot = Read-JsonFile -Path $BatchEntriesJsonPath
+    $selected = @($entriesRoot['selected_batches'])
+    if ($selected.Count -gt 0) {
+      $batchNums = @($selected | ForEach-Object { [int]$_ } | Sort-Object -Unique)
+      $source = 'entries.json:selected_batches'
+    } else {
+      $derived = New-Object System.Collections.ArrayList
+      foreach ($entry in @($entriesRoot['entries'])) {
+        $idx = 0
+        if ($null -ne $entry -and $entry.ContainsKey('batch_index')) {
+          $idx = [int]$entry['batch_index']
+        } elseif ($null -ne $entry) {
+          $m = [regex]::Match([string]$entry['tag'], 'batch[_\-]?0*(\d+)')
+          if ($m.Success) { $idx = [int]$m.Groups[1].Value }
+        }
+        if ($idx -gt 0) { [void]$derived.Add($idx) }
+      }
+      if ($derived.Count -gt 0) {
+        $batchNums = @($derived.ToArray() | Sort-Object -Unique)
+        $source = 'entries.json:entries'
+      }
+    }
+  }
+  if ($batchNums.Count -eq 0) { $batchNums = @($diskNums); $source = 'parsed_outputs' }
+  $batchNums = @($batchNums | ForEach-Object { [int]$_ } | Sort-Object -Unique)
+  if ($batchNums.Count -eq 0) {
+    throw ('[cr_refere_preventif] LOT ' + $lot + ' : aucun batch hierarchique disponible dans entries.json ni dans ' + $BatchOutputsDir + '.')
+  }
+
+  $n = [int]$batchNums[-1]
+  $expected = @(1..$n)
+  $holes = @($expected | Where-Object { $_ -notin $batchNums })
+  $unexpected = @($batchNums | Where-Object { $_ -notin $expected })
+  if ($batchNums.Count -ne $n -or $holes.Count -gt 0 -or $unexpected.Count -gt 0) {
+    throw ('[cr_refere_preventif] LOT ' + $lot + ' : batches non continus, attendu 1..' + $n + ' ; absents=' + $(if ($holes.Count -gt 0) { @($holes | ForEach-Object { 'batch ' + $_ }) -join ',' } else { 'aucun' }) + ' inattendus=' + $(if ($unexpected.Count -gt 0) { @($unexpected) -join ',' } else { 'aucun' }) + '.')
+  }
+
+  if ($null -ne $entriesRoot -and $entriesRoot.ContainsKey('expected_batches')) {
+    $declared = [int]$entriesRoot['expected_batches']
+    if ($declared -ne $batchNums.Count) {
+      throw ('[cr_refere_preventif] LOT ' + $lot + ' : incoherence entries.json expected_batches=' + $declared + ' mais batches autoritaires=' + $batchNums.Count + '.')
+    }
+  }
+
+  $missingFiles = @($batchNums | Where-Object {
+    $name = 'batch_' + ('{0:D2}' -f $_) + '_response.json'
+    -not (Test-Path -LiteralPath (Join-Path $BatchOutputsDir $name) -PathType Leaf)
+  })
+  $extraFiles = @($diskNums | Where-Object { $_ -notin $batchNums })
+  if ($missingFiles.Count -gt 0 -or $extraFiles.Count -gt 0) {
+    throw ('[cr_refere_preventif] LOT ' + $lot + ' : incoherence entries.json/parsed_outputs ; fichiers absents=' + $(if ($missingFiles.Count -gt 0) { @($missingFiles | ForEach-Object { 'batch ' + $_ }) -join ',' } else { 'aucun' }) + ' fichiers hors perimetre=' + $(if ($extraFiles.Count -gt 0) { @($extraFiles | ForEach-Object { 'batch ' + $_ }) -join ',' } else { 'aucun' }) + '.')
+  }
+
+  return @{
+    batch_nums = @($batchNums)
+    disk_batch_nums = @($diskNums)
+    source = $source
+    entries_path = [string]$BatchEntriesJsonPath
+    entries_root = $entriesRoot
+  }
+}
+
+function New-Pass2B2FHierarchicalGroupPlans {
+  param([int[]] $BatchNums)
+  $nums = @($BatchNums | ForEach-Object { [int]$_ } | Sort-Object -Unique)
+  $n = $nums.Count
+  if ($n -lt 6) {
+    throw ('[cr_refere_preventif] Pass2B_2F hierarchique : au moins 6 batches sont requis pour 6 groupes non vides (recu=' + $n + ').')
+  }
+  $expected = @(1..$n)
+  if (@(Compare-Object $expected $nums).Count -gt 0) {
+    throw ('[cr_refere_preventif] Pass2B_2F hierarchique : les batches doivent couvrir exactement 1..' + $n + '.')
+  }
+
+  $sizes = @()
+  if ($n -eq 36) {
+    $sizes = @(6, 3, 7, 6, 7, 7)
+  } else {
+    $baseSize = [int][math]::Floor($n / 6)
+    $remainder = $n % 6
+    for ($g = 0; $g -lt 6; $g++) { $sizes += $baseSize + $(if ($g -lt $remainder) { 1 } else { 0 }) }
+  }
+
+  $plans = New-Object System.Collections.ArrayList
+  $offset = 0
+  for ($g = 0; $g -lt 6; $g++) {
+    $groupNums = @($nums[$offset..($offset + $sizes[$g] - 1)])
+    [void]$plans.Add(@{
+      id = ('{0:D2}' -f ($g + 1))
+      label = 'G' + ($g + 1)
+      batch_nums = @($groupNums)
+    })
+    $offset += $sizes[$g]
+  }
+  return @($plans.ToArray())
+}
 function Invoke-Pass2B2FHierarchicalConsolidation {
   param(
     [string] $OutDir,
@@ -4354,13 +4610,12 @@ function Invoke-Pass2B2FHierarchicalConsolidation {
   }
   $exhResume = [string]$exhObj['resume_global']
 
-  # --- 1. Repertoire des sorties batch (36 fichiers) --------------------------
-  if (-not $BatchOutputsDir -or -not (Test-Path -LiteralPath $BatchOutputsDir -PathType Container)) {
-    throw ('[cr_refere_preventif] LOT ' + $lot + ' : -Pass2B2FBatchOutputsDir invalide : ' + [string]$BatchOutputsDir)
-  }
+  # --- 1. Repertoire et liste autoritaire des sorties batch -------------------
+  $batchPlan = Get-Pass2B2FHierarchicalBatchPlan -BatchOutputsDir $BatchOutputsDir -BatchEntriesJsonPath $BatchEntriesJsonPath -LotLabel $lot
+  $expectedBatchNums = @($batchPlan.batch_nums)
+  $BatchEntriesJsonPath = [string]$batchPlan.entries_path
   $batchOutputs = @{}
   $batchSerTexts = @{}
-  $expectedBatchNums = @(1..36)
   foreach ($bi in $expectedBatchNums) {
     $bname = 'batch_' + ('{0:D2}' -f $bi) + '_response.json'
     $bpath = Join-Path $BatchOutputsDir $bname
@@ -4377,7 +4632,7 @@ function Invoke-Pass2B2FHierarchicalConsolidation {
     $batchOutputs[$bi] = $bobj
     $batchSerTexts[$bi] = ($bobj | ConvertTo-Json -Depth 100)
   }
-  Write-CrInfo ('Pass2B_2F LOT ' + $lot + ' : 36 sorties batch lues depuis ' + $BatchOutputsDir)
+  Write-CrInfo ('Pass2B_2F LOT ' + $lot + ' : ' + $expectedBatchNums.Count + ' sorties batch lues depuis ' + $BatchOutputsDir + ' (source=' + [string]$batchPlan.source + ')')
 
   # --- 2. Entrees journal (metadonnees chronologiques / sujets) ---------------
   $entriesByTag = @{}
@@ -4387,7 +4642,8 @@ function Invoke-Pass2B2FHierarchicalConsolidation {
     if (Test-Path -LiteralPath $candE -PathType Leaf) { $BatchEntriesJsonPath = $candE }
   }
   if ($BatchEntriesJsonPath -and (Test-Path -LiteralPath $BatchEntriesJsonPath -PathType Leaf)) {
-    $entriesRoot = Read-JsonFile -Path $BatchEntriesJsonPath
+    $entriesRoot = $batchPlan.entries_root
+    if ($null -eq $entriesRoot) { $entriesRoot = Read-JsonFile -Path $BatchEntriesJsonPath }
     foreach ($en in @($entriesRoot['entries'])) {
       $tg = [string]$en['tag']
       if ($tg) {
@@ -4405,22 +4661,9 @@ function Invoke-Pass2B2FHierarchicalConsolidation {
     Write-CrWarn ('Pass2B_2F LOT ' + $lot + ' : entries.json absent, metadonnees groupe partiellement derivees des fichiers batch.')
   }
 
-  $groupDefs = @(
-    @{ id = '01'; label = 'G1'; from = 1;  to = 6 },
-    @{ id = '02'; label = 'G2'; from = 7;  to = 9 },
-    @{ id = '03'; label = 'G3'; from = 10; to = 16 },
-    @{ id = '04'; label = 'G4'; from = 17; to = 22 },
-    @{ id = '05'; label = 'G5'; from = 23; to = 29 },
-    @{ id = '06'; label = 'G6'; from = 30; to = 36 }
-  )
-  if (@($groupDefs).Count -ne 6) {
+  $groupPlans = @(New-Pass2B2FHierarchicalGroupPlans -BatchNums $expectedBatchNums)
+  if (@($groupPlans).Count -ne 6) {
     throw '[cr_refere_preventif] Pass2B_2F hierarchique : la definition 6G doit contenir 6 groupes.'
-  }
-  $groupPlans = New-Object System.Collections.ArrayList
-  foreach ($gd in $groupDefs) {
-    $nums = New-Object System.Collections.ArrayList
-    for ($b = [int]$gd.from; $b -le [int]$gd.to; $b++) { [void]$nums.Add([int]$b) }
-    [void]$groupPlans.Add(@{ id = [string]$gd.id; label = [string]$gd.label; batch_nums = @($nums.ToArray()) })
   }
   # --- 3. Boucle groupes : condensation intermediaire (contrat 7 cles) --------
   $budget = Get-ContextBudget $ModelAlias

@@ -2,7 +2,7 @@
 # LOT REFERE-E2E-2 : orchestrateur du mode production -RunReferePipeline.
 # Charge par dot-source depuis cr_refere_preventif_pipeline_json.ps1 (ASCII).
 # Reutilise UNIQUEMENT les fonctions validees du pipeline. Aucune logique
-# dupliquee ; la chaine est : Pass2F -> Pass2B_2F 36 batches -> consolidation
+# dupliquee ; la chaine est : Pass2F -> Pass2B_2F batches dynamiques -> consolidation
 # hierarchique 6G -> refere_global_meeting.json -> Pass3 A/B/C/D_refere ->
 # Pass3E_refere tous sujets utiles -> assemblage refere -> renderer DOCX.
 # =============================================================================
@@ -194,7 +194,6 @@ function Invoke-RefereProductionPipeline {
       [void]$rows.Add(@{ phase='Pass2B2F_run_complete'; ok=$true; batches=$batchesCount; merge=$mergePath2 })
       $phase = 'hierarchical_6g'
       $entriesJson2 = Join-Path $p2Root (Join-Path $execName2 'entries.json')
-      Add-RefereProgressCalls -Llm 7 -Http 7
       $hierP = Invoke-Pass2B2FHierarchicalConsolidation -OutDir $OutDir -BatchOutputsDir $batchParsedDir2 -ExhaustiveJsonPath $mergePath2 -BatchEntriesJsonPath $entriesJson2 -ModelAlias $ModelPass2B2F -StartedAt $StartedAt -ApiBaseOverride $script:AdapterApiBase -ApiKeyOverride $script:AdapterApiKey -LotLabel $script:P3LotLabel -MaxTokensIntermediate $MaxTokensIntermediate -ConsolidateLlm
       $llmTotal += [int]$hierP.summary.llm_calls
       $httpTotal += [int]$hierP.summary.http_calls
