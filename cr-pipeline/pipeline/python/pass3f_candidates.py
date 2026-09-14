@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Deterministically prefilter cross-subject candidates for future Pass3F-A."""
+
+from __future__ import annotations
+
+import argparse
+import itertools
+import re
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Iterable
+
+from pass3f_provenance import content_tokens, normalize_text, read_json, stable_id, write_json_deterministic
+
+
+SCHEMA_VERSION = "pass3f.candidates.v1"
+_ADDRESS_RE = re.compile(
+    r"\b(?P<number>\d{1,4})\s+"
+    r"(?P<kind>rue|avenue|boulevard|place|all[ée]e|chemin|impasse)\s+"
+    r"(?:(?:de\s+la|de\s+l['’]|de|du|des)\s+)?"
+    r"(?P<name>[A-ZÀ-ÖØ-Þ][\w'’-]*(?:\s+[A-ZÀ-ÖØ-Þ][\w'’-]*){0,3})"
+)
+
+
+def _canonical_address(match: re.Match[str]) -> str:
+    return "|".join((match.group("number"), normalize_text(match.group("kind")), normalize_text(match.group("name"))))
+
+
+def extract_addresses(text: str) -> list[dict[str, str]]:
+    found: dict[str, str] = {}
+    for match in _ADDRESS_RE.finditer(text or ""):
+        found.setdefault(_canonical_address(match), match.group(0))
+    return [{"canonical": key, "display": found[key]} for key in sorted(found)]
+
+
+def _candidate(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "candidate_id": stable_id("candidate", {"kind": kind, **payload}),
+        "kind": kind,
+        **payload,
+        "ambiguous": True,
+        "requires_llm_review": True,
+    }
+
+
+def _shared_evidence(registry: dict[str, Any]) -> Iterable[dict[str, Any]]:
+    for item in registry["evidence"]:
+        if len(item["pass1_subjects"]) < 2:
+            continue
+        for left, right in itertools.combinations(item["pass1_subjects"], 2):
+            yield _candidate("shared_evidence", {
+                "source_subject": left,
+                "target_subject": right,
+                "excerpt": item["exact_text"],
+                "evidence_refs": [item["evidence_id"]],
+                "fragment_refs": [],
+                "signals": ["same persistent source evidence assigned by Pass1 to both subjects"],
+                "score": 1.0,
+            })
+
+
+def _reference_conflicts(registry: dict[str, Any]) -> Iterable[dict[str, Any]]:
+    subject_addresses: dict[str, set[str]] = {}
+    address_subjects: dict[str, list[str]] = defaultdict(list)
+    for subject in registry["subjects"]:
+        subject_id = subject["subject_id"]
+        reference = " ".join((subject["title"], subject["location"], subject["description"]))
+        addresses = {item["canonical"] for item in extract_addresses(reference)}
+        subject_addresses[subject_id] = addresses
+        for address in addresses:
+            address_subjects[address].append(subject_id)
+
+    grouped: dict[tuple[str, str, str | None], dict[str, Any]] = {}
+    for fragment in registry["derived_fragments"]:
+        source = fragment["subject_id"]
+        for address in extract_addresses(fragment["text"]):
+            canonical = address["canonical"]
+            if canonical in subject_addresses.get(source, set()):
+                continue
+            targets = [item for item in address_subjects.get(canonical, []) if item != source]
+            for target in targets or [None]:
+                key = (source, canonical, target)
+                if key not in grouped:
+                    grouped[key] = {
+                        "source_subject": source,
+                        "target_subject": target,
+                        "excerpt": fragment["text"],
+                        "evidence_refs": [],
+                        "fragment_refs": [],
+                        "signals": [f"address {address['display']!r} is absent from the source subject reference"],
+                        "score": 1.0 if target is not None else 0.9,
+                    }
+                grouped[key]["fragment_refs"].append(fragment["fragment_id"])
+                grouped[key]["evidence_refs"].extend(
+                    link["evidence_id"] for link in fragment["links"] if link["evidence_id"]
+                )
+    for value in grouped.values():
+        value["fragment_refs"] = sorted(set(value["fragment_refs"]))
+        value["evidence_refs"] = sorted(set(value["evidence_refs"]))
+        yield _candidate("subject_reference_conflict", value)
+
+
+def _derived_duplicates(registry: dict[str, Any]) -> Iterable[dict[str, Any]]:
+    fragments = [item for item in registry["derived_fragments"] if len(content_tokens(item["text"])) >= 8]
+    for left, right in itertools.combinations(fragments, 2):
+        if left["subject_id"] == right["subject_id"] or left["stage"] != right["stage"]:
+            continue
+        left_tokens = content_tokens(left["text"])
+        right_tokens = content_tokens(right["text"])
+        union = left_tokens | right_tokens
+        score = len(left_tokens & right_tokens) / len(union) if union else 0.0
+        exact = normalize_text(left["text"]) == normalize_text(right["text"])
+        if not exact and score < 0.9:
+            continue
+        left_evidence = {link["evidence_id"] for link in left["links"] if link["evidence_id"]}
+        right_evidence = {link["evidence_id"] for link in right["links"] if link["evidence_id"]}
+        common_evidence = left_evidence & right_evidence
+        if not common_evidence:
+            continue
+        yield _candidate("derived_text_duplicate", {
+            "source_subject": left["subject_id"],
+            "target_subject": right["subject_id"],
+            "excerpt": left["text"],
+            "evidence_refs": sorted(common_evidence),
+            "fragment_refs": sorted((left["fragment_id"], right["fragment_id"])),
+            "signals": ["normalized exact duplicate" if exact else "token Jaccard >= 0.90"],
+            "score": 1.0 if exact else round(score, 6),
+        })
+
+
+def build_candidates(registry: dict[str, Any]) -> dict[str, Any]:
+    if registry.get("schema") != "pass3f.provenance.v1":
+        raise ValueError("unsupported provenance registry schema")
+    values = list(_shared_evidence(registry))
+    values.extend(_reference_conflicts(registry))
+    values.extend(_derived_duplicates(registry))
+    candidates = sorted({item["candidate_id"]: item for item in values}.values(), key=lambda item: item["candidate_id"])
+    by_kind: dict[str, int] = defaultdict(int)
+    for item in candidates:
+        by_kind[item["kind"]] += 1
+    return {
+        "schema": SCHEMA_VERSION,
+        "source_registry_hash": stable_id("registry", registry),
+        "candidates": candidates,
+        "stats": {"candidate_count": len(candidates), "by_kind": dict(sorted(by_kind.items()))},
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--registry", required=True, type=Path)
+    parser.add_argument("--out", required=True, type=Path)
+    args = parser.parse_args(argv)
+    write_json_deterministic(args.out, build_candidates(read_json(args.registry)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

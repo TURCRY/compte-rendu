@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pass3f_audit.v1.schema.json",
+  "title": "Pass3F-A consultative cross-subject audit",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "run_id", "source_registry_hash", "source_candidates_hash", "model_alias", "parameters", "groups", "proposals"],
+  "properties": {
+    "schema": {"const": "pass3f.audit.v1"},
+    "run_id": {"type": "string", "pattern": "^run:[0-9a-f]{64}$"},
+    "source_registry_hash": {"type": "string", "pattern": "^registry:[0-9a-f]{64}$"},
+    "source_candidates_hash": {"type": "string", "pattern": "^candidates:[0-9a-f]{64}$"},
+    "model_alias": {"type": "string", "minLength": 1},
+    "parameters": {"$ref": "#/$defs/parameters"},
+    "groups": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/group"}
+    },
+    "proposals": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/proposal"}
+    }
+  },
+  "$defs": {
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["temperature", "max_tokens", "timeout_seconds", "max_attempts", "response_format", "local_strict", "n_ctx", "safety_margin_tokens"],
+      "properties": {
+        "temperature": {"type": "number", "minimum": 0, "maximum": 0.3},
+        "max_tokens": {"type": "integer", "minimum": 256},
+        "timeout_seconds": {"type": "integer", "minimum": 1},
+        "max_attempts": {"type": "integer", "minimum": 1, "maximum": 6},
+        "response_format": {"const": "json_object"},
+        "local_strict": {"type": "boolean"},
+        "n_ctx": {"type": ["integer", "null"], "minimum": 1},
+        "safety_margin_tokens": {"type": "integer", "minimum": 0}
+      }
+    },
+    "reported_usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prompt_tokens", "completion_tokens", "total_tokens"],
+      "properties": {
+        "prompt_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "completion_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "total_tokens": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["group_id", "candidate_ids", "proposal_ids", "input_hash", "estimated_input_tokens", "reported_model", "reported_usage"],
+      "properties": {
+        "group_id": {"type": "string", "pattern": "^group_[0-9]{3}$"},
+        "candidate_ids": {"type": "array", "items": {"type": "string", "pattern": "^candidate:[0-9a-f]{64}$"}, "minItems": 1, "uniqueItems": true},
+        "proposal_ids": {"type": "array", "items": {"type": "string", "pattern": "^proposal:[0-9a-f]{64}$"}, "minItems": 1, "uniqueItems": true},
+        "input_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "estimated_input_tokens": {"type": "integer", "minimum": 1},
+        "reported_model": {"type": "string"},
+        "reported_usage": {"$ref": "#/$defs/reported_usage"}
+      }
+    },
+    "truncation_record": {
+      "type": "object",
+      "required": ["status", "stage", "scope", "source_file", "source_hash", "details", "event_refs"],
+      "properties": {
+        "status": {"enum": ["none", "confirmed", "possible", "unknown"]},
+        "stage": {"const": "2E"},
+        "scope": {"enum": ["subject", "chunk", "fragment", "unknown"]},
+        "source_file": {"type": "string"},
+        "source_hash": {"type": "string", "pattern": "^(|[0-9a-f]{64})$"},
+        "details": {"type": "string"},
+        "event_refs": {"type": "array", "items": {"type": "string", "pattern": "^truncation:[0-9a-f]{64}$"}, "uniqueItems": true}
+      }
+    },
+    "subject_truncation": {
+      "allOf": [
+        {"$ref": "#/$defs/truncation_record"},
+        {
+          "type": "object",
+          "required": ["subject_id"],
+          "properties": {"subject_id": {"type": "string", "pattern": "^[1-9][0-9]*$"}}
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "fragment_truncation": {
+      "allOf": [
+        {"$ref": "#/$defs/truncation_record"},
+        {
+          "type": "object",
+          "required": ["fragment_id"],
+          "properties": {"fragment_id": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"}}
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "truncation_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subjects", "fragments", "caution"],
+      "properties": {
+        "subjects": {"type": "array", "items": {"$ref": "#/$defs/subject_truncation"}, "minItems": 1},
+        "fragments": {"type": "array", "items": {"$ref": "#/$defs/fragment_truncation"}},
+        "caution": {"type": "string", "minLength": 1}
+      }
+    },
+    "proposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["proposal_id", "candidate_id", "action", "source_subject", "target_subject", "source_fragment_ids", "evidence_refs", "original_pass1_subjects", "origin_stage", "reason", "confidence", "ambiguous", "requires_human_review", "truncation_context"],
+      "properties": {
+        "proposal_id": {"type": "string", "pattern": "^proposal:[0-9a-f]{64}$"},
+        "candidate_id": {"type": "string", "pattern": "^candidate:[0-9a-f]{64}$"},
+        "action": {"enum": ["move", "merge", "remove_duplicate", "retain_overlap", "no_action"]},
+        "source_subject": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+        "target_subject": {"type": ["string", "null"], "pattern": "^[1-9][0-9]*$"},
+        "source_fragment_ids": {"type": "array", "items": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"}, "uniqueItems": true},
+        "evidence_refs": {"type": "array", "items": {"type": "string", "pattern": "^evidence:[0-9a-f]{64}$"}, "uniqueItems": true},
+        "original_pass1_subjects": {"type": "array", "items": {"type": "string", "pattern": "^[1-9][0-9]*$"}, "uniqueItems": true},
+        "origin_stage": {"enum": ["pass1", "2e", "3e", "indeterminate"]},
+        "reason": {"type": "string", "minLength": 1},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "ambiguous": {"type": "boolean"},
+        "requires_human_review": {"const": true},
+        "truncation_context": {"$ref": "#/$defs/truncation_context"}
+      }
+    }
+  }
+}

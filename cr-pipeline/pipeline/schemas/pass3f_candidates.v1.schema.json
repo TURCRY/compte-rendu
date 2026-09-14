@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pass3f_candidates.v1.schema.json",
+  "title": "Pass3F deterministic candidates",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "source_registry_hash", "candidates", "stats"],
+  "properties": {
+    "schema": {"const": "pass3f.candidates.v1"},
+    "source_registry_hash": {"type": "string", "pattern": "^registry:[0-9a-f]{64}$"},
+    "candidates": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["candidate_id", "kind", "source_subject", "target_subject", "excerpt", "evidence_refs", "fragment_refs", "signals", "score", "ambiguous", "requires_llm_review"], "properties": {
+      "candidate_id": {"type": "string", "pattern": "^candidate:[0-9a-f]{64}$"}, "kind": {"enum": ["shared_evidence", "subject_reference_conflict", "derived_text_duplicate"]}, "source_subject": {"type": "string", "pattern": "^[1-9][0-9]*$"}, "target_subject": {"oneOf": [{"type": "string", "pattern": "^[1-9][0-9]*$"}, {"type": "null"}]}, "excerpt": {"type": "string"},
+      "evidence_refs": {"type": "array", "items": {"type": "string", "pattern": "^evidence:[0-9a-f]{64}$"}, "uniqueItems": true}, "fragment_refs": {"type": "array", "items": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"}, "uniqueItems": true}, "signals": {"type": "array", "items": {"type": "string"}, "minItems": 1}, "score": {"type": "number", "minimum": 0, "maximum": 1}, "ambiguous": {"const": true}, "requires_llm_review": {"const": true}
+    }}},
+    "stats": {"type": "object", "additionalProperties": false, "required": ["candidate_count", "by_kind"], "properties": {
+      "candidate_count": {"type": "integer", "minimum": 0}, "by_kind": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}}
+    }}
+  }
+}
