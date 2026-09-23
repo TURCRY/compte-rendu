@@ -34,10 +34,18 @@ def extract_addresses(text: str) -> list[dict[str, str]]:
 
 
 def _candidate(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    identity_payload = {
+        key: value for key, value in payload.items()
+        if key not in {"direct_evidence_refs", "context_evidence_refs"}
+    }
     return {
-        "candidate_id": stable_id("candidate", {"kind": kind, **payload}),
+        "candidate_id": stable_id("candidate", {"kind": kind, **identity_payload}),
         "kind": kind,
         **payload,
+        "direct_evidence_refs": sorted(set(
+            payload.get("direct_evidence_refs", payload.get("evidence_refs") or [])
+        )),
+        "context_evidence_refs": sorted(set(payload.get("context_evidence_refs") or [])),
         "ambiguous": True,
         "requires_llm_review": True,
     }
@@ -60,6 +68,7 @@ def _shared_evidence(registry: dict[str, Any]) -> Iterable[dict[str, Any]]:
 
 
 def _reference_conflicts(registry: dict[str, Any]) -> Iterable[dict[str, Any]]:
+    evidence_by_id = {item["evidence_id"]: item for item in registry["evidence"]}
     subject_addresses: dict[str, set[str]] = {}
     address_subjects: dict[str, list[str]] = defaultdict(list)
     for subject in registry["subjects"]:
@@ -86,17 +95,33 @@ def _reference_conflicts(registry: dict[str, Any]) -> Iterable[dict[str, Any]]:
                         "target_subject": target,
                         "excerpt": fragment["text"],
                         "evidence_refs": [],
+                        "direct_evidence_refs": [],
+                        "context_evidence_refs": [],
                         "fragment_refs": [],
                         "signals": [f"address {address['display']!r} is absent from the source subject reference"],
                         "score": 1.0 if target is not None else 0.9,
                     }
                 grouped[key]["fragment_refs"].append(fragment["fragment_id"])
-                grouped[key]["evidence_refs"].extend(
-                    link["evidence_id"] for link in fragment["links"] if link["evidence_id"]
-                )
+                for link in fragment["links"]:
+                    evidence_id = link["evidence_id"]
+                    if not evidence_id:
+                        continue
+                    grouped[key]["evidence_refs"].append(evidence_id)
+                    evidence_item = evidence_by_id.get(evidence_id)
+                    evidence_addresses = {
+                        item["canonical"] for item in extract_addresses(
+                            evidence_item["exact_text"] if evidence_item else ""
+                        )
+                    }
+                    usage = "direct_evidence_refs" if canonical in evidence_addresses else "context_evidence_refs"
+                    grouped[key][usage].append(evidence_id)
     for value in grouped.values():
         value["fragment_refs"] = sorted(set(value["fragment_refs"]))
         value["evidence_refs"] = sorted(set(value["evidence_refs"]))
+        value["direct_evidence_refs"] = sorted(set(value["direct_evidence_refs"]))
+        value["context_evidence_refs"] = sorted(
+            set(value["context_evidence_refs"]) - set(value["direct_evidence_refs"])
+        )
         yield _candidate("subject_reference_conflict", value)
 
 

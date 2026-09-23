@@ -123,7 +123,7 @@ def valid_response(packet, *, action="retain_overlap"):
 
 
 def address_conflict_documents():
-    evidence = {
+    address_evidence = {
         "evidence_id": stable_id("evidence", "61 avenue Gérardin"),
         "segment_id": "segment_16",
         "row_ref": 16,
@@ -134,18 +134,45 @@ def address_conflict_documents():
         "projection_classification": "specifique",
         "reported_subject_count": 1,
     }
-    fragment_base = {
+    context_evidence = {
+        "evidence_id": stable_id("evidence", "fenêtre ouverte"),
+        "segment_id": "segment_16",
+        "row_ref": 17,
+        "timecode": "00:16:17",
+        "speaker": "P1",
+        "exact_text": "Il y a une fenêtre ouverte. Il y a peut-être quelqu'un.",
+        "pass1_subjects": ["16"],
+        "projection_classification": "specifique",
+        "reported_subject_count": 1,
+    }
+    composite_base = {
+        "stage": "2E",
+        "subject_id": "16",
+        "field_path": "/synthese_intermediaire/resume_factuel/0",
+        "text": "Le lieu est situé au 61 avenue Gérardin. Une fenêtre était ouverte.",
+        "source_artifact": "pass2E_sujets_compact/sujet_016_compact.json",
+    }
+    composite = {
+        "fragment_id": stable_id("fragment", composite_base),
+        **composite_base,
+        "links": [
+            {"evidence_id": address_evidence["evidence_id"], "link_status": "candidate", "method": "token_overlap", "score": 1.0},
+            {"evidence_id": context_evidence["evidence_id"], "link_status": "candidate", "method": "token_overlap", "score": 1.0},
+        ],
+        "truncation": truncation("none"),
+    }
+    direct_base = {
         "stage": "3E",
         "subject_id": "16",
         "field_path": "/synthese_echanges/0",
         "text": "Localisation précise au 61 avenue Gérardin",
         "source_artifact": "pass3E_sujets/sujet_016_synthese.json",
     }
-    fragment = {
-        "fragment_id": stable_id("fragment", fragment_base),
-        **fragment_base,
+    direct_fragment = {
+        "fragment_id": stable_id("fragment", direct_base),
+        **direct_base,
         "links": [{
-            "evidence_id": evidence["evidence_id"],
+            "evidence_id": address_evidence["evidence_id"],
             "link_status": "candidate",
             "method": "token_overlap",
             "score": 0.9,
@@ -159,32 +186,22 @@ def address_conflict_documents():
             "pipeline_kind": "generaliste",
             "input_hashes": {"global.json": "c" * 64},
         },
-        "subjects": [{
-            "subject_id": "16",
-            "numero": 16,
-            "title": "État descriptif technique du 61 rue de Malleville",
-            "location": "61 rue de Malleville",
-            "description": "Référentiel canonique S16",
-            "truncation": truncation("none"),
-        }],
-        "evidence": [evidence],
+        "subjects": [
+            {"subject_id": "16", "numero": 16, "title": "État descriptif technique du 61 rue de Malleville", "location": "61 rue de Malleville", "description": "Référentiel canonique S16", "truncation": truncation("none")},
+            {"subject_id": "18", "numero": 18, "title": "État descriptif technique du 12 avenue de Girardin", "location": "parcelle 18", "description": "Référence voisine", "truncation": truncation("none")},
+            {"subject_id": "19", "numero": 19, "title": "État descriptif technique du 15 avenue de Girardin", "location": "parcelle 19", "description": "Référence voisine", "truncation": truncation("none")},
+        ],
+        "evidence": [address_evidence, context_evidence],
         "truncation_events": [],
-        "derived_fragments": [fragment],
+        "derived_fragments": [composite, direct_fragment],
         "stats": {},
     }
-    candidate = {
-        "ambiguous": True,
-        "candidate_id": stable_id("candidate", "address-conflict"),
-        "evidence_refs": [evidence["evidence_id"]],
-        "excerpt": "Localisation précise au 61 avenue Gérardin",
-        "fragment_refs": [fragment["fragment_id"]],
-        "kind": "subject_reference_conflict",
-        "requires_llm_review": True,
-        "score": 0.9,
-        "signals": ["address conflict"],
-        "source_subject": "16",
-        "target_subject": None,
-    }
+    candidate = next(
+        item for item in build_candidates(registry)["candidates"]
+        if item["kind"] == "subject_reference_conflict"
+        and item["source_subject"] == "16"
+        and item["target_subject"] is None
+    )
     return registry, build_group_packet(registry, [candidate])
 
 
@@ -271,9 +288,18 @@ class Pass3FAuditTest(unittest.TestCase):
         _registry, packet = address_conflict_documents()
         candidate = packet["candidates"][0]
         prompt = user_prompt(packet)
+        evidence_by_text = {item["exact_text"]: item["evidence_id"] for item in packet["evidence"]}
+        address_evidence_id = evidence_by_text["61 avenue Gérardin."]
+        context_evidence_id = evidence_by_text["Il y a une fenêtre ouverte. Il y a peut-être quelqu'un."]
         self.assertEqual(packet["pass1_assignments_role"], "historical_audit_input_not_correctness_evidence")
+        self.assertEqual(packet["allowed_subject_ids"], ["16"])
+        self.assertEqual({item["subject_id"] for item in packet["other_subject_index"]}, {"18", "19"})
+        self.assertEqual(candidate["direct_evidence_refs"], [address_evidence_id])
+        self.assertEqual(candidate["context_evidence_refs"], [context_evidence_id])
+        self.assertEqual(candidate["allowed_evidence_refs"], [address_evidence_id])
         self.assertIn("61 rue de Malleville", prompt)
         self.assertIn("61 avenue Gérardin", prompt)
+        self.assertIn("aucune réaffectation suffisamment étayée", SYSTEM_PROMPT)
         decision = {
             "proposals": [{
                 "candidate_id": candidate["candidate_id"],
@@ -281,12 +307,21 @@ class Pass3FAuditTest(unittest.TestCase):
                 "target_subject": None,
                 "confidence": 0.9,
                 "ambiguous": False,
-                "cited_evidence_ids": candidate["allowed_evidence_refs"],
+                "cited_evidence_ids": [address_evidence_id],
                 "reason": "Pass1 avait affecté la preuve à S16.",
             }],
         }
         with self.assertRaisesRegex(ValueError, "must remain ambiguous"):
             parse_and_validate_response(json.dumps(decision), packet, self.schema)
+        decision["proposals"][0]["ambiguous"] = True
+        decision["proposals"][0]["cited_evidence_ids"] = [context_evidence_id]
+        with self.assertRaisesRegex(ValueError, "invented evidence reference"):
+            parse_and_validate_response(json.dumps(decision), packet, self.schema)
+        decision["proposals"][0]["cited_evidence_ids"] = [address_evidence_id]
+        decision["proposals"][0]["target_subject"] = "18"
+        with self.assertRaisesRegex(ValueError, "invented target subject"):
+            parse_and_validate_response(json.dumps(decision), packet, self.schema)
+        decision["proposals"][0]["target_subject"] = None
         decision["proposals"][0]["ambiguous"] = True
         final = parse_and_validate_response(json.dumps(decision), packet, self.schema)["proposals"][0]
         self.assertEqual(final["source_subject"], "16")

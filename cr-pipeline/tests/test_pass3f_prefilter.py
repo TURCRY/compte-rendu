@@ -247,10 +247,18 @@ class Pass3FJ48ObservationTest(unittest.TestCase):
             self.assertTrue(all(item["truncation"]["scope"] == "subject" for item in possible))
 
     def test_run_b_known_address_conflicts_surface(self):
+        registry = self.outputs["B"][0]
         candidates = self.outputs["B"][1]["candidates"]
         conflicts = [item for item in candidates if item["kind"] == "subject_reference_conflict"]
         self.assertTrue(any(item["source_subject"] == "16" and "61 avenue" in item["excerpt"].casefold() for item in conflicts))
         self.assertTrue(any(item["source_subject"] == "2" and item["target_subject"] == "8" and "curzay" in item["excerpt"].casefold() for item in conflicts))
+        b005 = next(item for item in conflicts if item["source_subject"] == "16" and "61 avenue" in item["excerpt"].casefold())
+        evidence = {item["evidence_id"]: item["exact_text"] for item in registry["evidence"]}
+        self.assertEqual([evidence[item] for item in b005["direct_evidence_refs"]], ["61 avenue Gérardin."])
+        self.assertIn("Il y a une fenêtre ouverte. Il y a peut-être quelqu'un.", [
+            evidence[item] for item in b005["context_evidence_refs"]
+        ])
+        self.assertTrue(set(b005["direct_evidence_refs"]).isdisjoint(b005["context_evidence_refs"]))
 
     def test_run_b_cigarette_duplicates_surface(self):
         candidates = self.outputs["B"][1]["candidates"]

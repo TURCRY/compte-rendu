@@ -58,7 +58,7 @@ Règles absolues :
 - Chaque décision contient exclusivement : candidate_id, action, target_subject, confidence, ambiguous, cited_evidence_ids et reason.
 - Ne retourne aucune métadonnée déterministe telle que proposal_id, source_subject, fragments, affectations Pass1, provenance, troncature ou revue humaine ; Python les réinjecte après validation.
 - Une cible doit appartenir à allowed_subject_ids. N'invente ni sujet, ni fragment, ni preuve.
-- cited_evidence_ids doit être un sous-ensemble exact de allowed_evidence_refs.
+- cited_evidence_ids doit être un sous-ensemble exact de direct_evidence_refs. Les context_evidence_refs peuvent être lues pour comprendre la séquence, mais ne sont jamais citables comme preuves de la décision.
 - Les affectations Pass1 sont des données historiques à auditer et ne prouvent jamais que l'affectation est correcte. Une preuve affectée à un sujet peut précisément être mal classée. La décision doit comparer le contenu factuel de la preuve au référentiel canonique des sujets.
 - Un conflit explicite d'adresse, lieu, acteur ou objet avec le référentiel canonique ne peut pas être rejeté comme faux positif uniquement parce que Pass1 avait affecté la preuve au sujet courant.
 - Un lien de provenance candidate ou unresolved ne devient jamais verified par ton analyse.
@@ -66,6 +66,7 @@ Règles absolues :
 - Une troncature confirmed au niveau sujet/chunk impose de la prudence, sans être attribuée à un fragment particulier.
 - Une troncature unknown interdit une confiance forte fondée seulement sur le texte dérivé 2E/3E.
 - Pour move, merge ou remove_duplicate, target_subject est obligatoire. Si aucune cible autorisée n'est étayée, choisis no_action et ambiguous=true.
+- Pour un conflit de référence réel sans cible autorisée fiable, réponds no_action et ambiguous=true. Explique que le fragment paraît incompatible avec le sujet source, mais qu'aucune réaffectation suffisamment étayée n'est possible. Ne conclus jamais que le fragment correspond au sujet source seulement parce qu'aucune cible n'existe.
 - N'invente aucun fait. Préserve dates, lieux, acteurs, portée technique et degré de certitude.
 
 Actions :
@@ -244,9 +245,19 @@ def build_group_packet(
         {subject for item in candidates for subject in _candidate_subjects(item)},
         key=_subject_sort,
     )
-    evidence_refs = {ref for item in candidates for ref in item.get("evidence_refs") or []}
+    evidence_refs = {
+        ref for item in candidates
+        for ref in (
+            list(item.get("direct_evidence_refs") or item.get("evidence_refs") or [])
+            + list(item.get("context_evidence_refs") or [])
+        )
+    }
     candidate_values = []
     for candidate in sorted(candidates, key=lambda item: item["candidate_id"]):
+        direct_evidence_refs = set(
+            candidate.get("direct_evidence_refs") or candidate.get("evidence_refs") or []
+        )
+        context_evidence_refs = set(candidate.get("context_evidence_refs") or []) - direct_evidence_refs
         original = _original_pass1_subjects(candidate, evidence)
         relevant_3e = _relevant_3e_fragments([candidate], registry["derived_fragments"])
         fragment_ids = sorted({
@@ -262,7 +273,9 @@ def build_group_packet(
             **candidate,
             "proposal_id": proposal_id,
             "allowed_subject_ids": subject_ids,
-            "allowed_evidence_refs": sorted(set(candidate.get("evidence_refs") or [])),
+            "direct_evidence_refs": sorted(direct_evidence_refs),
+            "context_evidence_refs": sorted(context_evidence_refs),
+            "allowed_evidence_refs": sorted(direct_evidence_refs),
             "allowed_fragment_ids": fragment_ids,
             "original_pass1_subjects": original,
             "truncation_context": _candidate_truncation(candidate, subjects, fragments, fragment_ids),
@@ -274,6 +287,14 @@ def build_group_packet(
         "pass1_assignments_role": "historical_audit_input_not_correctness_evidence",
         "allowed_subject_ids": subject_ids,
         "subject_definitions": [subjects[subject_id] for subject_id in subject_ids],
+        "other_subject_index": [
+            {
+                "subject_id": subject_id,
+                "title": subjects[subject_id]["title"],
+                "location": subjects[subject_id]["location"],
+            }
+            for subject_id in sorted(set(subjects) - set(subject_ids), key=_subject_sort)
+        ],
         "candidates": candidate_values,
         "evidence": [evidence[ref] for ref in sorted(evidence_refs) if ref in evidence],
         "asr_context_windows": _context_windows(evidence_refs, registry["evidence"]),
