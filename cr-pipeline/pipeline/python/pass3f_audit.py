@@ -43,6 +43,10 @@ _PROPOSAL_KEYS = {
     "source_fragment_ids", "evidence_refs", "original_pass1_subjects", "origin_stage",
     "reason", "confidence", "ambiguous", "requires_human_review", "truncation_context",
 }
+_LLM_DECISION_KEYS = {
+    "candidate_id", "action", "target_subject", "confidence", "ambiguous",
+    "cited_evidence_ids", "reason",
+}
 
 
 SYSTEM_PROMPT = """Tu réalises la passe consultative 3F-A d'un compte rendu d'expertise judiciaire.
@@ -50,15 +54,18 @@ Tu audits des candidats inter-sujets sans modifier aucun artefact et sans prendr
 
 Règles absolues :
 - Réponds par un unique objet JSON strict, sans Markdown ni commentaire hors JSON.
-- Produis exactement une proposition par candidate_id et recopie proposal_id sans le modifier.
+- Produis exactement une décision par candidate_id et recopie seulement candidate_id sans le modifier.
+- Chaque décision contient exclusivement : candidate_id, action, target_subject, confidence, ambiguous, cited_evidence_ids et reason.
+- Ne retourne aucune métadonnée déterministe telle que proposal_id, source_subject, fragments, affectations Pass1, provenance, troncature ou revue humaine ; Python les réinjecte après validation.
 - Une cible doit appartenir à allowed_subject_ids. N'invente ni sujet, ni fragment, ni preuve.
-- evidence_refs, source_fragment_ids et original_pass1_subjects doivent être des sous-ensembles exacts des valeurs fournies pour le candidat.
+- cited_evidence_ids doit être un sous-ensemble exact de allowed_evidence_refs.
+- Les affectations Pass1 sont des données historiques à auditer et ne prouvent jamais que l'affectation est correcte. Une preuve affectée à un sujet peut précisément être mal classée. La décision doit comparer le contenu factuel de la preuve au référentiel canonique des sujets.
+- Un conflit explicite d'adresse, lieu, acteur ou objet avec le référentiel canonique ne peut pas être rejeté comme faux positif uniquement parce que Pass1 avait affecté la preuve au sujet courant.
 - Un lien de provenance candidate ou unresolved ne devient jamais verified par ton analyse.
 - Une troncature possible au niveau fragment n'est jamais une preuve que le fragment est incomplet.
 - Une troncature confirmed au niveau sujet/chunk impose de la prudence, sans être attribuée à un fragment particulier.
 - Une troncature unknown interdit une confiance forte fondée seulement sur le texte dérivé 2E/3E.
-- move, merge et remove_duplicate restent toujours requires_human_review=true.
-- Dans cette passe consultative, toutes les propositions restent requires_human_review=true.
+- Pour move, merge ou remove_duplicate, target_subject est obligatoire. Si aucune cible autorisée n'est étayée, choisis no_action et ambiguous=true.
 - N'invente aucun fait. Préserve dates, lieux, acteurs, portée technique et degré de certitude.
 
 Actions :
@@ -68,7 +75,6 @@ Actions :
 - retain_overlap : recouvrement légitime entre sujets ;
 - no_action : signal insuffisant, faux positif probable ou cas à ne pas changer.
 
-origin_stage indique où l'erreur semble apparaître : pass1, 2e, 3e ou indeterminate.
 ambiguous doit rester true dès que les preuves ne permettent pas une conclusion univoque.
 Le champ reason doit distinguer observation, preuve et incertitude, sans prétendre à une provenance plus forte que link_status.
 """
@@ -265,6 +271,7 @@ def build_group_packet(
         "schema": "pass3f.audit.input.v1",
         "run_id": registry["run"]["run_id"],
         "pipeline_kind": registry["run"]["pipeline_kind"],
+        "pass1_assignments_role": "historical_audit_input_not_correctness_evidence",
         "allowed_subject_ids": subject_ids,
         "subject_definitions": [subjects[subject_id] for subject_id in subject_ids],
         "candidates": candidate_values,
@@ -313,7 +320,9 @@ def build_groups(
 def user_prompt(packet: dict[str, Any]) -> str:
     return (
         "Audite chaque candidat du paquet ci-dessous. Réponds avec exactement cette racine JSON : "
-        "{\"proposals\":[...]}. Chaque objet doit respecter les champs imposés dans le candidat et les règles système.\n\n"
+        "{\"proposals\":[...]}. Chaque objet contient exactement : "
+        "candidate_id, action, target_subject, confidence, ambiguous, cited_evidence_ids, reason. "
+        "Ne recopie aucune autre métadonnée du paquet.\n\n"
         + json.dumps(packet, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )
 
@@ -418,6 +427,55 @@ def _validate_proposal_shape(proposal: Any) -> None:
         raise ValueError("invalid truncation context values")
 
 
+def _validate_llm_decision_shape(decision: Any) -> None:
+    if not isinstance(decision, dict) or set(decision) != _LLM_DECISION_KEYS:
+        raise ValueError("decision fields do not match the minimal Pass3F-A LLM contract")
+    candidate_id = decision["candidate_id"]
+    if not isinstance(candidate_id, str) or not _ID_PATTERNS["candidate_id"].fullmatch(candidate_id):
+        raise ValueError("invalid candidate_id")
+    if decision["action"] not in ACTIONS:
+        raise ValueError("unsupported action")
+    if decision["target_subject"] is not None and not isinstance(decision["target_subject"], str):
+        raise ValueError("target_subject must be a string or null")
+    confidence = decision["confidence"]
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+        raise ValueError("confidence must be between 0 and 1")
+    if not isinstance(decision["ambiguous"], bool):
+        raise ValueError("ambiguous must be a boolean")
+    evidence_ids = decision["cited_evidence_ids"]
+    if not isinstance(evidence_ids, list) or not all(isinstance(value, str) for value in evidence_ids):
+        raise ValueError("cited_evidence_ids must be a string array")
+    if len(evidence_ids) != len(set(evidence_ids)):
+        raise ValueError("cited_evidence_ids must not contain duplicates")
+    if not isinstance(decision["reason"], str) or not decision["reason"].strip():
+        raise ValueError("reason must be non-empty")
+
+
+def enrich_llm_decision(candidate: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
+    direct_fragment_ids = sorted({
+        fragment_id for fragment_id in candidate.get("fragment_refs") or []
+        if fragment_id in candidate["allowed_fragment_ids"]
+    })
+    proposal = {
+        "proposal_id": candidate["proposal_id"],
+        "candidate_id": candidate["candidate_id"],
+        "action": decision["action"],
+        "source_subject": str(candidate["source_subject"]),
+        "target_subject": decision["target_subject"],
+        "source_fragment_ids": direct_fragment_ids,
+        "evidence_refs": sorted(decision["cited_evidence_ids"]),
+        "original_pass1_subjects": list(candidate["original_pass1_subjects"]),
+        "origin_stage": "indeterminate",
+        "reason": decision["reason"],
+        "confidence": decision["confidence"],
+        "ambiguous": decision["ambiguous"],
+        "requires_human_review": True,
+        "truncation_context": json.loads(json.dumps(candidate["truncation_context"])),
+    }
+    _validate_proposal_shape(proposal)
+    return proposal
+
+
 def parse_and_validate_response(
     raw_content: str,
     packet: dict[str, Any],
@@ -426,44 +484,40 @@ def parse_and_validate_response(
     parsed = json.loads(raw_content)
     if not isinstance(parsed, dict) or set(parsed) != {"proposals"} or not isinstance(parsed["proposals"], list):
         raise ValueError("response root must contain only a proposals array")
-    for proposal in parsed["proposals"]:
-        _validate_proposal_shape(proposal)
+    for decision in parsed["proposals"]:
+        _validate_llm_decision_shape(decision)
     expected = {item["candidate_id"]: item for item in packet["candidates"]}
     actual = {item["candidate_id"]: item for item in parsed["proposals"]}
     if len(actual) != len(parsed["proposals"]) or set(actual) != set(expected):
         raise ValueError("response must contain exactly one proposal per candidate_id")
     allowed_subjects = set(packet["allowed_subject_ids"])
-    for candidate_id, proposal in actual.items():
-        candidate = expected[candidate_id]
-        if proposal["proposal_id"] != candidate["proposal_id"]:
-            raise ValueError(f"proposal_id mismatch for {candidate_id}")
-        if proposal["source_subject"] not in allowed_subjects:
-            raise ValueError(f"invented source subject for {candidate_id}")
-        target = proposal["target_subject"]
+    final_proposals = []
+    for candidate in packet["candidates"]:
+        candidate_id = candidate["candidate_id"]
+        decision = actual[candidate_id]
+        target = decision["target_subject"]
         if target is not None and target not in allowed_subjects:
             raise ValueError(f"invented target subject for {candidate_id}")
-        if not set(proposal["source_fragment_ids"]).issubset(candidate["allowed_fragment_ids"]):
-            raise ValueError(f"invented fragment reference for {candidate_id}")
-        if not set(proposal["evidence_refs"]).issubset(candidate["allowed_evidence_refs"]):
+        if not set(decision["cited_evidence_ids"]).issubset(candidate["allowed_evidence_refs"]):
             raise ValueError(f"invented evidence reference for {candidate_id}")
-        if not set(proposal["original_pass1_subjects"]).issubset(candidate["original_pass1_subjects"]):
-            raise ValueError(f"invented Pass1 assignment for {candidate_id}")
-        if proposal["truncation_context"] != candidate["truncation_context"]:
-            raise ValueError(f"truncation context was altered for {candidate_id}")
-        if proposal["action"] in {"move", "merge", "remove_duplicate"} and target is None:
-            raise ValueError(f"action {proposal['action']} requires a target for {candidate_id}")
-        if proposal["action"] not in ACTIONS or proposal["origin_stage"] not in ORIGIN_STAGES:
-            raise ValueError(f"unsupported classification for {candidate_id}")
-        if not proposal["requires_human_review"]:
-            raise ValueError(f"human review cannot be disabled for {candidate_id}")
+        if decision["action"] in {"move", "merge", "remove_duplicate"} and target is None:
+            raise ValueError(f"action {decision['action']} requires a target for {candidate_id}")
+        if (
+            candidate.get("kind") == "subject_reference_conflict"
+            and target is None
+            and decision["action"] == "no_action"
+            and not decision["ambiguous"]
+        ):
+            raise ValueError(f"unresolved subject reference conflict must remain ambiguous for {candidate_id}")
         statuses = {
-            item["status"] for item in proposal["truncation_context"]["subjects"]
+            item["status"] for item in candidate["truncation_context"]["subjects"]
         } | {
-            item["status"] for item in proposal["truncation_context"]["fragments"]
+            item["status"] for item in candidate["truncation_context"]["fragments"]
         }
-        if not proposal["evidence_refs"] and "unknown" in statuses and proposal["confidence"] > 0.7:
+        if not decision["cited_evidence_ids"] and "unknown" in statuses and decision["confidence"] > 0.7:
             raise ValueError(f"confidence too high with unknown truncation and no evidence for {candidate_id}")
-    parsed["proposals"] = [actual[item["candidate_id"]] for item in packet["candidates"]]
+        final_proposals.append(enrich_llm_decision(candidate, decision))
+    parsed["proposals"] = final_proposals
     return parsed
 
 

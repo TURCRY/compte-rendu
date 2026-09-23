@@ -20,6 +20,7 @@ from pass3f_audit import (  # noqa: E402
     call_openai_compatible,
     parse_and_validate_response,
     run_audit,
+    user_prompt,
 )
 from pass3f_candidates import build_candidates  # noqa: E402
 from pass3f_provenance import stable_id, write_json_deterministic  # noqa: E402
@@ -103,23 +104,88 @@ def fixture_documents():
 def valid_response(packet, *, action="retain_overlap"):
     proposals = []
     for candidate in packet["candidates"]:
+        target = candidate["target_subject"]
+        if action in {"move", "merge", "remove_duplicate"} and target is None:
+            target = next(
+                subject_id for subject_id in candidate["allowed_subject_ids"]
+                if subject_id != candidate["source_subject"]
+            )
         proposals.append({
-            "proposal_id": candidate["proposal_id"],
             "candidate_id": candidate["candidate_id"],
             "action": action,
-            "source_subject": candidate["source_subject"],
-            "target_subject": candidate["target_subject"],
-            "source_fragment_ids": candidate["allowed_fragment_ids"],
-            "evidence_refs": candidate["allowed_evidence_refs"],
-            "original_pass1_subjects": candidate["original_pass1_subjects"],
-            "origin_stage": "pass1",
-            "reason": "Le même extrait peut légitimement éclairer les deux objets; validation humaine requise.",
+            "target_subject": target,
             "confidence": 0.62,
             "ambiguous": True,
-            "requires_human_review": True,
-            "truncation_context": json.loads(json.dumps(candidate["truncation_context"])),
+            "cited_evidence_ids": candidate["allowed_evidence_refs"],
+            "reason": "Le même extrait peut légitimement éclairer les deux objets; validation humaine requise.",
         })
     return {"proposals": proposals}
+
+
+def address_conflict_documents():
+    evidence = {
+        "evidence_id": stable_id("evidence", "61 avenue Gérardin"),
+        "segment_id": "segment_16",
+        "row_ref": 16,
+        "timecode": "00:16:00",
+        "speaker": "P1",
+        "exact_text": "61 avenue Gérardin.",
+        "pass1_subjects": ["16"],
+        "projection_classification": "specifique",
+        "reported_subject_count": 1,
+    }
+    fragment_base = {
+        "stage": "3E",
+        "subject_id": "16",
+        "field_path": "/synthese_echanges/0",
+        "text": "Localisation précise au 61 avenue Gérardin",
+        "source_artifact": "pass3E_sujets/sujet_016_synthese.json",
+    }
+    fragment = {
+        "fragment_id": stable_id("fragment", fragment_base),
+        **fragment_base,
+        "links": [{
+            "evidence_id": evidence["evidence_id"],
+            "link_status": "candidate",
+            "method": "token_overlap",
+            "score": 0.9,
+        }],
+        "truncation": truncation("none"),
+    }
+    registry = {
+        "schema": "pass3f.provenance.v1",
+        "run": {
+            "run_id": stable_id("run", "address-conflict"),
+            "pipeline_kind": "generaliste",
+            "input_hashes": {"global.json": "c" * 64},
+        },
+        "subjects": [{
+            "subject_id": "16",
+            "numero": 16,
+            "title": "État descriptif technique du 61 rue de Malleville",
+            "location": "61 rue de Malleville",
+            "description": "Référentiel canonique S16",
+            "truncation": truncation("none"),
+        }],
+        "evidence": [evidence],
+        "truncation_events": [],
+        "derived_fragments": [fragment],
+        "stats": {},
+    }
+    candidate = {
+        "ambiguous": True,
+        "candidate_id": stable_id("candidate", "address-conflict"),
+        "evidence_refs": [evidence["evidence_id"]],
+        "excerpt": "Localisation précise au 61 avenue Gérardin",
+        "fragment_refs": [fragment["fragment_id"]],
+        "kind": "subject_reference_conflict",
+        "requires_llm_review": True,
+        "score": 0.9,
+        "signals": ["address conflict"],
+        "source_subject": "16",
+        "target_subject": None,
+    }
+    return registry, build_group_packet(registry, [candidate])
 
 
 def response_envelope(parsed, *, prompt_tokens=1000, completion_tokens=300):
@@ -167,9 +233,11 @@ class Pass3FAuditTest(unittest.TestCase):
     def test_prompt_contains_provenance_and_truncation_guards(self):
         self.assertIn("candidate ou unresolved ne devient jamais verified", SYSTEM_PROMPT)
         self.assertIn("troncature possible", SYSTEM_PROMPT)
-        self.assertIn("requires_human_review=true", SYSTEM_PROMPT)
+        self.assertIn("Pass1 sont des données historiques à auditer", SYSTEM_PROMPT)
+        self.assertIn("ne prouvent jamais que l'affectation est correcte", SYSTEM_PROMPT)
+        self.assertIn("conflit explicite d'adresse, lieu, acteur ou objet", SYSTEM_PROMPT)
 
-    def test_strict_parser_rejects_markdown_and_invented_target(self):
+    def test_strict_parser_rejects_markdown_invented_target_and_evidence(self):
         packet = build_group_packet(self.registry, [self.candidates["candidates"][0]])
         parsed = valid_response(packet)
         with self.assertRaises(json.JSONDecodeError):
@@ -177,17 +245,53 @@ class Pass3FAuditTest(unittest.TestCase):
         parsed["proposals"][0]["target_subject"] = "999"
         with self.assertRaises(ValueError):
             parse_and_validate_response(json.dumps(parsed), packet, self.schema)
-
-    def test_parser_rejects_altered_truncation_and_disabled_review(self):
-        packet = build_group_packet(self.registry, [self.candidates["candidates"][0]])
         parsed = valid_response(packet)
-        parsed["proposals"][0]["truncation_context"]["caution"] = "invented"
+        parsed["proposals"][0]["cited_evidence_ids"] = ["evidence:" + "f" * 64]
         with self.assertRaises(ValueError):
             parse_and_validate_response(json.dumps(parsed), packet, self.schema)
-        parsed = valid_response(packet)
-        parsed["proposals"][0]["requires_human_review"] = False
-        with self.assertRaises(Exception):
-            parse_and_validate_response(json.dumps(parsed), packet, self.schema)
+
+    def test_python_enriches_final_contract_and_forces_human_review(self):
+        source = next(item for item in self.candidates["candidates"] if item["target_subject"] is not None)
+        packet = build_group_packet(self.registry, [source])
+        candidate = packet["candidates"][0]
+        for action in ("move", "merge", "remove_duplicate"):
+            final = parse_and_validate_response(
+                json.dumps(valid_response(packet, action=action)), packet, self.schema,
+            )["proposals"][0]
+            self.assertEqual(set(final), self.schema["$defs"]["proposal"]["properties"].keys())
+            self.assertEqual(final["proposal_id"], candidate["proposal_id"])
+            self.assertEqual(final["source_subject"], candidate["source_subject"])
+            self.assertEqual(final["source_fragment_ids"], sorted(candidate["fragment_refs"]))
+            self.assertEqual(final["original_pass1_subjects"], candidate["original_pass1_subjects"])
+            self.assertEqual(final["truncation_context"], candidate["truncation_context"])
+            self.assertEqual(final["origin_stage"], "indeterminate")
+            self.assertTrue(final["requires_human_review"])
+
+    def test_pass1_assignment_cannot_resolve_explicit_address_conflict(self):
+        _registry, packet = address_conflict_documents()
+        candidate = packet["candidates"][0]
+        prompt = user_prompt(packet)
+        self.assertEqual(packet["pass1_assignments_role"], "historical_audit_input_not_correctness_evidence")
+        self.assertIn("61 rue de Malleville", prompt)
+        self.assertIn("61 avenue Gérardin", prompt)
+        decision = {
+            "proposals": [{
+                "candidate_id": candidate["candidate_id"],
+                "action": "no_action",
+                "target_subject": None,
+                "confidence": 0.9,
+                "ambiguous": False,
+                "cited_evidence_ids": candidate["allowed_evidence_refs"],
+                "reason": "Pass1 avait affecté la preuve à S16.",
+            }],
+        }
+        with self.assertRaisesRegex(ValueError, "must remain ambiguous"):
+            parse_and_validate_response(json.dumps(decision), packet, self.schema)
+        decision["proposals"][0]["ambiguous"] = True
+        final = parse_and_validate_response(json.dumps(decision), packet, self.schema)["proposals"][0]
+        self.assertEqual(final["source_subject"], "16")
+        self.assertEqual(final["original_pass1_subjects"], ["16"])
+        self.assertTrue(final["ambiguous"])
 
     def test_invalid_contract_preserves_raw_response_before_raising_without_retry(self):
         seen = []
