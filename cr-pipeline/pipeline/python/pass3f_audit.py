@@ -508,6 +508,44 @@ def validate_reported_local_model(envelope: dict[str, Any], requested_model: str
     return reported
 
 
+def _attempt_artifact_dirs(artifact_dir: Path, attempt: int) -> tuple[Path, Path]:
+    artifact_dir = Path(artifact_dir)
+    return artifact_dir, artifact_dir / "attempts" / f"attempt_{attempt:03d}"
+
+
+def _write_attempt_bytes(artifact_dir: Path, attempt: int, name: str, value: bytes) -> None:
+    for target_dir in _attempt_artifact_dirs(artifact_dir, attempt):
+        target_dir.mkdir(parents=True, exist_ok=True)
+        (target_dir / name).write_bytes(value)
+
+
+def _write_attempt_json(artifact_dir: Path, attempt: int, name: str, value: dict[str, Any]) -> None:
+    for target_dir in _attempt_artifact_dirs(artifact_dir, attempt):
+        write_json_deterministic(target_dir / name, value)
+
+
+def _transport_metadata(
+    transport_response: dict[str, Any] | None,
+    *,
+    http_status: int,
+    duration_seconds: float,
+    attempt: int,
+    model_alias: str,
+    endpoint: str,
+) -> dict[str, Any]:
+    choices = transport_response.get("choices") if isinstance(transport_response, dict) else None
+    first_choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    return {
+        "http_status": http_status,
+        "model_declared": transport_response.get("model") if isinstance(transport_response, dict) else None,
+        "finish_reason": first_choice.get("finish_reason"),
+        "duration_seconds": round(duration_seconds, 6),
+        "attempt": attempt,
+        "model_alias": model_alias,
+        "endpoint_local": endpoint,
+    }
+
+
 def call_openai_compatible(
     *,
     api_base: str,
@@ -522,6 +560,7 @@ def call_openai_compatible(
     timeout: int = 600,
     max_attempts: int = 3,
     local_strict: bool = False,
+    artifact_dir: Path | None = None,
     transport: Transport | None = None,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -550,6 +589,7 @@ def call_openai_compatible(
     )
     failures: list[str] = []
     for attempt in range(1, max_attempts + 1):
+        started_at = time.perf_counter()
         try:
             transport_raw = (
                 transport(request, timeout)
@@ -558,11 +598,43 @@ def call_openai_compatible(
             )
             if not isinstance(transport_raw, bytes):
                 raise TypeError("transport must return the exact HTTP response body as bytes")
+            duration_seconds = time.perf_counter() - started_at
+            if artifact_dir is not None:
+                _write_attempt_bytes(artifact_dir, attempt, "transport_raw_response.txt", transport_raw)
+                _write_attempt_json(
+                    artifact_dir,
+                    attempt,
+                    "transport_metadata.json",
+                    _transport_metadata(
+                        None,
+                        http_status=200,
+                        duration_seconds=duration_seconds,
+                        attempt=attempt,
+                        model_alias=model,
+                        endpoint=request.full_url,
+                    ),
+                )
             transport_text = transport_raw.decode("utf-8-sig")
             transport_response = json.loads(transport_text)
+            if artifact_dir is not None:
+                _write_attempt_json(
+                    artifact_dir,
+                    attempt,
+                    "transport_metadata.json",
+                    _transport_metadata(
+                        transport_response,
+                        http_status=200,
+                        duration_seconds=duration_seconds,
+                        attempt=attempt,
+                        model_alias=model,
+                        endpoint=request.full_url,
+                    ),
+                )
             reported_model = validate_reported_local_model(transport_response, model) if local_strict else str(transport_response.get("model") or "")
             adapter_message_content = str(transport_response["choices"][0]["message"]["content"])
             parsed = parse_and_validate_response(adapter_message_content, packet, output_schema)
+            if artifact_dir is not None:
+                _write_attempt_json(artifact_dir, attempt, "parsed_response.json", parsed)
             return {
                 "request": request_body,
                 "transport_raw_bytes": transport_raw,
@@ -574,8 +646,40 @@ def call_openai_compatible(
                 "attempt_count": attempt,
             }, [{"attempt": index + 1, "error": value} for index, value in enumerate(failures)]
         except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
-            failures.append(f"json_contract_error: {type(exc).__name__}: {exc}")
+            failure = f"json_contract_error: {type(exc).__name__}: {exc}"
+            failures.append(failure)
+            if artifact_dir is not None:
+                _write_attempt_json(artifact_dir, attempt, "contract_error.json", {
+                    "attempt": attempt,
+                    "error_type": type(exc).__name__,
+                    "detail": str(exc),
+                })
+            raise RuntimeError(f"Pass3F-A contract validation failed on attempt {attempt}: {failure}") from exc
         except urllib.error.HTTPError as exc:
+            duration_seconds = time.perf_counter() - started_at
+            transport_raw = exc.read()
+            if artifact_dir is not None:
+                _write_attempt_bytes(artifact_dir, attempt, "transport_raw_response.txt", transport_raw)
+                transport_response = None
+                try:
+                    decoded = json.loads(transport_raw.decode("utf-8-sig"))
+                    if isinstance(decoded, dict):
+                        transport_response = decoded
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    pass
+                _write_attempt_json(
+                    artifact_dir,
+                    attempt,
+                    "transport_metadata.json",
+                    _transport_metadata(
+                        transport_response,
+                        http_status=exc.code,
+                        duration_seconds=duration_seconds,
+                        attempt=attempt,
+                        model_alias=model,
+                        endpoint=request.full_url,
+                    ),
+                )
             failures.append(f"http_error: {exc.code}: {exc.reason}")
             if exc.code < 500 and exc.code != 429:
                 raise RuntimeError(failures[-1]) from exc
@@ -671,6 +775,7 @@ def run_audit(
             timeout=timeout,
             max_attempts=max_attempts,
             local_strict=local_strict,
+            artifact_dir=group_dir,
             transport=transport,
             sleeper=sleeper,
         )
@@ -703,7 +808,7 @@ def run_audit(
         for name in (
             "input_packet.json", "system_prompt.txt", "user_prompt.txt", "request.json",
             "transport_raw_response.bin", "transport_raw_response.txt", "transport_response.json",
-            "adapter_message_content.txt", "parsed_response.json",
+            "transport_metadata.json", "adapter_message_content.txt", "parsed_response.json",
         ):
             artifact_hashes[name] = sha256_bytes((group_dir / name).read_bytes())
         manifest_groups.append({

@@ -189,25 +189,43 @@ class Pass3FAuditTest(unittest.TestCase):
         with self.assertRaises(Exception):
             parse_and_validate_response(json.dumps(parsed), packet, self.schema)
 
-    def test_json_failure_retries_same_request_without_repair(self):
-        packet = build_group_packet(self.registry, [self.candidates["candidates"][0]])
+    def test_invalid_contract_preserves_raw_response_before_raising_without_retry(self):
         seen = []
+        invalid_response = response_bytes({"wrong": []})
 
         def transport(request, _timeout):
             seen.append(request.data)
-            if len(seen) == 1:
-                return response_bytes({"wrong": []})
-            return response_bytes(valid_response(packet))
+            return invalid_response
 
-        result, failures = call_openai_compatible(
-            api_base="http://example.invalid", api_key="secret", model=DEFAULT_MODEL,
-            temperature=0.1, max_tokens=1000, system=SYSTEM_PROMPT, user="fixture",
-            packet=packet, output_schema=self.schema, transport=transport, sleeper=lambda _delay: None,
-        )
-        self.assertEqual(result["attempt_count"], 2)
-        self.assertEqual(seen[0], seen[1])
-        self.assertEqual(len(failures), 1)
-        self.assertIn("json_contract_error", failures[0]["error"])
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "pass3f"
+            with self.assertRaises(RuntimeError) as caught:
+                run_audit(
+                    self.registry, self.candidates, output_dir,
+                    schema_path=SCHEMA_PATH, api_base="http://example.invalid", api_key="secret",
+                    max_candidates=1, max_attempts=3, transport=transport,
+                    sleeper=lambda _delay: None,
+                )
+            self.assertIn("contract validation failed", str(caught.exception))
+            self.assertEqual(len(seen), 1)
+            group_dir = output_dir / "groups" / "group_001"
+            self.assertEqual((group_dir / "transport_raw_response.txt").read_bytes(), invalid_response)
+            self.assertEqual(
+                (group_dir / "attempts" / "attempt_001" / "transport_raw_response.txt").read_bytes(),
+                invalid_response,
+            )
+            metadata = json.loads((group_dir / "transport_metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["http_status"], 200)
+            self.assertEqual(metadata["model_declared"], "Gemma_4_12B_It_Q4_K_M")
+            self.assertEqual(metadata["finish_reason"], "stop")
+            self.assertEqual(metadata["attempt"], 1)
+            self.assertEqual(metadata["model_alias"], DEFAULT_MODEL)
+            self.assertEqual(metadata["endpoint_local"], "http://example.invalid/v1/chat/completions")
+            self.assertGreaterEqual(metadata["duration_seconds"], 0)
+            contract_error = json.loads((group_dir / "contract_error.json").read_text(encoding="utf-8"))
+            self.assertEqual(contract_error["error_type"], "ValueError")
+            self.assertIn("proposals array", contract_error["detail"])
+            self.assertFalse((group_dir / "parsed_response.json").exists())
 
     def test_run_writes_auditable_package_and_leaves_inputs_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
