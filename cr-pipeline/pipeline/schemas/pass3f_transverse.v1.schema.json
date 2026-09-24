@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pass3f_transverse.v1.schema.json",
+  "title": "Deterministic Pass3F transverse document requests",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "transverse_id", "run_id", "source_hashes", "units", "stats", "rollback"],
+  "properties": {
+    "schema": {"const": "pass3f.transverse.v1"},
+    "transverse_id": {"type": "string", "pattern": "^transverse:[0-9a-f]{64}$"},
+    "run_id": {"type": "string", "pattern": "^run:[0-9a-f]{64}$"},
+    "source_hashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["global_final", "global_source", "provenance_registry", "pass3f_applied", "decisions"],
+      "properties": {
+        "global_final": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "global_source": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "provenance_registry": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "pass3f_applied": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "decisions": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "units": {"type": "array", "items": {"$ref": "#/$defs/transverse_unit"}},
+    "stats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit_count", "existing_unique_count", "new_entry_count", "ambiguous_count"],
+      "properties": {
+        "unit_count": {"type": "integer", "minimum": 0},
+        "existing_unique_count": {"type": "integer", "minimum": 0},
+        "new_entry_count": {"type": "integer", "minimum": 0},
+        "ambiguous_count": {"type": "integer", "minimum": 0}
+      }
+    },
+    "rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "source_global_final_hash"],
+      "properties": {
+        "method": {"const": "discard_sidecar_and_rebuild"},
+        "source_global_final_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  },
+  "$defs": {
+    "evidence_ids": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^evidence-occurrence:[0-9a-f]{64}$"},
+      "uniqueItems": true
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision_id", "proposal_id", "status", "reviewer", "reason"],
+      "properties": {
+        "decision_id": {"type": "string", "pattern": "^decision:[0-9a-f]{64}$"},
+        "proposal_id": {"type": "string", "pattern": "^proposal:[0-9a-f]{64}$"},
+        "status": {"const": "accepted"},
+        "reviewer": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1}
+      }
+    },
+    "existing_match": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["found", "status", "normalized_object", "match_indexes", "matched_entry_hash", "matched_entry"],
+      "properties": {
+        "found": {"type": "boolean"},
+        "status": {"enum": ["unique", "absent", "ambiguous_existing_match"]},
+        "normalized_object": {"type": "string", "minLength": 1},
+        "match_indexes": {"type": "array", "items": {"type": "integer", "minimum": 0}, "uniqueItems": true},
+        "matched_entry_hash": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "matched_entry": {"type": ["object", "null"]}
+      }
+    },
+    "prepared_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["objet", "demandeur", "destinataire", "echeance", "commentaire", "origine"],
+      "properties": {
+        "objet": {"type": "string", "minLength": 1},
+        "demandeur": {"type": "null"},
+        "destinataire": {"type": "null"},
+        "echeance": {"type": "null"},
+        "commentaire": {"type": "null"},
+        "origine": {"const": "pass3f"}
+      }
+    },
+    "transverse_unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit_id", "text", "derived_from_fragment_id", "evidence_occurrence_ids", "historical_subject", "historical_origins", "decision", "existing_match", "materialization_status", "automatic_materialization_allowed", "prepared_entry"],
+      "properties": {
+        "unit_id": {"type": "string", "pattern": "^composite-unit:[0-9a-f]{64}$"},
+        "text": {"type": "string", "minLength": 1},
+        "derived_from_fragment_id": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"},
+        "evidence_occurrence_ids": {"$ref": "#/$defs/evidence_ids"},
+        "historical_subject": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+        "historical_origins": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "decision": {"$ref": "#/$defs/decision"},
+        "existing_match": {"$ref": "#/$defs/existing_match"},
+        "materialization_status": {"enum": ["reuse_existing", "prepare_new", "blocked_ambiguous"]},
+        "automatic_materialization_allowed": {"type": "boolean"},
+        "prepared_entry": {"oneOf": [{"$ref": "#/$defs/prepared_entry"}, {"type": "null"}]}
+      }
+    }
+  }
+}
