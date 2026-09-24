@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pass3f_reconciliation_plan.v1.schema.json",
+  "title": "Pass3F deterministic local reconciliation plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "source_subject",
+    "target_subject",
+    "proposal_id",
+    "source_hashes",
+    "publishable_insertions",
+    "excluded_provenance_projection_ids",
+    "participant_operations",
+    "placeholder_operations",
+    "exact_duplicate_operations",
+    "relations",
+    "simulated_target",
+    "reconciliation_plan_id"
+  ],
+  "properties": {
+    "schema": {"const": "pass3f.reconciliation-plan.v1"},
+    "source_subject": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+    "target_subject": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+    "proposal_id": {"type": "string", "pattern": "^proposal:[0-9a-f]{64}$"},
+    "source_hashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["global_by_sujet", "provenance_registry", "proposal"],
+      "properties": {
+        "global_by_sujet": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "provenance_registry": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "proposal": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "publishable_insertions": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/insertion"}
+    },
+    "excluded_provenance_projection_ids": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"},
+      "uniqueItems": true
+    },
+    "participant_operations": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/participant_operation"}
+    },
+    "placeholder_operations": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/placeholder_operation"}
+    },
+    "exact_duplicate_operations": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/exact_duplicate_operation"}
+    },
+    "relations": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/relation"}
+    },
+    "simulated_target": {"type": "object"},
+    "reconciliation_plan_id": {
+      "type": "string",
+      "pattern": "^reconciliation-plan:[0-9a-f]{64}$"
+    }
+  },
+  "$defs": {
+    "evidence_ids": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^evidence-occurrence:[0-9a-f]{64}$"},
+      "uniqueItems": true
+    },
+    "fragment_ids": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"},
+      "uniqueItems": true
+    },
+    "insertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "item_id",
+        "kind",
+        "section",
+        "text",
+        "representation_type",
+        "evidence_occurrence_ids",
+        "verified_evidence_occurrence_ids",
+        "source_fragment_ids",
+        "precedence"
+      ],
+      "properties": {
+        "item_id": {"type": "string"},
+        "kind": {"enum": ["fragment", "composite_unit"]},
+        "section": {"enum": ["synthese_echanges", "conclusion_expert"]},
+        "text": {"type": "string", "minLength": 1},
+        "representation_type": {"const": "publishable_text_unit"},
+        "evidence_occurrence_ids": {"$ref": "#/$defs/evidence_ids"},
+        "verified_evidence_occurrence_ids": {"$ref": "#/$defs/evidence_ids"},
+        "source_fragment_ids": {"$ref": "#/$defs/fragment_ids"},
+        "precedence": {"type": "integer", "minimum": 0}
+      }
+    },
+    "participant_operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "action",
+        "source_subject",
+        "target_subject",
+        "source_index",
+        "participant",
+        "participant_hash",
+        "source_fragment_ids",
+        "evidence_occurrence_ids",
+        "deterministic_evidence_occurrence_ids",
+        "excluded_candidate_evidence_occurrence_ids",
+        "target_exact_duplicate_indices",
+        "target_same_name_indices",
+        "status",
+        "requires_human_review"
+      ],
+      "properties": {
+        "operation_id": {"type": "string", "pattern": "^participant-operation:[0-9a-f]{64}$"},
+        "action": {"const": "move_participant_object"},
+        "source_subject": {"type": "string"},
+        "target_subject": {"type": "string"},
+        "source_index": {"type": "integer", "minimum": 0},
+        "participant": {"type": "object"},
+        "participant_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "source_fragment_ids": {"$ref": "#/$defs/fragment_ids"},
+        "evidence_occurrence_ids": {"$ref": "#/$defs/evidence_ids"},
+        "deterministic_evidence_occurrence_ids": {"$ref": "#/$defs/evidence_ids"},
+        "excluded_candidate_evidence_occurrence_ids": {"$ref": "#/$defs/evidence_ids"},
+        "target_exact_duplicate_indices": {"type": "array", "items": {"type": "integer", "minimum": 0}, "uniqueItems": true},
+        "target_same_name_indices": {"type": "array", "items": {"type": "integer", "minimum": 0}, "uniqueItems": true},
+        "status": {"enum": ["ready_for_human_validation", "duplicate_target_object", "ambiguous_target_object"]},
+        "requires_human_review": {"const": true}
+      }
+    },
+    "placeholder_operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "section",
+        "index",
+        "text",
+        "text_hash",
+        "scope",
+        "contradicted_by_item_ids",
+        "proposal_id",
+        "requires_accepted_decision"
+      ],
+      "properties": {
+        "operation": {"const": "remove_placeholder"},
+        "section": {"enum": ["synthese_echanges", "conclusion_expert"]},
+        "index": {"type": "integer", "minimum": 0},
+        "text": {"type": "string", "minLength": 1},
+        "text_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "scope": {"const": "entire_section_has_no_identified_content"},
+        "contradicted_by_item_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "uniqueItems": true},
+        "proposal_id": {"type": "string"},
+        "requires_accepted_decision": {"const": true}
+      }
+    },
+    "exact_duplicate_operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation", "kept_item_id", "suppressed_item_id", "shared_evidence_occurrence_ids"],
+      "properties": {
+        "operation": {"const": "drop_exact_duplicate"},
+        "kept_item_id": {"type": "string"},
+        "suppressed_item_id": {"type": "string"},
+        "shared_evidence_occurrence_ids": {"$ref": "#/$defs/evidence_ids"}
+      }
+    },
+    "relation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "left_item_id",
+        "right_item_id",
+        "classification",
+        "operation",
+        "llm_eligible",
+        "blockers"
+      ],
+      "properties": {
+        "left_item_id": {"type": "string"},
+        "right_item_id": {"type": "string"},
+        "classification": {
+          "enum": [
+            "exact_duplicate",
+            "semantic_duplicate",
+            "partial_overlap",
+            "complementary",
+            "contradiction",
+            "unrelated"
+          ]
+        },
+        "operation": {"enum": ["keep_both", "drop_exact_duplicate", "merge_required", "remove_placeholder"]},
+        "llm_eligible": {"type": "boolean"},
+        "blockers": {
+          "type": "array",
+          "items": {"enum": ["provenance_not_authorized"]},
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

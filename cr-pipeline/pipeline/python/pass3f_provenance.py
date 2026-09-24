@@ -16,6 +16,7 @@ from typing import Any, Iterable
 SCHEMA_VERSION = "pass3f.provenance.v2"
 EVIDENCE_OCCURRENCE_ALGORITHM = "pass3f.evidence-occurrence.v2"
 EVIDENCE_CONTENT_ALGORITHM = "pass3f.evidence-content.v1"
+FRAGMENT_STRUCTURE_ALGORITHM = "pass3f.fragment-structure.v1"
 _WORD_RE = re.compile(r"[a-z0-9]+")
 _CIVILITY_RE = re.compile(
     r"\b(?:M(?:onsieur)?\.?|Mme\.?|Madame|Mlle\.?|Mademoiselle|Ma[iî]tre)\s+",
@@ -76,6 +77,23 @@ def normalize_text(value: Any) -> str:
     text = unicodedata.normalize("NFKD", str(value or ""))
     text = "".join(char for char in text if not unicodedata.combining(char))
     return " ".join(_WORD_RE.findall(text.casefold()))
+
+
+def fragment_representation_type(stage: str, field_path: str) -> str:
+    """Classify where a derived fragment lives, independently of its meaning."""
+    if stage in {"2E", "2F"}:
+        return "provenance_projection"
+    if stage != "3E":
+        return "unsupported"
+    if re.fullmatch(r"/(?:synthese_echanges|conclusion_expert)/\d+", field_path):
+        return "publishable_text_unit"
+    if re.fullmatch(r"/avis_participants/\d+", field_path):
+        return "participant_object"
+    if re.match(r"^/avis_participants/\d+/", field_path):
+        return "participant_subfield"
+    if re.match(r"^/(?:numero|titre|localisation|description)(?:/|$)", field_path):
+        return "metadata"
+    return "unsupported"
 
 
 def content_tokens(value: Any) -> set[str]:
@@ -576,6 +594,10 @@ def build_registry(
                     "source_artifact": f"{directory.name}/{path.name}",
                 }
                 fragment["fragment_id"] = stable_id("fragment", fragment)
+                fragment["representation_type"] = fragment_representation_type(
+                    stage, field_path
+                )
+                fragment["structure_algorithm"] = FRAGMENT_STRUCTURE_ALGORITHM
                 fragment["links"] = _link_fragment(text, by_subject.get(subject_id, []))
                 subject_status = subject_truncation[subject_id]
                 if subject_status["status"] == "confirmed":
@@ -616,6 +638,10 @@ def build_registry(
                     "source_artifact": source_artifact,
                 }
                 fragment["fragment_id"] = stable_id("fragment", fragment)
+                fragment["representation_type"] = fragment_representation_type(
+                    "2F", field_path
+                )
+                fragment["structure_algorithm"] = FRAGMENT_STRUCTURE_ALGORITHM
                 fragment["links"] = _link_fragment(text, by_subject.get(subject_id, []))
                 fragment["truncation"] = _truncation_record(
                     "unknown", "unknown",

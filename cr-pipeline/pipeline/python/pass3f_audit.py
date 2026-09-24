@@ -21,6 +21,7 @@ from pass3f_candidates import extract_addresses
 from pass3f_provenance import (
     canonical_bytes,
     content_tokens,
+    fragment_representation_type,
     normalize_text,
     read_json,
     stable_id,
@@ -51,6 +52,7 @@ _PROPOSAL_KEYS = {
     "source_fragment_ids", "composite_fragment_ids", "unresolved_fragment_ids", "evidence_refs",
     "original_pass1_subjects", "origin_stage",
     "reason", "confidence", "ambiguous", "requires_human_review", "truncation_context",
+    "fragment_classifications",
 }
 _LLM_DECISION_KEYS = {
     "candidate_id", "action", "target_subject", "confidence", "ambiguous",
@@ -569,14 +571,64 @@ def classify_candidate_fragments(
     candidate: dict[str, Any],
     decision: dict[str, Any],
     packet: dict[str, Any],
-) -> dict[str, list[str]]:
+) -> dict[str, Any]:
     fragment_refs = sorted(set(candidate.get("fragment_refs") or []))
-    result = {"applicable": [], "composite": [], "unresolved": []}
+    result = {
+        "applicable": [],
+        "composite": [],
+        "unresolved": [],
+        "provenance_projection": [],
+        "participant_object": [],
+        "participant_subfield": [],
+        "metadata": [],
+        "unsupported": [],
+        "classifications": [],
+    }
     if not fragment_refs:
         return result
-    if candidate.get("kind") != "subject_reference_conflict" or decision.get("target_subject") is None:
-        result["unresolved"] = fragment_refs
+    fragments = {
+        item["fragment_id"]: item
+        for item in packet.get("candidate_fragments", []) + packet.get("pass3e_fragments", [])
+    }
+
+    def classify_without_target() -> dict[str, Any]:
+        for fragment_id in fragment_refs:
+            fragment = fragments.get(fragment_id)
+            representation_type = (
+                str(fragment.get("representation_type"))
+                if fragment and fragment.get("representation_type")
+                else fragment_representation_type(
+                    str(fragment.get("stage") or "") if fragment else "",
+                    str(fragment.get("field_path") or "") if fragment else "",
+                )
+            )
+            if representation_type in {
+                "provenance_projection", "participant_object",
+                "participant_subfield", "metadata",
+            }:
+                bucket = representation_type
+                disposition = (
+                    "manifest_only"
+                    if representation_type in {"provenance_projection", "metadata"}
+                    else "structured_object_operation_required"
+                    if representation_type == "participant_object"
+                    else "structured_parent_required"
+                )
+            else:
+                bucket = "unresolved"
+                disposition = "blocked"
+            result[bucket].append(fragment_id)
+            result["classifications"].append({
+                "fragment_id": fragment_id,
+                "representation_type": representation_type,
+                "content_shape": "unresolved",
+                "operation_disposition": disposition,
+            })
+        result["classifications"].sort(key=lambda item: item["fragment_id"])
         return result
+
+    if candidate.get("kind") != "subject_reference_conflict" or decision.get("target_subject") is None:
+        return classify_without_target()
 
     subjects = {
         str(item["subject_id"]): item
@@ -585,13 +637,8 @@ def classify_candidate_fragments(
     target_id = str(decision["target_subject"])
     target = subjects.get(target_id)
     if target is None:
-        result["unresolved"] = fragment_refs
-        return result
+        return classify_without_target()
     target_addresses, target_identities, target_phrases = _subject_signals(target)
-    fragments = {
-        item["fragment_id"]: item
-        for item in packet.get("candidate_fragments", []) + packet.get("pass3e_fragments", [])
-    }
     other_subject_signals = [
         _subject_signals(subject)
         for subject_id, subject in subjects.items()
@@ -602,6 +649,12 @@ def classify_candidate_fragments(
         fragment = fragments.get(fragment_id)
         if fragment is None:
             result["unresolved"].append(fragment_id)
+            result["classifications"].append({
+                "fragment_id": fragment_id,
+                "representation_type": "unsupported",
+                "content_shape": "unresolved",
+                "operation_disposition": "blocked",
+            })
             continue
         text = str(fragment.get("text") or "")
         addresses = {item["canonical"] for item in extract_addresses(text)}
@@ -619,11 +672,54 @@ def classify_candidate_fragments(
             for _addresses, _identities, phrases in other_subject_signals
             for value in phrases
         )
-        if target_address_hit or target_identity_hit or target_phrase_hit:
-            bucket = "composite" if other_address_hit or other_identity_hit or other_phrase_hit else "applicable"
-            result[bucket].append(fragment_id)
+        target_hit = target_address_hit or target_identity_hit or target_phrase_hit
+        other_hit = other_address_hit or other_identity_hit or other_phrase_hit
+        content_shape = (
+            "composite" if target_hit and other_hit
+            else "atomic" if target_hit
+            else "unresolved"
+        )
+        representation_type = str(
+            fragment.get("representation_type")
+            or fragment_representation_type(
+                str(fragment.get("stage") or ""),
+                str(fragment.get("field_path") or ""),
+            )
+        )
+        if representation_type == "publishable_text_unit":
+            if content_shape == "composite":
+                bucket = "composite"
+                disposition = "composite_split_required"
+            elif content_shape == "atomic":
+                bucket = "applicable"
+                disposition = "publishable_move"
+            else:
+                bucket = "unresolved"
+                disposition = "blocked"
+        elif representation_type == "provenance_projection":
+            bucket = "provenance_projection"
+            disposition = "manifest_only"
+        elif representation_type in {"participant_object", "participant_subfield"}:
+            bucket = representation_type
+            disposition = (
+                "structured_object_operation_required"
+                if representation_type == "participant_object"
+                else "structured_parent_required"
+            )
+        elif representation_type == "metadata":
+            bucket = "metadata"
+            disposition = "manifest_only"
         else:
-            result["unresolved"].append(fragment_id)
+            bucket = "unsupported"
+            disposition = "blocked"
+        result[bucket].append(fragment_id)
+        result["classifications"].append({
+            "fragment_id": fragment_id,
+            "representation_type": representation_type,
+            "content_shape": content_shape,
+            "operation_disposition": disposition,
+        })
+    result["classifications"].sort(key=lambda item: item["fragment_id"])
     return result
 
 
@@ -641,6 +737,7 @@ def enrich_llm_decision(
         "source_fragment_ids": sorted(fragment_classification["applicable"]),
         "composite_fragment_ids": sorted(fragment_classification["composite"]),
         "unresolved_fragment_ids": sorted(fragment_classification["unresolved"]),
+        "fragment_classifications": list(fragment_classification["classifications"]),
         "evidence_refs": sorted(decision["cited_evidence_ids"]),
         "original_pass1_subjects": list(candidate["original_pass1_subjects"]),
         "origin_stage": "indeterminate",

@@ -415,7 +415,13 @@ class Pass3FAuditTest(unittest.TestCase):
                 {"subject_id": "20", "title": "20 rue Gamma", "location": "20 rue Gamma"},
             ],
             "candidate_fragments": [
-                {"fragment_id": fragment_id, "text": text} for fragment_id, text in rows
+                {
+                    "fragment_id": fragment_id,
+                    "text": text,
+                    "stage": "3E",
+                    "field_path": f"/synthese_echanges/{index}",
+                }
+                for index, (fragment_id, text) in enumerate(rows)
             ],
             "pass3e_fragments": [],
         }
@@ -424,7 +430,7 @@ class Pass3FAuditTest(unittest.TestCase):
         self.assertEqual(classified["composite"], [rows[1][0], rows[2][0]])
         self.assertEqual(classified["unresolved"], [rows[3][0]])
 
-    def test_a007_is_classified_as_nine_applicable_three_composite_zero_unresolved(self):
+    def test_a007_separates_publishable_projection_and_participant_fragments(self):
         rows = [
             ("fragment:30a7bce88540d60c11f8d670458a2afc9aa13f2e860fe2f6c747ecf65afc99e4", "Maison du 15 avenue de Girardin (occupée par M. P166 et Mme P167) : décrite comme une construction de la première moitié du XXe siècle en maçonnerie enduite et globalement bien entretenue. Sont relevés de petites fissures au niveau des murets de l'escalier et des soubassements."),
             ("fragment:358839e1e6ea97b57f2e08d54d8b4935a1d00c9d1000bfcdb352d721c51aefed", "Dallage du 15 avenue de Girardin : signalé en mauvais état, cet état est attribué dans la synthèse aux variations du sous-sol. Cette explication est présentée comme l'interprétation des observations rapportées."),
@@ -439,6 +445,20 @@ class Pass3FAuditTest(unittest.TestCase):
             ("fragment:f2cb66309f87ea20138fcb07fc73f8ca553bef566e7363767b653c235fa4254d", "Recommandation factuelle : obtenir les coordonnées des occupants du 12 avenue de Girardin pour organiser la visite intérieure, recueillir les photographies détaillées du mur en béton côté 54 rue de Malleville et rassembler les documents techniques ou historiques relatifs à la construction du 15 avenue de Girardin afin de poursuivre l'expertise et permettre des conclusions techniques motivées."),
             ("fragment:f445596e7fc24d162acfa18fa3da3ee2b30c3c6541a76ea1b3432c7fe2481f9b", "occupant (15 avenue de Girardin)"),
         ]
+        structures = {
+            rows[0][0]: ("3E", "/synthese_echanges/2"),
+            rows[1][0]: ("3E", "/synthese_echanges/3"),
+            rows[2][0]: ("3E", "/conclusion_expert/2"),
+            rows[3][0]: ("2E", "/synthese_intermediaire/resume_factuel/0"),
+            rows[4][0]: ("2E", "/synthese_intermediaire/actions/2/0"),
+            rows[5][0]: ("3E", "/synthese_echanges/4"),
+            rows[6][0]: ("2E", "/synthese_intermediaire/points_cles/2/0"),
+            rows[7][0]: ("2E", "/synthese_intermediaire/documents_demandes/2/0"),
+            rows[8][0]: ("2E", "/synthese_intermediaire/points_cles/3/0"),
+            rows[9][0]: ("3E", "/avis_participants/3/role/0"),
+            rows[10][0]: ("3E", "/conclusion_expert/3"),
+            rows[11][0]: ("3E", "/avis_participants/2/role/0"),
+        }
         candidate = {
             "kind": "subject_reference_conflict",
             "fragment_refs": [fragment_id for fragment_id, _text in rows],
@@ -450,17 +470,31 @@ class Pass3FAuditTest(unittest.TestCase):
             ],
             "other_subject_index": [],
             "candidate_fragments": [
-                {"fragment_id": fragment_id, "text": text} for fragment_id, text in rows
+                {
+                    "fragment_id": fragment_id,
+                    "text": text,
+                    "stage": structures[fragment_id][0],
+                    "field_path": structures[fragment_id][1],
+                }
+                for fragment_id, text in rows
             ],
             "pass3e_fragments": [],
         }
         classified = classify_candidate_fragments(candidate, {"target_subject": "19"}, packet)
-        self.assertEqual(len(classified["applicable"]), 9)
-        self.assertEqual(len(classified["composite"]), 3)
+        self.assertEqual(len(classified["applicable"]), 3)
+        self.assertEqual(len(classified["composite"]), 2)
         self.assertEqual(classified["unresolved"], [])
         self.assertEqual(
             set(classified["composite"]),
-            {rows[3][0], rows[5][0], rows[10][0]},
+            {rows[5][0], rows[10][0]},
+        )
+        self.assertEqual(
+            set(classified["provenance_projection"]),
+            {rows[index][0] for index in (3, 4, 6, 7, 8)},
+        )
+        self.assertEqual(
+            set(classified["participant_subfield"]),
+            {rows[9][0], rows[11][0]},
         )
 
     def test_invalid_contract_preserves_raw_response_before_raising_without_retry(self):

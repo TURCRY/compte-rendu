@@ -50,8 +50,9 @@
       "chunk_index": {"type": ["integer", "null"]}, "chunk_total": {"type": ["integer", "null"]}, "status": {"const": "confirmed"}, "stage": {"const": "2E"}, "scope": {"enum": ["chunk", "subject"]},
       "source_file": {"type": "string", "minLength": 1}, "source_line": {"type": "integer", "minimum": 1}, "source_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "details": {"type": "string", "minLength": 1}
     }},
-    "fragment": {"type": "object", "additionalProperties": false, "required": ["fragment_id", "stage", "subject_id", "field_path", "text", "source_artifact", "links", "truncation"], "properties": {
+    "fragment": {"type": "object", "additionalProperties": false, "required": ["fragment_id", "stage", "subject_id", "field_path", "text", "source_artifact", "representation_type", "structure_algorithm", "links", "truncation"], "properties": {
       "fragment_id": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"}, "stage": {"enum": ["2E", "2F", "3E"]}, "subject_id": {"type": "string"}, "field_path": {"type": "string"}, "text": {"type": "string", "minLength": 1}, "source_artifact": {"type": "string"}, "links": {"type": "array", "items": {"$ref": "#/$defs/link"}, "minItems": 1}, "truncation": {"$ref": "#/$defs/truncation"}
+      ,"representation_type": {"enum": ["publishable_text_unit", "provenance_projection", "participant_object", "participant_subfield", "metadata", "unsupported"]}, "structure_algorithm": {"const": "pass3f.fragment-structure.v1"}
     }}
   }
 }

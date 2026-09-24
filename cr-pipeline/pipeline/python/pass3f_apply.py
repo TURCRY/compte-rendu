@@ -453,6 +453,23 @@ def build_application(
             "source_global_hash": source_hashes["global_by_sujet"],
         },
         "changes": changes,
+        "fragment_classifications": [
+            {
+                "proposal_id": proposal["proposal_id"],
+                **copy.deepcopy(classification),
+            }
+            for proposal in sorted(proposals.values(), key=lambda item: item["proposal_id"])
+            for classification in proposal.get("fragment_classifications") or []
+        ],
+        "non_publishable_fragments": [
+            {
+                "proposal_id": proposal["proposal_id"],
+                **copy.deepcopy(classification),
+            }
+            for proposal in sorted(proposals.values(), key=lambda item: item["proposal_id"])
+            for classification in proposal.get("fragment_classifications") or []
+            if classification["representation_type"] != "publishable_text_unit"
+        ],
         "composite_split_plans": [
             split_plan
             for operation in operations
