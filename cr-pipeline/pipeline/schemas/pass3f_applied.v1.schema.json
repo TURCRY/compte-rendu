@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pass3f_applied.v1.schema.json",
+  "title": "Deterministic Pass3F-B1 application result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "application_id", "run_id", "status", "source_hashes", "output_global_hash", "operations", "controls"],
+  "properties": {
+    "schema": {"const": "pass3f.applied.v1"},
+    "application_id": {"type": "string", "pattern": "^application:[0-9a-f]{64}$"},
+    "run_id": {"type": "string", "pattern": "^run:[0-9a-f]{64}$"},
+    "status": {"enum": ["applied", "partially_applied", "blocked", "no_change"]},
+    "source_hashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["global_by_sujet", "provenance_registry", "audit_proposals", "decisions"],
+      "properties": {
+        "global_by_sujet": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "provenance_registry": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "audit_proposals": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "decisions": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "output_global_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "operations": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/operation"}
+    },
+    "controls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["applied_text_is_unique", "composite_fragments_unchanged", "unresolved_fragments_not_applied", "evidence_refs_preserved", "unaffected_subjects_identical"],
+      "properties": {
+        "applied_text_is_unique": {"const": true},
+        "composite_fragments_unchanged": {"const": true},
+        "unresolved_fragments_not_applied": {"const": true},
+        "evidence_refs_preserved": {"const": true},
+        "unaffected_subjects_identical": {"const": true}
+      }
+    }
+  },
+  "$defs": {
+    "fragment_ids": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"},
+      "uniqueItems": true
+    },
+    "blocked_fragment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fragment_id", "blocker"],
+      "properties": {
+        "fragment_id": {"type": ["string", "null"], "pattern": "^fragment:[0-9a-f]{64}$"},
+        "blocker": {"type": "string", "minLength": 1}
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["proposal_id", "decision_id", "action", "source_subject", "target_subject", "status", "applied_fragment_ids", "already_applied_fragment_ids", "pending_simple_fragment_ids", "pending_composite_fragment_ids", "blocked_unresolved_fragment_ids", "blocked_fragments"],
+      "properties": {
+        "proposal_id": {"type": "string", "pattern": "^proposal:[0-9a-f]{64}$"},
+        "decision_id": {"type": "string", "pattern": "^decision:[0-9a-f]{64}$"},
+        "action": {"enum": ["move", "merge", "remove_duplicate", "retain_overlap", "no_action"]},
+        "source_subject": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+        "target_subject": {"type": ["string", "null"], "pattern": "^[1-9][0-9]*$"},
+        "status": {"enum": ["applied", "partially_applied", "blocked", "no_change", "rejected", "deferred"]},
+        "applied_fragment_ids": {"$ref": "#/$defs/fragment_ids"},
+        "already_applied_fragment_ids": {"$ref": "#/$defs/fragment_ids"},
+        "pending_simple_fragment_ids": {"$ref": "#/$defs/fragment_ids"},
+        "pending_composite_fragment_ids": {"$ref": "#/$defs/fragment_ids"},
+        "blocked_unresolved_fragment_ids": {"$ref": "#/$defs/fragment_ids"},
+        "blocked_fragments": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/blocked_fragment"}
+        }
+      }
+    }
+  }
+}

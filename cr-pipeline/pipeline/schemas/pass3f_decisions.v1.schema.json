@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pass3f_decisions.v1.schema.json",
+  "title": "Human decisions for deterministic Pass3F-B1 application",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "run_id", "source_audit_hash", "source_global_hash", "source_registry_hash", "decisions"],
+  "properties": {
+    "schema": {"const": "pass3f.decisions.v1"},
+    "run_id": {"type": "string", "pattern": "^run:[0-9a-f]{64}$"},
+    "source_audit_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_global_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_registry_hash": {"type": "string", "pattern": "^registry:[0-9a-f]{64}$"},
+    "decisions": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/decision"}
+    }
+  },
+  "$defs": {
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision_id", "proposal_id", "proposal_hash", "decision", "accepted_fragment_ids", "reviewer", "reason"],
+      "properties": {
+        "decision_id": {"type": "string", "pattern": "^decision:[0-9a-f]{64}$"},
+        "proposal_id": {"type": "string", "pattern": "^proposal:[0-9a-f]{64}$"},
+        "proposal_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "decision": {"enum": ["accepted", "rejected", "deferred"]},
+        "accepted_fragment_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"},
+          "uniqueItems": true
+        },
+        "reviewer": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}
