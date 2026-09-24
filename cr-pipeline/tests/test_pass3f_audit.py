@@ -111,6 +111,9 @@ def valid_response(packet, *, action="retain_overlap"):
                 subject_id for subject_id in candidate["allowed_subject_ids"]
                 if subject_id != candidate["source_subject"]
             )
+        selected_fragment_ids = []
+        if action in {"move", "merge", "remove_duplicate"}:
+            selected_fragment_ids = [candidate["allowed_fragment_ids"][0]]
         proposals.append({
             "candidate_id": candidate["candidate_id"],
             "action": action,
@@ -118,6 +121,8 @@ def valid_response(packet, *, action="retain_overlap"):
             "confidence": 0.62,
             "ambiguous": True,
             "cited_evidence_ids": candidate["allowed_evidence_refs"],
+            "selected_fragment_ids": selected_fragment_ids,
+            "composite_fragment_ids": [],
             "reason": "Le même extrait peut légitimement éclairer les deux objets; validation humaine requise.",
         })
     return {"proposals": proposals}
@@ -309,6 +314,8 @@ class Pass3FAuditTest(unittest.TestCase):
         self.assertIn("Pass1 sont des données historiques à auditer", SYSTEM_PROMPT)
         self.assertIn("ne prouvent jamais que l'affectation est correcte", SYSTEM_PROMPT)
         self.assertIn("conflit explicite d'adresse, lieu, acteur ou objet", SYSTEM_PROMPT)
+        self.assertIn("uniquement les fragments entièrement compatibles", SYSTEM_PROMPT)
+        self.assertIn("Ne force jamais un fragment composite", SYSTEM_PROMPT)
 
     def test_strict_parser_rejects_markdown_invented_target_and_evidence(self):
         packet = build_group_packet(self.registry, [self.candidates["candidates"][0]])
@@ -334,7 +341,8 @@ class Pass3FAuditTest(unittest.TestCase):
             self.assertEqual(set(final), self.schema["$defs"]["proposal"]["properties"].keys())
             self.assertEqual(final["proposal_id"], candidate["proposal_id"])
             self.assertEqual(final["source_subject"], candidate["source_subject"])
-            self.assertEqual(final["source_fragment_ids"], sorted(candidate["fragment_refs"]))
+            self.assertEqual(final["source_fragment_ids"], [candidate["allowed_fragment_ids"][0]])
+            self.assertEqual(final["composite_fragment_ids"], [])
             self.assertEqual(final["original_pass1_subjects"], candidate["original_pass1_subjects"])
             self.assertEqual(final["truncation_context"], candidate["truncation_context"])
             self.assertEqual(final["origin_stage"], "indeterminate")
@@ -367,6 +375,8 @@ class Pass3FAuditTest(unittest.TestCase):
                 "confidence": 0.9,
                 "ambiguous": False,
                 "cited_evidence_ids": [address_evidence_id],
+                "selected_fragment_ids": [],
+                "composite_fragment_ids": [],
                 "reason": "Pass1 avait affecté la preuve à S16.",
             }],
         }
@@ -386,6 +396,58 @@ class Pass3FAuditTest(unittest.TestCase):
         self.assertEqual(final["source_subject"], "16")
         self.assertEqual(final["original_pass1_subjects"], ["16"])
         self.assertTrue(final["ambiguous"])
+
+    def test_move_selects_simple_fragments_and_separates_composite_fragments(self):
+        source = next(item for item in self.candidates["candidates"] if item["target_subject"] is not None)
+        packet = build_group_packet(self.registry, [source])
+        allowed = packet["candidates"][0]["allowed_fragment_ids"]
+        composite_id = "fragment:" + "e" * 64
+        packet["candidates"][0]["allowed_fragment_ids"] = sorted([*allowed, composite_id])
+        decision = valid_response(packet, action="move")
+        decision["proposals"][0]["selected_fragment_ids"] = [allowed[0]]
+        decision["proposals"][0]["composite_fragment_ids"] = [composite_id]
+        final = parse_and_validate_response(json.dumps(decision), packet, self.schema)["proposals"][0]
+        self.assertEqual(final["source_fragment_ids"], [allowed[0]])
+        self.assertEqual(final["composite_fragment_ids"], [composite_id])
+
+    def test_fragment_selection_lists_must_be_disjoint(self):
+        source = next(item for item in self.candidates["candidates"] if item["target_subject"] is not None)
+        packet = build_group_packet(self.registry, [source])
+        fragment_id = packet["candidates"][0]["allowed_fragment_ids"][0]
+        decision = valid_response(packet, action="move")
+        decision["proposals"][0]["selected_fragment_ids"] = [fragment_id]
+        decision["proposals"][0]["composite_fragment_ids"] = [fragment_id]
+        with self.assertRaisesRegex(ValueError, "must be disjoint"):
+            parse_and_validate_response(json.dumps(decision), packet, self.schema)
+
+    def test_unknown_selected_or_composite_fragment_is_rejected(self):
+        source = next(item for item in self.candidates["candidates"] if item["target_subject"] is not None)
+        packet = build_group_packet(self.registry, [source])
+        unknown = "fragment:" + "f" * 64
+        for key, message in (
+            ("selected_fragment_ids", "invented selected fragment"),
+            ("composite_fragment_ids", "invented composite fragment"),
+        ):
+            with self.subTest(key=key):
+                decision = valid_response(packet, action="move")
+                decision["proposals"][0]["selected_fragment_ids"] = []
+                decision["proposals"][0]["composite_fragment_ids"] = []
+                decision["proposals"][0][key] = [unknown]
+                with self.assertRaisesRegex(ValueError, message):
+                    parse_and_validate_response(json.dumps(decision), packet, self.schema)
+
+    def test_move_requires_fragment_but_retain_overlap_allows_empty_lists(self):
+        source = next(item for item in self.candidates["candidates"] if item["target_subject"] is not None)
+        packet = build_group_packet(self.registry, [source])
+        move = valid_response(packet, action="move")
+        move["proposals"][0]["selected_fragment_ids"] = []
+        with self.assertRaisesRegex(ValueError, "requires selected or composite fragments"):
+            parse_and_validate_response(json.dumps(move), packet, self.schema)
+        retained = parse_and_validate_response(
+            json.dumps(valid_response(packet, action="retain_overlap")), packet, self.schema,
+        )["proposals"][0]
+        self.assertEqual(retained["source_fragment_ids"], [])
+        self.assertEqual(retained["composite_fragment_ids"], [])
 
     def test_invalid_contract_preserves_raw_response_before_raising_without_retry(self):
         seen = []

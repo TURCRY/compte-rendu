@@ -40,12 +40,12 @@ _ID_PATTERNS = {
 }
 _PROPOSAL_KEYS = {
     "proposal_id", "candidate_id", "action", "source_subject", "target_subject",
-    "source_fragment_ids", "evidence_refs", "original_pass1_subjects", "origin_stage",
+    "source_fragment_ids", "composite_fragment_ids", "evidence_refs", "original_pass1_subjects", "origin_stage",
     "reason", "confidence", "ambiguous", "requires_human_review", "truncation_context",
 }
 _LLM_DECISION_KEYS = {
     "candidate_id", "action", "target_subject", "confidence", "ambiguous",
-    "cited_evidence_ids", "reason",
+    "cited_evidence_ids", "selected_fragment_ids", "composite_fragment_ids", "reason",
 }
 
 
@@ -55,11 +55,16 @@ Tu audits des candidats inter-sujets sans modifier aucun artefact et sans prendr
 Règles absolues :
 - Réponds par un unique objet JSON strict, sans Markdown ni commentaire hors JSON.
 - Produis exactement une décision par candidate_id et recopie seulement candidate_id sans le modifier.
-- Chaque décision contient exclusivement : candidate_id, action, target_subject, confidence, ambiguous, cited_evidence_ids et reason.
-- Ne retourne aucune métadonnée déterministe telle que proposal_id, source_subject, fragments, affectations Pass1, provenance, troncature ou revue humaine ; Python les réinjecte après validation.
+- Chaque décision contient exclusivement : candidate_id, action, target_subject, confidence, ambiguous, cited_evidence_ids, selected_fragment_ids, composite_fragment_ids et reason.
+- Ne retourne aucune métadonnée déterministe telle que proposal_id, source_subject, affectations Pass1, provenance, troncature ou revue humaine ; Python les réinjecte après validation.
 - Une cible doit appartenir à allowed_subject_ids. N'invente ni sujet, ni fragment, ni preuve.
 - Les identités de other_subject_index servent uniquement à la comparaison. Elles ne permettent jamais de choisir comme cible un sujet absent de allowed_subject_ids.
 - cited_evidence_ids doit être un sous-ensemble exact de direct_evidence_refs. Les context_evidence_refs peuvent être lues pour comprendre la séquence, mais ne sont jamais citables comme preuves de la décision.
+- selected_fragment_ids et composite_fragment_ids doivent être des sous-ensembles disjoints de allowed_fragment_ids.
+- Place dans selected_fragment_ids uniquement les fragments entièrement compatibles avec l'action proposée.
+- Place dans composite_fragment_ids tout fragment contenant à la fois du contenu à déplacer, fusionner ou dédupliquer et du contenu à conserver. Ne force jamais un fragment composite dans selected_fragment_ids.
+- Pour move, merge ou remove_duplicate, au moins une de ces deux listes doit être non vide. Un fragment composite est signalé pour revue et ne doit jamais être appliqué directement par 3F-B.
+- retain_overlap et no_action peuvent laisser les deux listes vides lorsqu'aucune intervention textuelle n'est nécessaire.
 - Les affectations Pass1 sont des données historiques à auditer et ne prouvent jamais que l'affectation est correcte. Une preuve affectée à un sujet peut précisément être mal classée. La décision doit comparer le contenu factuel de la preuve au référentiel canonique des sujets.
 - Un conflit explicite d'adresse, lieu, acteur ou objet avec le référentiel canonique ne peut pas être rejeté comme faux positif uniquement parce que Pass1 avait affecté la preuve au sujet courant.
 - Un lien de provenance candidate ou unresolved ne devient jamais verified par ton analyse.
@@ -376,7 +381,8 @@ def user_prompt(packet: dict[str, Any]) -> str:
     return (
         "Audite chaque candidat du paquet ci-dessous. Réponds avec exactement cette racine JSON : "
         "{\"proposals\":[...]}. Chaque objet contient exactement : "
-        "candidate_id, action, target_subject, confidence, ambiguous, cited_evidence_ids, reason. "
+        "candidate_id, action, target_subject, confidence, ambiguous, cited_evidence_ids, "
+        "selected_fragment_ids, composite_fragment_ids, reason. "
         "Ne recopie aucune autre métadonnée du paquet.\n\n"
         + json.dumps(packet, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )
@@ -462,10 +468,19 @@ def _validate_proposal_shape(proposal: Any) -> None:
         raise ValueError("source_subject must be a string")
     if proposal["target_subject"] is not None and not isinstance(proposal["target_subject"], str):
         raise ValueError("target_subject must be a string or null")
-    for key in ("source_fragment_ids", "evidence_refs", "original_pass1_subjects"):
+    for key in ("source_fragment_ids", "composite_fragment_ids", "evidence_refs", "original_pass1_subjects"):
         values = proposal[key]
         if not isinstance(values, list) or not all(isinstance(value, str) for value in values) or len(values) != len(set(values)):
             raise ValueError(f"{key} must be a unique string array")
+    selected_fragment_ids = set(proposal["source_fragment_ids"])
+    composite_fragment_ids = set(proposal["composite_fragment_ids"])
+    if selected_fragment_ids & composite_fragment_ids:
+        raise ValueError("source and composite fragment lists must be disjoint")
+    if (
+        proposal["action"] in {"move", "merge", "remove_duplicate"}
+        and not (selected_fragment_ids or composite_fragment_ids)
+    ):
+        raise ValueError(f"action {proposal['action']} requires source or composite fragments")
     if not isinstance(proposal["reason"], str) or not proposal["reason"].strip():
         raise ValueError("reason must be non-empty")
     confidence = proposal["confidence"]
@@ -502,22 +517,25 @@ def _validate_llm_decision_shape(decision: Any) -> None:
         raise ValueError("cited_evidence_ids must be a string array")
     if len(evidence_ids) != len(set(evidence_ids)):
         raise ValueError("cited_evidence_ids must not contain duplicates")
+    for key in ("selected_fragment_ids", "composite_fragment_ids"):
+        fragment_ids = decision[key]
+        if not isinstance(fragment_ids, list) or not all(isinstance(value, str) for value in fragment_ids):
+            raise ValueError(f"{key} must be a string array")
+        if len(fragment_ids) != len(set(fragment_ids)):
+            raise ValueError(f"{key} must not contain duplicates")
     if not isinstance(decision["reason"], str) or not decision["reason"].strip():
         raise ValueError("reason must be non-empty")
 
 
 def enrich_llm_decision(candidate: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
-    direct_fragment_ids = sorted({
-        fragment_id for fragment_id in candidate.get("fragment_refs") or []
-        if fragment_id in candidate["allowed_fragment_ids"]
-    })
     proposal = {
         "proposal_id": candidate["proposal_id"],
         "candidate_id": candidate["candidate_id"],
         "action": decision["action"],
         "source_subject": str(candidate["source_subject"]),
         "target_subject": decision["target_subject"],
-        "source_fragment_ids": direct_fragment_ids,
+        "source_fragment_ids": sorted(decision["selected_fragment_ids"]),
+        "composite_fragment_ids": sorted(decision["composite_fragment_ids"]),
         "evidence_refs": sorted(decision["cited_evidence_ids"]),
         "original_pass1_subjects": list(candidate["original_pass1_subjects"]),
         "origin_stage": "indeterminate",
@@ -555,8 +573,22 @@ def parse_and_validate_response(
             raise ValueError(f"invented target subject for {candidate_id}")
         if not set(decision["cited_evidence_ids"]).issubset(candidate["allowed_evidence_refs"]):
             raise ValueError(f"invented evidence reference for {candidate_id}")
+        selected_fragment_ids = set(decision["selected_fragment_ids"])
+        composite_fragment_ids = set(decision["composite_fragment_ids"])
+        allowed_fragment_ids = set(candidate["allowed_fragment_ids"])
+        if not selected_fragment_ids.issubset(allowed_fragment_ids):
+            raise ValueError(f"invented selected fragment reference for {candidate_id}")
+        if not composite_fragment_ids.issubset(allowed_fragment_ids):
+            raise ValueError(f"invented composite fragment reference for {candidate_id}")
+        if selected_fragment_ids & composite_fragment_ids:
+            raise ValueError(f"selected and composite fragment lists must be disjoint for {candidate_id}")
         if decision["action"] in {"move", "merge", "remove_duplicate"} and target is None:
             raise ValueError(f"action {decision['action']} requires a target for {candidate_id}")
+        if (
+            decision["action"] in {"move", "merge", "remove_duplicate"}
+            and not (selected_fragment_ids or composite_fragment_ids)
+        ):
+            raise ValueError(f"action {decision['action']} requires selected or composite fragments for {candidate_id}")
         if (
             candidate.get("kind") == "subject_reference_conflict"
             and target is None
