@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pass3f_composite_validations.v1.schema.json",
+  "title": "Human validations for resolved Pass3F composite plans",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "run_id", "source_hashes", "validations"],
+  "properties": {
+    "schema": {"const": "pass3f.composite_validations.v1"},
+    "run_id": {"type": "string", "pattern": "^run:[0-9a-f]{64}$"},
+    "source_hashes": {"$ref": "#/$defs/source_hashes"},
+    "validations": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/validation"}
+    }
+  },
+  "$defs": {
+    "source_hashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["global_by_sujet", "provenance_registry", "pass3f_applied", "correction_manifest", "transverse_units"],
+      "properties": {
+        "global_by_sujet": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "provenance_registry": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "pass3f_applied": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "correction_manifest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "transverse_units": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "unit_disposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit_id", "destination", "unit_hash"],
+      "properties": {
+        "unit_id": {"type": "string", "pattern": "^composite-unit:[0-9a-f]{64}$"},
+        "destination": {
+          "oneOf": [
+            {"type": "string", "pattern": "^subject:[1-9][0-9]*$"},
+            {"enum": ["transverse_document_request", "metadata_only", "discard_editorial_wrapper"]}
+          ]
+        },
+        "unit_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "transverse_reconciliation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit_id", "materialization_status", "existing_match_hash"],
+      "properties": {
+        "unit_id": {"type": "string", "pattern": "^composite-unit:[0-9a-f]{64}$"},
+        "materialization_status": {"enum": ["reuse_existing", "prepare_new"]},
+        "existing_match_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["validation_id", "proposal_id", "split_plan_id", "split_plan_hash", "fragment_id", "fragment_hash", "evidence_occurrence_ids", "evidence_occurrences_hash", "unit_dispositions", "transverse_reconciliations", "decision", "reviewer", "reason"],
+      "properties": {
+        "validation_id": {"type": "string", "pattern": "^composite-validation:[0-9a-f]{64}$"},
+        "proposal_id": {"type": "string", "pattern": "^proposal:[0-9a-f]{64}$"},
+        "split_plan_id": {"type": "string", "pattern": "^composite-split-plan:[0-9a-f]{64}$"},
+        "split_plan_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "fragment_id": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"},
+        "fragment_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "evidence_occurrence_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^evidence-occurrence:[0-9a-f]{64}$"},
+          "uniqueItems": true
+        },
+        "evidence_occurrences_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "unit_dispositions": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/unit_disposition"},
+          "minItems": 1
+        },
+        "transverse_reconciliations": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/transverse_reconciliation"}
+        },
+        "decision": {"const": "accepted"},
+        "reviewer": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

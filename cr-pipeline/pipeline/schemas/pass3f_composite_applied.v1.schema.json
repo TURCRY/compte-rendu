@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pass3f_composite_applied.v1.schema.json",
+  "title": "Deterministic application of validated Pass3F composite plans",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "application_id", "run_id", "status", "source_hashes", "output_global_hash", "operations", "controls"],
+  "properties": {
+    "schema": {"const": "pass3f.composite_applied.v1"},
+    "application_id": {"type": "string", "pattern": "^composite-application:[0-9a-f]{64}$"},
+    "run_id": {"type": "string", "pattern": "^run:[0-9a-f]{64}$"},
+    "status": {"enum": ["fully_applied", "partially_applied", "blocked"]},
+    "source_hashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["global_by_sujet", "provenance_registry", "pass3f_applied", "correction_manifest", "transverse_units"],
+      "properties": {
+        "global_by_sujet": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "provenance_registry": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "pass3f_applied": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "correction_manifest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "transverse_units": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "output_global_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "operations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["proposal_id", "split_plan_id", "fragment_id", "validation_id", "status", "blockers", "subject_unit_ids", "transverse_unit_ids", "metadata_unit_ids", "discarded_unit_ids"],
+        "properties": {
+          "proposal_id": {"type": "string", "pattern": "^proposal:[0-9a-f]{64}$"},
+          "split_plan_id": {"type": "string", "pattern": "^composite-split-plan:[0-9a-f]{64}$"},
+          "fragment_id": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"},
+          "validation_id": {"type": ["string", "null"], "pattern": "^composite-validation:[0-9a-f]{64}$"},
+          "status": {"enum": ["fully_applied", "blocked"]},
+          "blockers": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+          "subject_unit_ids": {"type": "array", "items": {"type": "string", "pattern": "^composite-unit:[0-9a-f]{64}$"}, "uniqueItems": true},
+          "transverse_unit_ids": {"type": "array", "items": {"type": "string", "pattern": "^composite-unit:[0-9a-f]{64}$"}, "uniqueItems": true},
+          "metadata_unit_ids": {"type": "array", "items": {"type": "string", "pattern": "^composite-unit:[0-9a-f]{64}$"}, "uniqueItems": true},
+          "discarded_unit_ids": {"type": "array", "items": {"type": "string", "pattern": "^composite-unit:[0-9a-f]{64}$"}, "uniqueItems": true}
+        }
+      }
+    },
+    "controls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["original_fragments_removed", "subject_units_unique", "transverse_units_reconciled", "metadata_preserved_in_manifest", "unaffected_subjects_identical"],
+      "properties": {
+        "original_fragments_removed": {"type": "boolean"},
+        "subject_units_unique": {"type": "boolean"},
+        "transverse_units_reconciled": {"type": "boolean"},
+        "metadata_preserved_in_manifest": {"type": "boolean"},
+        "unaffected_subjects_identical": {"type": "boolean"}
+      }
+    }
+  }
+}
