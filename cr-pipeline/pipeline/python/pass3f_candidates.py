@@ -13,13 +13,23 @@ from typing import Any, Iterable
 from pass3f_provenance import content_tokens, normalize_text, read_json, stable_id, write_json_deterministic
 
 
-SCHEMA_VERSION = "pass3f.candidates.v1"
+SCHEMA_VERSION = "pass3f.candidates.v2"
 _ADDRESS_RE = re.compile(
     r"\b(?P<number>\d{1,4})\s+"
     r"(?P<kind>rue|avenue|boulevard|place|all[ée]e|chemin|impasse)\s+"
     r"(?:(?:de\s+la|de\s+l['’]|de|du|des)\s+)?"
     r"(?P<name>[A-ZÀ-ÖØ-Þ][\w'’-]*(?:\s+[A-ZÀ-ÖØ-Þ][\w'’-]*){0,3})"
 )
+
+
+def _index_unique(items: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for item in items:
+        value = str(item[key])
+        if value in result:
+            raise ValueError(f"duplicate {key}: {value}")
+        result[value] = item
+    return result
 
 
 def _canonical_address(match: re.Match[str]) -> str:
@@ -71,7 +81,7 @@ def _contains_normalized_identity(text: str, identity: str) -> bool:
 
 
 def _enrich_target_signals(registry: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
-    evidence = {item["evidence_id"]: item for item in registry["evidence"]}
+    evidence = _index_unique(registry["evidence"], "evidence_occurrence_id")
     fragments = {item["fragment_id"]: item for item in registry["derived_fragments"]}
     address_subjects, identity_subjects = _subject_signal_indexes(registry)
     texts = [candidate.get("excerpt", "")]
@@ -124,7 +134,7 @@ def _shared_evidence(registry: dict[str, Any]) -> Iterable[dict[str, Any]]:
                 "source_subject": left,
                 "target_subject": right,
                 "excerpt": item["exact_text"],
-                "evidence_refs": [item["evidence_id"]],
+                "evidence_refs": [item["evidence_occurrence_id"]],
                 "fragment_refs": [],
                 "signals": ["same persistent source evidence assigned by Pass1 to both subjects"],
                 "score": 1.0,
@@ -132,7 +142,7 @@ def _shared_evidence(registry: dict[str, Any]) -> Iterable[dict[str, Any]]:
 
 
 def _reference_conflicts(registry: dict[str, Any]) -> Iterable[dict[str, Any]]:
-    evidence_by_id = {item["evidence_id"]: item for item in registry["evidence"]}
+    evidence_by_id = _index_unique(registry["evidence"], "evidence_occurrence_id")
     subject_addresses: dict[str, set[str]] = {}
     address_subjects: dict[str, list[str]] = defaultdict(list)
     for subject in registry["subjects"]:
@@ -167,7 +177,7 @@ def _reference_conflicts(registry: dict[str, Any]) -> Iterable[dict[str, Any]]:
                     }
                 grouped[key]["fragment_refs"].append(fragment["fragment_id"])
                 for link in fragment["links"]:
-                    evidence_id = link["evidence_id"]
+                    evidence_id = link["evidence_occurrence_id"]
                     if not evidence_id:
                         continue
                     grouped[key]["evidence_refs"].append(evidence_id)
@@ -201,8 +211,14 @@ def _derived_duplicates(registry: dict[str, Any]) -> Iterable[dict[str, Any]]:
         exact = normalize_text(left["text"]) == normalize_text(right["text"])
         if not exact and score < 0.9:
             continue
-        left_evidence = {link["evidence_id"] for link in left["links"] if link["evidence_id"]}
-        right_evidence = {link["evidence_id"] for link in right["links"] if link["evidence_id"]}
+        left_evidence = {
+            link["evidence_occurrence_id"] for link in left["links"]
+            if link["evidence_occurrence_id"]
+        }
+        right_evidence = {
+            link["evidence_occurrence_id"] for link in right["links"]
+            if link["evidence_occurrence_id"]
+        }
         common_evidence = left_evidence & right_evidence
         if not common_evidence:
             continue
@@ -218,7 +234,7 @@ def _derived_duplicates(registry: dict[str, Any]) -> Iterable[dict[str, Any]]:
 
 
 def build_candidates(registry: dict[str, Any]) -> dict[str, Any]:
-    if registry.get("schema") != "pass3f.provenance.v1":
+    if registry.get("schema") != "pass3f.provenance.v2":
         raise ValueError("unsupported provenance registry schema")
     values = list(_shared_evidence(registry))
     values.extend(_reference_conflicts(registry))

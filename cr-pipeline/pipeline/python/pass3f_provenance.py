@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = "pass3f.provenance.v1"
+SCHEMA_VERSION = "pass3f.provenance.v2"
+EVIDENCE_OCCURRENCE_ALGORITHM = "pass3f.evidence-occurrence.v2"
+EVIDENCE_CONTENT_ALGORITHM = "pass3f.evidence-content.v1"
 _WORD_RE = re.compile(r"[a-z0-9]+")
 _CIVILITY_RE = re.compile(
     r"\b(?:M(?:onsieur)?\.?|Mme\.?|Madame|Mlle\.?|Mademoiselle|Ma[iî]tre)\s+",
@@ -309,7 +311,7 @@ def _pass2e_truncation(
     return summaries, events
 
 
-def _evidence_locator(item: dict[str, Any]) -> dict[str, Any]:
+def _source_evidence_locator(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "segment_id": str(item.get("segment_id") or ""),
         "row_ref": item.get("row_ref"),
@@ -317,6 +319,50 @@ def _evidence_locator(item: dict[str, Any]) -> dict[str, Any]:
         "speaker": str(item.get("auteur") or ""),
         "exact_text": str(item.get("texte") or ""),
     }
+
+
+def _normalized_evidence_locator(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "segment_id": str(item.get("segment_id") or ""),
+        "row_ref": item.get("row_ref"),
+        "timecode": str(item.get("timecode") or ""),
+        "speaker": str(item.get("speaker") or ""),
+        "exact_text": str(item.get("exact_text") or ""),
+    }
+
+
+def _json_pointer_token(value: Any) -> str:
+    return str(value).replace("~", "~0").replace("/", "~1")
+
+
+def _legacy_evidence_id(source_hash: str, item: dict[str, Any]) -> str:
+    # Reproduce the v1 bug for historical diagnostics only.
+    return stable_id("evidence", {
+        "source_hash": source_hash,
+        "locator": _source_evidence_locator(item),
+    })
+
+
+def _evidence_occurrence_id(source_hash: str, item: dict[str, Any]) -> str:
+    locator = _normalized_evidence_locator(item)
+    return stable_id("evidence-occurrence", {
+        "algorithm": EVIDENCE_OCCURRENCE_ALGORITHM,
+        "source_artifact": "global.json",
+        "source_hash": source_hash,
+        "source_pointers": sorted(item["source_pointers"]),
+        "segment_id": locator["segment_id"],
+        "row_ref": locator["row_ref"],
+        "timecode": locator["timecode"],
+        "speaker": locator["speaker"],
+        "exact_text_sha256": hashlib.sha256(locator["exact_text"].encode("utf-8")).hexdigest(),
+    })
+
+
+def _evidence_content_id(exact_text: str) -> str:
+    return stable_id("evidence-content", {
+        "algorithm": EVIDENCE_CONTENT_ALGORITHM,
+        "normalized_text": normalize_text(exact_text),
+    })
 
 
 def _paragraphs(value: str) -> list[str]:
@@ -364,7 +410,7 @@ def _link_fragment(text: str, evidence: list[dict[str, Any]]) -> list[dict[str, 
             normalized in evidence_normalized or evidence_normalized in normalized
         ):
             verified.append({
-                "evidence_id": item["evidence_id"],
+                "evidence_occurrence_id": item["evidence_occurrence_id"],
                 "link_status": "verified",
                 "method": "normalized_exact_containment",
                 "score": 1.0,
@@ -376,18 +422,18 @@ def _link_fragment(text: str, evidence: list[dict[str, Any]]) -> list[dict[str, 
         score = (overlap / denominator) if denominator else 0.0
         if overlap >= 3 and score >= 0.6:
             candidates.append({
-                "evidence_id": item["evidence_id"],
+                "evidence_occurrence_id": item["evidence_occurrence_id"],
                 "link_status": "candidate",
                 "method": "token_overlap",
                 "score": round(score, 6),
             })
     links = verified or sorted(
-        candidates, key=lambda link: (-link["score"], link["evidence_id"])
+        candidates, key=lambda link: (-link["score"], link["evidence_occurrence_id"])
     )[:8]
     if links:
-        return sorted(links, key=lambda link: (link["link_status"], link["evidence_id"]))
+        return sorted(links, key=lambda link: (link["link_status"], link["evidence_occurrence_id"]))
     return [{
-        "evidence_id": None,
+        "evidence_occurrence_id": None,
         "link_status": "unresolved",
         "method": "none",
         "score": 0.0,
@@ -449,33 +495,54 @@ def build_registry(
         subject_id = str(_subject_number(raw_subject_id))
         if subject_id not in subject_ids:
             continue
-        for item in raw_subjects.get(raw_subject_id) or []:
+        locator_occurrences: dict[bytes, int] = defaultdict(int)
+        for item_index, item in enumerate(raw_subjects.get(raw_subject_id) or []):
             if not isinstance(item, dict) or not str(item.get("texte") or "").strip():
                 continue
-            locator = _evidence_locator(item)
-            key = canonical_bytes(locator)
+            locator = _source_evidence_locator(item)
+            locator_key = canonical_bytes(locator)
+            occurrence_index = locator_occurrences[locator_key]
+            locator_occurrences[locator_key] += 1
+            key = canonical_bytes({"locator": locator, "occurrence_index": occurrence_index})
             if key not in grouped:
                 grouped[key] = {
                     **locator,
+                    "source_artifact": "global.json",
+                    "source_pointers": set(),
                     "pass1_subjects": set(),
                     "projection_classification": str(item.get("projection_classification") or ""),
                     "reported_subject_count": item.get("row_ref_subject_count"),
                 }
+            grouped[key]["source_pointers"].add(
+                f"/sujets/{_json_pointer_token(raw_subject_id)}/{item_index}"
+            )
             grouped[key]["pass1_subjects"].add(subject_id)
 
     evidence: list[dict[str, Any]] = []
     for key in sorted(grouped):
         item = grouped[key]
+        item["source_pointers"] = sorted(item["source_pointers"])
         item["pass1_subjects"] = sorted(item["pass1_subjects"], key=int)
-        item["evidence_id"] = stable_id("evidence", {
-            "source_hash": input_hashes["global.json"],
-            "locator": _evidence_locator(item),
-        })
+        item["identity_algorithm"] = EVIDENCE_OCCURRENCE_ALGORITHM
+        item["source_hash"] = input_hashes["global.json"]
+        item["exact_text_sha256"] = hashlib.sha256(item["exact_text"].encode("utf-8")).hexdigest()
+        item["evidence_occurrence_id"] = _evidence_occurrence_id(input_hashes["global.json"], item)
+        item["evidence_content_id"] = _evidence_content_id(item["exact_text"])
+        item["legacy_evidence_id"] = _legacy_evidence_id(input_hashes["global.json"], item)
         evidence.append(item)
+    legacy_counts: dict[str, int] = defaultdict(int)
+    for item in evidence:
+        legacy_counts[item["legacy_evidence_id"]] += 1
+    for item in evidence:
+        item["legacy_evidence_id_collision"] = legacy_counts[item["legacy_evidence_id"]] > 1
+        item["legacy_evidence_id_occurrence_count"] = legacy_counts[item["legacy_evidence_id"]]
+    occurrence_ids = [item["evidence_occurrence_id"] for item in evidence]
+    if len(occurrence_ids) != len(set(occurrence_ids)):
+        raise ValueError("evidence occurrence identity collision")
     evidence.sort(key=lambda item: (
         str(item["segment_id"]),
         item["row_ref"] if isinstance(item["row_ref"], int) else 10**12,
-        item["evidence_id"],
+        item["evidence_occurrence_id"],
     ))
     by_subject: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in evidence:
@@ -569,6 +636,9 @@ def build_registry(
         "stats": {
             "subject_count": len(subjects),
             "evidence_count": len(evidence),
+            "evidence_occurrence_count": len(evidence),
+            "evidence_content_count": len({item["evidence_content_id"] for item in evidence}),
+            "legacy_evidence_collision_id_count": sum(count > 1 for count in legacy_counts.values()),
             "derived_fragment_count": len(derived),
             "verified_link_count": sum(link["link_status"] == "verified" for item in derived for link in item["links"]),
             "candidate_link_count": sum(link["link_status"] == "candidate" for item in derived for link in item["links"]),

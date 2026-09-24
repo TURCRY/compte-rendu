@@ -20,7 +20,7 @@ from pass3f_provenance import (
 
 
 DECISIONS_SCHEMA_VERSION = "pass3f.decisions.v1"
-APPLIED_SCHEMA_VERSION = "pass3f.applied.v1"
+APPLIED_SCHEMA_VERSION = "pass3f.applied.v2"
 PLAN_SCHEMA_VERSION = "pass3f.application_plan.v1"
 MANIFEST_SCHEMA_VERSION = "pass3f.correction_manifest.v1"
 HASHES_SCHEMA_VERSION = "pass3f.hashes.v1"
@@ -94,9 +94,9 @@ def _occurrences(subject: dict[str, Any], text: str) -> list[dict[str, Any]]:
 
 def _fragment_evidence(fragment: dict[str, Any]) -> list[str]:
     return sorted({
-        str(link["evidence_id"])
+        str(link["evidence_occurrence_id"])
         for link in fragment.get("links") or []
-        if link.get("evidence_id")
+        if link.get("evidence_occurrence_id")
     })
 
 
@@ -248,6 +248,10 @@ def build_application(
     decisions: dict[str, Any],
 ) -> dict[str, Any]:
     _validate_decisions(decisions, audit, global_by_subject)
+    if registry.get("schema") != "pass3f.provenance.v2":
+        raise StaleDecisionError("unsupported or stale provenance registry schema")
+    if audit.get("schema") != "pass3f.audit.v2":
+        raise StaleDecisionError("unsupported or stale audit schema")
     if audit.get("source_registry_hash") != stable_id("registry", registry):
         raise StaleDecisionError("audit registry hash does not match registry")
     if registry.get("run", {}).get("run_id") != audit.get("run_id"):

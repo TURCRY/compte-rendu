@@ -28,7 +28,7 @@ from pass3f_candidates import build_candidates  # noqa: E402
 from pass3f_provenance import stable_id, write_json_deterministic  # noqa: E402
 
 
-SCHEMA_PATH = ROOT / "pipeline" / "schemas" / "pass3f_audit.v1.schema.json"
+SCHEMA_PATH = ROOT / "pipeline" / "schemas" / "pass3f_audit.v2.schema.json"
 
 
 def truncation(status="none", scope="subject"):
@@ -58,7 +58,7 @@ def fixture_documents():
             "exact_text": text,
         }
         evidence.append({
-            "evidence_id": stable_id("evidence", locator),
+            "evidence_occurrence_id": stable_id("evidence-occurrence", locator),
             **locator,
             "pass1_subjects": subjects,
             "projection_classification": "specifique",
@@ -87,11 +87,11 @@ def fixture_documents():
         fragments.append({
             "fragment_id": stable_id("fragment", base),
             **base,
-            "links": [{"evidence_id": link["evidence_id"], "link_status": "candidate", "method": "token_overlap", "score": 0.8}],
+            "links": [{"evidence_occurrence_id": link["evidence_occurrence_id"], "link_status": "candidate", "method": "token_overlap", "score": 0.8}],
             "truncation": truncation("possible" if subject_id == "1" else ("unknown" if subject_id == "3" else "none"), "subject" if subject_id != "3" else "unknown"),
         })
     registry = {
-        "schema": "pass3f.provenance.v1",
+        "schema": "pass3f.provenance.v2",
         "run": {"run_id": stable_id("run", "fixture"), "pipeline_kind": "generaliste", "input_hashes": {"global.json": "b" * 64}},
         "subjects": subjects,
         "evidence": evidence,
@@ -126,7 +126,7 @@ def valid_response(packet, *, action="retain_overlap"):
 
 def address_conflict_documents():
     address_evidence = {
-        "evidence_id": stable_id("evidence", "61 avenue Gérardin"),
+        "evidence_occurrence_id": stable_id("evidence-occurrence", "61 avenue Gérardin"),
         "segment_id": "segment_16",
         "row_ref": 16,
         "timecode": "00:16:00",
@@ -137,7 +137,7 @@ def address_conflict_documents():
         "reported_subject_count": 1,
     }
     context_evidence = {
-        "evidence_id": stable_id("evidence", "fenêtre ouverte"),
+        "evidence_occurrence_id": stable_id("evidence-occurrence", "fenêtre ouverte"),
         "segment_id": "segment_16",
         "row_ref": 17,
         "timecode": "00:16:17",
@@ -158,8 +158,8 @@ def address_conflict_documents():
         "fragment_id": stable_id("fragment", composite_base),
         **composite_base,
         "links": [
-            {"evidence_id": address_evidence["evidence_id"], "link_status": "candidate", "method": "token_overlap", "score": 1.0},
-            {"evidence_id": context_evidence["evidence_id"], "link_status": "candidate", "method": "token_overlap", "score": 1.0},
+            {"evidence_occurrence_id": address_evidence["evidence_occurrence_id"], "link_status": "candidate", "method": "token_overlap", "score": 1.0},
+            {"evidence_occurrence_id": context_evidence["evidence_occurrence_id"], "link_status": "candidate", "method": "token_overlap", "score": 1.0},
         ],
         "truncation": truncation("none"),
     }
@@ -174,7 +174,7 @@ def address_conflict_documents():
         "fragment_id": stable_id("fragment", direct_base),
         **direct_base,
         "links": [{
-            "evidence_id": address_evidence["evidence_id"],
+            "evidence_occurrence_id": address_evidence["evidence_occurrence_id"],
             "link_status": "candidate",
             "method": "token_overlap",
             "score": 0.9,
@@ -182,7 +182,7 @@ def address_conflict_documents():
         "truncation": truncation("none"),
     }
     registry = {
-        "schema": "pass3f.provenance.v1",
+        "schema": "pass3f.provenance.v2",
         "run": {
             "run_id": stable_id("run", "address-conflict"),
             "pipeline_kind": "generaliste",
@@ -325,7 +325,7 @@ class Pass3FAuditTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_and_validate_response(json.dumps(parsed), packet, self.schema)
         parsed = valid_response(packet)
-        parsed["proposals"][0]["cited_evidence_ids"] = ["evidence:" + "f" * 64]
+        parsed["proposals"][0]["cited_evidence_ids"] = ["evidence-occurrence:" + "f" * 64]
         with self.assertRaises(ValueError):
             parse_and_validate_response(json.dumps(parsed), packet, self.schema)
 
@@ -352,7 +352,7 @@ class Pass3FAuditTest(unittest.TestCase):
         _registry, packet = address_conflict_documents()
         candidate = packet["candidates"][0]
         prompt = user_prompt(packet)
-        evidence_by_text = {item["exact_text"]: item["evidence_id"] for item in packet["evidence"]}
+        evidence_by_text = {item["exact_text"]: item["evidence_occurrence_id"] for item in packet["evidence"]}
         address_evidence_id = evidence_by_text["61 avenue Gérardin."]
         context_evidence_id = evidence_by_text["Il y a une fenêtre ouverte. Il y a peut-être quelqu'un."]
         self.assertEqual(packet["pass1_assignments_role"], "historical_audit_input_not_correctness_evidence")

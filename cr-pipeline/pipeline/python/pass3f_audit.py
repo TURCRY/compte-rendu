@@ -28,8 +28,8 @@ from pass3f_provenance import (
 )
 
 
-SCHEMA_VERSION = "pass3f.audit.v1"
-MANIFEST_VERSION = "pass3f.audit.manifest.v1"
+SCHEMA_VERSION = "pass3f.audit.v2"
+MANIFEST_VERSION = "pass3f.audit.manifest.v2"
 DEFAULT_MODEL = "pass3_remote"
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_MAX_TOKENS = 3000
@@ -246,9 +246,11 @@ def _context_windows(
     ordered = sorted(evidence_items, key=lambda item: (
         str(item.get("segment_id") or ""),
         item.get("row_ref") if isinstance(item.get("row_ref"), int) else 10**12,
-        item["evidence_id"],
+        item["evidence_occurrence_id"],
     ))
-    positions = {item["evidence_id"]: index for index, item in enumerate(ordered)}
+    positions = {item["evidence_occurrence_id"]: index for index, item in enumerate(ordered)}
+    if len(positions) != len(ordered):
+        raise ValueError("duplicate evidence_occurrence_id in provenance registry")
     windows = []
     for evidence_id in sorted(evidence_refs):
         if evidence_id not in positions:
@@ -259,7 +261,7 @@ def _context_windows(
         for near in ordered[max(0, index - radius):min(len(ordered), index + radius + 1)]:
             if near.get("segment_id") == center.get("segment_id"):
                 rows.append({
-                    "evidence_id": near["evidence_id"],
+                    "evidence_occurrence_id": near["evidence_occurrence_id"],
                     "row_ref": near["row_ref"],
                     "timecode": near["timecode"],
                     "speaker": near["speaker"],
@@ -275,7 +277,11 @@ def build_group_packet(
     candidates: list[dict[str, Any]],
 ) -> dict[str, Any]:
     subjects = {item["subject_id"]: item for item in registry["subjects"]}
-    evidence = {item["evidence_id"]: item for item in registry["evidence"]}
+    evidence = {
+        item["evidence_occurrence_id"]: item for item in registry["evidence"]
+    }
+    if len(evidence) != len(registry["evidence"]):
+        raise ValueError("duplicate evidence_occurrence_id in provenance registry")
     fragments = {item["fragment_id"]: item for item in registry["derived_fragments"]}
     subject_ids = sorted(
         {subject for item in candidates for subject in _candidate_subjects(item)},
@@ -326,7 +332,7 @@ def build_group_packet(
         if item["fragment_id"] not in candidate_fragment_refs
     ]
     return {
-        "schema": "pass3f.audit.input.v1",
+        "schema": "pass3f.audit.input.v2",
         "run_id": registry["run"]["run_id"],
         "pipeline_kind": registry["run"]["pipeline_kind"],
         "pass1_assignments_role": "historical_audit_input_not_correctness_evidence",
@@ -943,9 +949,9 @@ def run_audit(
     transport: Transport | None = None,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
-    if registry.get("schema") != "pass3f.provenance.v1":
+    if registry.get("schema") != "pass3f.provenance.v2":
         raise ValueError("unsupported provenance registry schema")
-    if candidates_doc.get("schema") != "pass3f.candidates.v1":
+    if candidates_doc.get("schema") != "pass3f.candidates.v2":
         raise ValueError("unsupported candidates schema")
     if candidates_doc.get("source_registry_hash") != stable_id("registry", registry):
         raise ValueError("candidates.json does not match provenance_registry.json")

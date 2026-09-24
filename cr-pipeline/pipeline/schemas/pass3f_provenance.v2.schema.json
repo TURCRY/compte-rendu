@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pass3f_provenance.v2.schema.json",
+  "title": "Pass3F provenance registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "run", "subjects", "evidence", "truncation_events", "derived_fragments", "stats"],
+  "properties": {
+    "schema": {"const": "pass3f.provenance.v2"},
+    "run": {"type": "object", "additionalProperties": false, "required": ["run_id", "pipeline_kind", "input_hashes"], "properties": {
+      "run_id": {"type": "string", "pattern": "^run:[0-9a-f]{64}$"}, "pipeline_kind": {"enum": ["generaliste", "refere"]},
+      "input_hashes": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+    }},
+    "subjects": {"type": "array", "items": {"$ref": "#/$defs/subject"}},
+    "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence"}},
+    "truncation_events": {"type": "array", "items": {"$ref": "#/$defs/truncation_event"}},
+    "derived_fragments": {"type": "array", "items": {"$ref": "#/$defs/fragment"}},
+    "stats": {"type": "object", "additionalProperties": false, "required": ["subject_count", "evidence_count", "evidence_occurrence_count", "evidence_content_count", "legacy_evidence_collision_id_count", "derived_fragment_count", "verified_link_count", "candidate_link_count", "unresolved_fragment_count", "confirmed_truncation_subject_count", "confirmed_truncation_fragment_count", "possible_truncation_fragment_count", "unknown_truncation_fragment_count", "truncation_event_count"], "properties": {
+      "subject_count": {"type": "integer", "minimum": 0}, "evidence_count": {"type": "integer", "minimum": 0}, "derived_fragment_count": {"type": "integer", "minimum": 0}, "verified_link_count": {"type": "integer", "minimum": 0}, "candidate_link_count": {"type": "integer", "minimum": 0}, "unresolved_fragment_count": {"type": "integer", "minimum": 0},
+      "evidence_occurrence_count": {"type": "integer", "minimum": 0}, "evidence_content_count": {"type": "integer", "minimum": 0}, "legacy_evidence_collision_id_count": {"type": "integer", "minimum": 0},
+      "confirmed_truncation_subject_count": {"type": "integer", "minimum": 0}, "confirmed_truncation_fragment_count": {"type": "integer", "minimum": 0}, "possible_truncation_fragment_count": {"type": "integer", "minimum": 0}, "unknown_truncation_fragment_count": {"type": "integer", "minimum": 0}, "truncation_event_count": {"type": "integer", "minimum": 0}
+    }}
+  },
+  "$defs": {
+    "subject": {"type": "object", "additionalProperties": false, "required": ["subject_id", "numero", "title", "location", "description", "identities", "truncation"], "properties": {
+      "subject_id": {"type": "string", "pattern": "^[1-9][0-9]*$"}, "numero": {"type": "integer", "minimum": 1}, "title": {"type": "string"}, "location": {"type": "string"}, "description": {"type": "string"},
+      "identities": {"type": "array", "items": {"$ref": "#/$defs/identity"}}, "truncation": {"$ref": "#/$defs/truncation"}
+    }},
+    "identity": {"type": "object", "additionalProperties": false, "required": ["canonical", "normalized", "role", "source"], "properties": {
+      "canonical": {"type": "string", "minLength": 1}, "normalized": {"type": "string", "minLength": 1},
+      "role": {"enum": ["proprietaire", "occupant", "partie", "societe", "organisme", "other"]}, "source": {"type": "string", "minLength": 1}
+    }},
+    "evidence": {"type": "object", "additionalProperties": false, "required": ["evidence_occurrence_id", "evidence_content_id", "identity_algorithm", "source_artifact", "source_hash", "source_pointers", "segment_id", "row_ref", "timecode", "speaker", "exact_text", "exact_text_sha256", "legacy_evidence_id", "legacy_evidence_id_collision", "legacy_evidence_id_occurrence_count", "pass1_subjects", "projection_classification", "reported_subject_count"], "properties": {
+      "evidence_occurrence_id": {"type": "string", "pattern": "^evidence-occurrence:[0-9a-f]{64}$"}, "evidence_content_id": {"type": "string", "pattern": "^evidence-content:[0-9a-f]{64}$"}, "identity_algorithm": {"const": "pass3f.evidence-occurrence.v2"},
+      "source_artifact": {"const": "global.json"}, "source_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "source_pointers": {"type": "array", "items": {"type": "string", "pattern": "^/sujets/"}, "minItems": 1, "uniqueItems": true},
+      "segment_id": {"type": "string"}, "row_ref": {"type": ["integer", "string", "null"]}, "timecode": {"type": "string"}, "speaker": {"type": "string"}, "exact_text": {"type": "string", "minLength": 1}, "exact_text_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+      "legacy_evidence_id": {"type": "string", "pattern": "^evidence:[0-9a-f]{64}$"}, "legacy_evidence_id_collision": {"type": "boolean"}, "legacy_evidence_id_occurrence_count": {"type": "integer", "minimum": 1},
+      "pass1_subjects": {"type": "array", "items": {"type": "string"}, "minItems": 1, "uniqueItems": true}, "projection_classification": {"type": "string"}, "reported_subject_count": {"type": ["integer", "null"]}
+    }},
+    "link": {"type": "object", "additionalProperties": false, "required": ["evidence_occurrence_id", "link_status", "method", "score"], "properties": {
+      "evidence_occurrence_id": {"oneOf": [{"type": "string", "pattern": "^evidence-occurrence:[0-9a-f]{64}$"}, {"type": "null"}]}, "link_status": {"enum": ["verified", "candidate", "unresolved"]}, "method": {"enum": ["normalized_exact_containment", "token_overlap", "none"]}, "score": {"type": "number", "minimum": 0, "maximum": 1}
+    }},
+    "truncation": {"type": "object", "additionalProperties": false, "required": ["status", "stage", "scope", "source_file", "source_hash", "details", "event_refs"], "properties": {
+      "status": {"enum": ["none", "confirmed", "possible", "unknown"]}, "stage": {"const": "2E"}, "scope": {"enum": ["subject", "chunk", "fragment", "unknown"]},
+      "source_file": {"type": "string"}, "source_hash": {"type": "string", "pattern": "^(|[0-9a-f]{64})$"}, "details": {"type": "string"},
+      "event_refs": {"type": "array", "items": {"type": "string", "pattern": "^truncation:[0-9a-f]{64}$"}, "uniqueItems": true}
+    }},
+    "truncation_event": {"type": "object", "additionalProperties": false, "required": ["event_id", "subject_id", "operation", "chunk_index", "chunk_total", "status", "stage", "scope", "source_file", "source_line", "source_hash", "details"], "properties": {
+      "event_id": {"type": "string", "pattern": "^truncation:[0-9a-f]{64}$"}, "subject_id": {"type": "string", "pattern": "^[1-9][0-9]*$"}, "operation": {"enum": ["chunk", "merge"]},
+      "chunk_index": {"type": ["integer", "null"]}, "chunk_total": {"type": ["integer", "null"]}, "status": {"const": "confirmed"}, "stage": {"const": "2E"}, "scope": {"enum": ["chunk", "subject"]},
+      "source_file": {"type": "string", "minLength": 1}, "source_line": {"type": "integer", "minimum": 1}, "source_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "details": {"type": "string", "minLength": 1}
+    }},
+    "fragment": {"type": "object", "additionalProperties": false, "required": ["fragment_id", "stage", "subject_id", "field_path", "text", "source_artifact", "links", "truncation"], "properties": {
+      "fragment_id": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"}, "stage": {"enum": ["2E", "2F", "3E"]}, "subject_id": {"type": "string"}, "field_path": {"type": "string"}, "text": {"type": "string", "minLength": 1}, "source_artifact": {"type": "string"}, "links": {"type": "array", "items": {"$ref": "#/$defs/link"}, "minItems": 1}, "truncation": {"$ref": "#/$defs/truncation"}
+    }}
+  }
+}

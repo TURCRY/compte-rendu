@@ -120,7 +120,7 @@ def identity_signal_registry(text):
         "speaker": "Expert", "exact_text": text,
     }
     evidence = {
-        "evidence_id": stable_id("evidence", locator), **locator,
+        "evidence_occurrence_id": stable_id("evidence-occurrence", locator), **locator,
         "pass1_subjects": ["1"], "projection_classification": "specifique", "reported_subject_count": 1,
     }
     fragment_base = {
@@ -129,11 +129,11 @@ def identity_signal_registry(text):
     }
     fragment = {
         "fragment_id": stable_id("fragment", fragment_base), **fragment_base,
-        "links": [{"evidence_id": evidence["evidence_id"], "link_status": "verified", "method": "normalized_exact_containment", "score": 1.0}],
+        "links": [{"evidence_occurrence_id": evidence["evidence_occurrence_id"], "link_status": "verified", "method": "normalized_exact_containment", "score": 1.0}],
         "truncation": dict(truncation),
     }
     return {
-        "schema": "pass3f.provenance.v1",
+        "schema": "pass3f.provenance.v2",
         "run": {"run_id": stable_id("run", "identity-signals"), "pipeline_kind": "generaliste", "input_hashes": {}},
         "subjects": subjects, "evidence": [evidence], "truncation_events": [],
         "derived_fragments": [fragment], "stats": {},
@@ -275,6 +275,42 @@ class Pass3FProvenanceTest(unittest.TestCase):
             self.assertEqual(first_registry.read_bytes(), second_registry.read_bytes())
             self.assertEqual(first_candidates.read_bytes(), second_candidates.read_bytes())
 
+    def test_occurrence_identity_distinguishes_source_positions_and_content_identity_groups_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = synthetic_run(Path(tmp))
+            global_doc = json.loads((run / "global.json").read_text(encoding="utf-8"))
+            rows = [
+                {
+                    "segment_id": "debrief", "auteur": "Expert", "texte": text,
+                    "projection_classification": "specifique",
+                }
+                for text in ("Visite du 12.", "Photos du mur.", "Documents du 15.", "Photos du mur.")
+            ]
+            global_doc["sujets"]["1"] = rows
+            dump(run / "global.json", global_doc)
+            registry = build_registry(run)
+
+        evidence = [item for item in registry["evidence"] if item["segment_id"] == "debrief"]
+        occurrence_ids = [item["evidence_occurrence_id"] for item in evidence]
+        self.assertEqual(len(occurrence_ids), 4)
+        self.assertEqual(len(set(occurrence_ids)), 4)
+        photos = [item for item in evidence if item["exact_text"] == "Photos du mur."]
+        self.assertEqual(len(photos), 2)
+        self.assertNotEqual(
+            photos[0]["evidence_occurrence_id"],
+            photos[1]["evidence_occurrence_id"],
+        )
+        self.assertEqual(photos[0]["evidence_content_id"], photos[1]["evidence_content_id"])
+        self.assertNotEqual(photos[0]["source_pointers"], photos[1]["source_pointers"])
+        self.assertTrue(all(item["legacy_evidence_id_collision"] for item in evidence))
+        self.assertTrue(all(item["legacy_evidence_id_occurrence_count"] == 4 for item in evidence))
+
+    def test_duplicate_occurrence_identity_is_rejected_instead_of_overwritten(self):
+        registry = identity_signal_registry("Visite du 20 rue Beta.")
+        registry["evidence"].append(dict(registry["evidence"][0]))
+        with self.assertRaisesRegex(ValueError, "duplicate evidence_occurrence_id"):
+            build_candidates(registry)
+
     def test_prefilter_emits_shared_evidence_and_reference_conflict(self):
         with tempfile.TemporaryDirectory() as tmp:
             candidates = build_candidates(build_registry(synthetic_run(Path(tmp))))["candidates"]
@@ -285,7 +321,7 @@ class Pass3FProvenanceTest(unittest.TestCase):
 
     def test_schema_files_are_strict_at_the_root(self):
         schema_dir = ROOT / "pipeline" / "schemas"
-        for name in ("pass3f_provenance.v1.schema.json", "pass3f_candidates.v1.schema.json"):
+        for name in ("pass3f_provenance.v2.schema.json", "pass3f_candidates.v2.schema.json"):
             schema = json.loads((schema_dir / name).read_text(encoding="utf-8"))
             self.assertFalse(schema["additionalProperties"])
             self.assertEqual(schema["$schema"], "https://json-schema.org/draft/2020-12/schema")
@@ -295,8 +331,8 @@ class Pass3FProvenanceTest(unittest.TestCase):
             registry = build_registry(synthetic_run(Path(tmp)))
             candidates = build_candidates(registry)
         schema_dir = ROOT / "pipeline" / "schemas"
-        provenance_schema = json.loads((schema_dir / "pass3f_provenance.v1.schema.json").read_text(encoding="utf-8"))
-        candidates_schema = json.loads((schema_dir / "pass3f_candidates.v1.schema.json").read_text(encoding="utf-8"))
+        provenance_schema = json.loads((schema_dir / "pass3f_provenance.v2.schema.json").read_text(encoding="utf-8"))
+        candidates_schema = json.loads((schema_dir / "pass3f_candidates.v2.schema.json").read_text(encoding="utf-8"))
         Draft202012Validator(provenance_schema).validate(registry)
         Draft202012Validator(candidates_schema).validate(candidates)
 
@@ -360,7 +396,7 @@ class Pass3FJ48ObservationTest(unittest.TestCase):
         self.assertTrue(any(item["source_subject"] == "16" and "61 avenue" in item["excerpt"].casefold() for item in conflicts))
         self.assertTrue(any(item["source_subject"] == "2" and item["target_subject"] == "8" and "curzay" in item["excerpt"].casefold() for item in conflicts))
         b005 = next(item for item in conflicts if item["source_subject"] == "16" and "61 avenue" in item["excerpt"].casefold())
-        evidence = {item["evidence_id"]: item["exact_text"] for item in registry["evidence"]}
+        evidence = {item["evidence_occurrence_id"]: item["exact_text"] for item in registry["evidence"]}
         self.assertEqual([evidence[item] for item in b005["direct_evidence_refs"]], ["61 avenue Gérardin."])
         self.assertIn("Il y a une fenêtre ouverte. Il y a peut-être quelqu'un.", [
             evidence[item] for item in b005["context_evidence_refs"]

@@ -22,7 +22,7 @@ from pass3f_provenance import stable_id  # noqa: E402
 
 
 DECISIONS_SCHEMA = ROOT / "pipeline" / "schemas" / "pass3f_decisions.v1.schema.json"
-APPLIED_SCHEMA = ROOT / "pipeline" / "schemas" / "pass3f_applied.v1.schema.json"
+APPLIED_SCHEMA = ROOT / "pipeline" / "schemas" / "pass3f_applied.v2.schema.json"
 
 
 def fragment(subject_id, text, index):
@@ -37,7 +37,7 @@ def fragment(subject_id, text, index):
         "fragment_id": stable_id("fragment", base),
         **base,
         "links": [{
-            "evidence_id": stable_id("evidence", {"subject": subject_id, "text": text}),
+            "evidence_occurrence_id": stable_id("evidence-occurrence", {"subject": subject_id, "text": text}),
             "link_status": "verified",
             "method": "fixture",
             "score": 1.0,
@@ -105,7 +105,7 @@ def fixture(action="move", *, simple_count=1, composite_count=0, unresolved_coun
     }
     run_id = stable_id("run", "pass3f-b1-fixture")
     registry = {
-        "schema": "pass3f.provenance.v1",
+        "schema": "pass3f.provenance.v2",
         "run": {"run_id": run_id, "pipeline_kind": "generaliste", "input_hashes": {}},
         "subjects": [],
         "evidence": [],
@@ -136,7 +136,7 @@ def fixture(action="move", *, simple_count=1, composite_count=0, unresolved_coun
         "truncation_context": {"subjects": [], "fragments": [], "caution": "fixture"},
     }
     audit = {
-        "schema": "pass3f.audit.v1",
+        "schema": "pass3f.audit.v2",
         "run_id": run_id,
         "source_registry_hash": stable_id("registry", registry),
         "source_candidates_hash": stable_id("candidates", "fixture"),
@@ -244,6 +244,14 @@ class Pass3FApplyTest(unittest.TestCase):
         with self.assertRaisesRegex(StaleDecisionError, "global_by_sujet"):
             build_application(global_doc, registry, audit, decisions)
 
+    def test_v1_registry_and_audit_lineage_is_rejected_as_stale(self):
+        global_doc, registry, audit, proposal, simple, _c, _u = fixture()
+        decisions = decisions_for(
+            global_doc, audit, proposal, [simple[0]["fragment_id"]]
+        )
+        registry["schema"] = "pass3f.provenance.v1"
+        with self.assertRaisesRegex(StaleDecisionError, "provenance registry schema"):
+            build_application(global_doc, registry, audit, decisions)
     def test_double_execution_writes_identical_bytes(self):
         values = fixture(composite_count=1)
         global_doc, registry, audit, proposal, simple, _c, _u = values
