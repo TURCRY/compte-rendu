@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pass3f_authority_rewrite_validation.v1.schema.json",
+  "title": "Human approval of evidence-authority rewrites for one composite fragment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "validation_id",
+    "base_split_plan_id",
+    "base_split_plan_hash",
+    "fragment_id",
+    "fragment_hash",
+    "approved_requirement_ids",
+    "decision",
+    "reviewer",
+    "reason"
+  ],
+  "properties": {
+    "schema": {"const": "pass3f.authority_rewrite_validation.v1"},
+    "validation_id": {"type": "string", "pattern": "^authority-rewrite-validation:[0-9a-f]{64}$"},
+    "base_split_plan_id": {"type": "string", "pattern": "^composite-split-plan:[0-9a-f]{64}$"},
+    "base_split_plan_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "fragment_id": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"},
+    "fragment_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "approved_requirement_ids": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^authority-rewrite-requirement:[0-9a-f]{64}$"},
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "decision": {"const": "accepted"},
+    "reviewer": {"type": "string", "minLength": 1},
+    "reason": {"type": "string", "minLength": 1}
+  }
+}

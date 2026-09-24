@@ -19,14 +19,21 @@ from pass3f_apply import (  # noqa: E402
     write_application,
 )
 from pass3f_composites import (  # noqa: E402
+    AUTHORITY_REWRITE_VALIDATION_SCHEMA,
+    authority_rewrite_validation_identifier,
     build_composite_split_plan,
     composite_status_dimensions,
+    resolve_authority_rewrite_plan,
 )
 from pass3f_provenance import stable_id  # noqa: E402
+from pass3f_reconciliation import build_reconciliation_plan  # noqa: E402
 
 
 DECISIONS_SCHEMA = ROOT / "pipeline" / "schemas" / "pass3f_decisions.v1.schema.json"
 APPLIED_SCHEMA = ROOT / "pipeline" / "schemas" / "pass3f_applied.v2.schema.json"
+AUTHORITY_VALIDATION_SCHEMA = (
+    ROOT / "pipeline" / "schemas" / "pass3f_authority_rewrite_validation.v1.schema.json"
+)
 COMPOSITE_EVIDENCE_ID = "evidence-occurrence:" + "d" * 64
 ACTION_EVIDENCE_IDS = [
     "evidence-occurrence:" + character * 64 for character in ("a", "b", "c")
@@ -108,6 +115,29 @@ def a007_composite_registry():
         "composite_fragment_ids": [item["fragment_id"] for item in values.values()],
     }
     return registry, proposal, values
+
+
+def authority_validation(plan, fragment, approved_requirement_ids=None):
+    validation = {
+        "schema": AUTHORITY_REWRITE_VALIDATION_SCHEMA,
+        "base_split_plan_id": plan["split_plan_id"],
+        "base_split_plan_hash": document_hash(plan),
+        "fragment_id": fragment["fragment_id"],
+        "fragment_hash": document_hash(fragment),
+        "approved_requirement_ids": sorted(
+            approved_requirement_ids
+            if approved_requirement_ids is not None
+            else [
+                item["requirement_id"]
+                for item in plan["authority_rewrite_requirements"]
+            ]
+        ),
+        "decision": "accepted",
+        "reviewer": "reviewer-fixture",
+        "reason": "Retour explicite aux trois formulations d'autorité validé.",
+    }
+    validation["validation_id"] = authority_rewrite_validation_identifier(validation)
+    return validation
 
 
 def fragment(subject_id, text, index):
@@ -257,6 +287,9 @@ class Pass3FApplyTest(unittest.TestCase):
     def setUp(self):
         self.decisions_schema = json.loads(DECISIONS_SCHEMA.read_text(encoding="utf-8"))
         self.applied_schema = json.loads(APPLIED_SCHEMA.read_text(encoding="utf-8"))
+        self.authority_validation_schema = json.loads(
+            AUTHORITY_VALIDATION_SCHEMA.read_text(encoding="utf-8")
+        )
 
     def apply_fixture(self, action="move", **kwargs):
         values = fixture(action, **kwargs)
@@ -423,7 +456,127 @@ class Pass3FApplyTest(unittest.TestCase):
         self.assertEqual(common_units[0]["text"], "Recommandation factuelle :")
         self.assertTrue(common_units[1]["text"].startswith("afin de poursuivre l'expertise"))
         self.assertIn("bounded_rewrite_required", plan["blockers"])
+        self.assertEqual(
+            [item["authority_text"] for item in plan["authority_rewrite_requirements"]],
+            [
+                "obtenir les coordonnées des occupants du 12 avenue de Girardin pour organiser une visite",
+                "fournir des photographies détaillées du mur en béton côté 54 rue de Malleville",
+                "fournir des documents techniques ou historiques relatifs à la construction du 15 avenue de Girardin",
+            ],
+        )
         self.assertFalse(plan["publication_allowed"])
+
+    def test_f2cb_requires_explicit_approval_of_all_authority_rewrites(self):
+        registry, proposal, values = a007_composite_registry()
+        plan = build_composite_split_plan(values["f2"], proposal, registry)
+        validation = authority_validation(
+            plan,
+            values["f2"],
+            [plan["authority_rewrite_requirements"][0]["requirement_id"]],
+        )
+        Draft202012Validator(self.authority_validation_schema).validate(validation)
+        with self.assertRaisesRegex(ValueError, "authority_rewrite_approval_incomplete"):
+            resolve_authority_rewrite_plan(
+                values["f2"], proposal, registry, validation
+            )
+
+    def test_f2cb_validated_authority_rewrite_is_deterministic_and_recovered(self):
+        registry, proposal, values = a007_composite_registry()
+        base_plan = build_composite_split_plan(values["f2"], proposal, registry)
+        validation = authority_validation(base_plan, values["f2"])
+        Draft202012Validator(self.authority_validation_schema).validate(validation)
+        plan = resolve_authority_rewrite_plan(
+            values["f2"], proposal, registry, validation
+        )
+        self.assertEqual(plan["split_status"], "deterministic")
+        self.assertEqual(plan["provenance_status"], "recovered")
+        self.assertEqual(plan["destination_status"], "resolved")
+        self.assertFalse(plan["publication_allowed"])
+        self.assertNotIn("bounded_rewrite_required", plan["blockers"])
+        self.assertEqual(
+            [item["destination"] for item in plan["units"]],
+            [
+                "discard_editorial_wrapper",
+                "subject:18",
+                "transverse_document_request",
+                "subject:19",
+                "metadata_only",
+            ],
+        )
+        self.assertEqual(
+            [item["evidence_refs"] for item in plan["units"] if item["role"] == "subject_content"],
+            [[evidence_id] for evidence_id in ACTION_EVIDENCE_IDS],
+        )
+
+    def test_f2cb_document_unit_is_deduplicated_before_insertion_against_de81(self):
+        registry, proposal, values = a007_composite_registry()
+        de_plan = build_composite_split_plan(values["de"], proposal, registry)
+        base_f2 = build_composite_split_plan(values["f2"], proposal, registry)
+        f2_plan = resolve_authority_rewrite_plan(
+            values["f2"], proposal, registry,
+            authority_validation(base_f2, values["f2"]),
+        )
+        de_unit = next(
+            item for item in de_plan["units"] if item["destination"] == "subject:19"
+        )
+        f2_unit = next(
+            item for item in f2_plan["units"] if item["destination"] == "subject:19"
+        )
+        global_doc = {
+            "sujets": [
+                {
+                    "numero": 18,
+                    "avis_participants": [],
+                    "synthese_echanges": "Source.",
+                    "conclusion_expert": "Conclusion source.",
+                },
+                {
+                    "numero": 19,
+                    "avis_participants": [],
+                    "synthese_echanges": "Cible.",
+                    "conclusion_expert": "Conclusion cible.",
+                },
+            ]
+        }
+        reconciliation_proposal = {
+            "proposal_id": stable_id("proposal", "f2cb-deduplication"),
+            "source_subject": "18",
+            "target_subject": "19",
+            "source_fragment_ids": [],
+            "fragment_classifications": [],
+        }
+        additional_units = [
+            {
+                "unit_id": unit["unit_id"],
+                "text": unit["text"],
+                "destination": unit["destination"],
+                "section": section,
+                "evidence_occurrence_ids": unit["evidence_refs"],
+                "authorized_evidence_occurrence_ids": unit["evidence_refs"],
+                "source_fragment_ids": [unit["derived_from_fragment_id"]],
+                "precedence": precedence,
+            }
+            for unit, section, precedence in (
+                (de_unit, "synthese_echanges", 10),
+                (f2_unit, "conclusion_expert", 20),
+            )
+        ]
+        plan = build_reconciliation_plan(
+            global_doc, registry, reconciliation_proposal,
+            additional_units=additional_units,
+        )
+        self.assertEqual(len(plan["publishable_insertions"]), 1)
+        self.assertEqual(plan["publishable_insertions"][0]["item_id"], de_unit["unit_id"])
+        self.assertEqual(len(plan["exact_duplicate_operations"]), 1)
+        self.assertEqual(
+            plan["exact_duplicate_operations"][0]["suppressed_item_id"],
+            f2_unit["unit_id"],
+        )
+        self.assertEqual(
+            plan["exact_duplicate_operations"][0]["shared_evidence_occurrence_ids"],
+            [ACTION_EVIDENCE_IDS[2]],
+        )
+        self.assertFalse(any(item["llm_eligible"] for item in plan["relations"]))
 
     def test_publication_requires_resolved_dimensions_and_recorded_human_review(self):
         units = [

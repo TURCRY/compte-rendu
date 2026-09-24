@@ -17,6 +17,7 @@ SPLIT_STATUSES = {
     "bounded_llm_completed",
     "unresolved",
 }
+AUTHORITY_REWRITE_VALIDATION_SCHEMA = "pass3f.authority_rewrite_validation.v1"
 PROVENANCE_STATUSES = {"recovered", "partial", "unresolved"}
 DESTINATION_STATUSES = {"resolved", "partial", "unresolved"}
 NON_SUBJECT_DESTINATIONS = {
@@ -45,6 +46,31 @@ _RECOMMENDATION_RE = re.compile(
 _MALLEVILLE_PHOTO_REQUEST = normalize_text(
     "fournir des photographies détaillées du mur en béton côté 54 rue de Malleville"
 )
+
+
+def _document_hash(value: Any) -> str:
+    return stable_id("document", value).split(":", 1)[1]
+
+
+def authority_rewrite_validation_identifier(validation: dict[str, Any]) -> str:
+    return stable_id("authority-rewrite-validation", {
+        key: value for key, value in validation.items() if key != "validation_id"
+    })
+
+
+def _authority_text(key: str, source_text: str) -> str | None:
+    replacements = {
+        "first": ("organiser la visite intérieure", "organiser une visite"),
+        "second": ("recueillir les photographies", "fournir des photographies"),
+        "third": ("rassembler les documents", "fournir des documents"),
+    }
+    old, new = replacements[key]
+    if normalize_text(old) not in normalize_text(source_text):
+        return None
+    rewritten, count = re.subn(
+        re.escape(old), new, source_text, count=1, flags=re.IGNORECASE
+    )
+    return rewritten if count == 1 else None
 
 
 def _evidence_counts(registry: dict[str, Any]) -> Counter[str]:
@@ -331,6 +357,7 @@ def _action_audit_plan(
             notes=["shared framing retained without destination"],
         )
     ]
+    authority_rewrite_requirements = []
     for key in ("first", "second", "third"):
         unit_text = match.group(key)
         units.append(_recovered_unit(
@@ -345,6 +372,30 @@ def _action_audit_plan(
                 else None
             ),
         ))
+        if match.re is _RECOMMENDATION_RE:
+            authority_text = _authority_text(key, unit_text)
+            if authority_text is not None:
+                authority_unit = _recovered_unit(
+                    fragment["fragment_id"],
+                    authority_text,
+                    _intended_subject(authority_text, proposal, registry),
+                    registry,
+                    destination=(
+                        "transverse_document_request"
+                        if normalize_text(authority_text) == _MALLEVILLE_PHOTO_REQUEST
+                        else None
+                    ),
+                )
+                requirement = {
+                    "source_text": unit_text,
+                    "authority_text": authority_text,
+                    "destination": authority_unit["destination"],
+                    "evidence_occurrence_ids": authority_unit["evidence_refs"],
+                }
+                requirement["requirement_id"] = stable_id(
+                    "authority-rewrite-requirement", requirement
+                )
+                authority_rewrite_requirements.append(requirement)
     units.append(_unit(
         fragment["fragment_id"],
         match.group("common"),
@@ -372,6 +423,7 @@ def _action_audit_plan(
         "split_status": split_status,
         "units": units,
         "blockers": sorted(set(blockers)),
+        "authority_rewrite_requirements": authority_rewrite_requirements,
     }
 
 
@@ -404,6 +456,9 @@ def build_composite_split_plan(
         "split_status": analysis["split_status"],
         "units": analysis["units"],
         "blockers": analysis["blockers"],
+        "authority_rewrite_requirements": analysis.get(
+            "authority_rewrite_requirements", []
+        ),
     }
     statuses = composite_status_dimensions(
         analysis["units"],
@@ -417,6 +472,118 @@ def build_composite_split_plan(
         "original_fragment_retained": True,
         "units": analysis["units"],
         "blockers": analysis["blockers"],
+        "authority_rewrite_requirements": analysis.get(
+            "authority_rewrite_requirements", []
+        ),
+    }
+
+
+def resolve_authority_rewrite_plan(
+    fragment: dict[str, Any],
+    proposal: dict[str, Any],
+    registry: dict[str, Any],
+    validation: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve an authority-backed rewrite after an exact human approval."""
+    base_plan = build_composite_split_plan(fragment, proposal, registry)
+    requirements = base_plan.get("authority_rewrite_requirements") or []
+    expected_requirement_ids = sorted(
+        str(item["requirement_id"]) for item in requirements
+    )
+    blockers = []
+    if validation.get("schema") != AUTHORITY_REWRITE_VALIDATION_SCHEMA:
+        blockers.append("authority_validation_schema_invalid")
+    if validation.get("decision") != "accepted":
+        blockers.append("authority_rewrite_not_accepted")
+    if validation.get("validation_id") != authority_rewrite_validation_identifier(validation):
+        blockers.append("authority_validation_id_invalid")
+    if validation.get("base_split_plan_id") != base_plan.get("split_plan_id"):
+        blockers.append("base_split_plan_changed")
+    if validation.get("base_split_plan_hash") != _document_hash(base_plan):
+        blockers.append("base_split_plan_changed")
+    if validation.get("fragment_id") != fragment.get("fragment_id"):
+        blockers.append("original_fragment_id_changed")
+    if validation.get("fragment_hash") != _document_hash(fragment):
+        blockers.append("original_fragment_changed")
+    if sorted(validation.get("approved_requirement_ids") or []) != expected_requirement_ids:
+        blockers.append("authority_rewrite_approval_incomplete")
+    if base_plan.get("split_status") != "bounded_llm_required" or len(requirements) != 3:
+        blockers.append("authority_rewrite_not_available")
+    if blockers:
+        raise ValueError(
+            "authority rewrite validation rejected: " + ", ".join(sorted(set(blockers)))
+        )
+
+    match = _RECOMMENDATION_RE.fullmatch(str(fragment["text"]).strip())
+    if match is None:
+        raise ValueError("authority rewrite source no longer matches its deterministic contract")
+
+    units = [_unit(
+        fragment["fragment_id"],
+        match.group("prefix"),
+        None,
+        destination="discard_editorial_wrapper",
+        evidence_refs=[],
+        provenance_status="unresolved",
+        link_status=None,
+        shared_composite_evidence=False,
+        role="common",
+        notes=["editorial wrapper retained in the correction history"],
+    )]
+    for requirement in requirements:
+        authority_text = str(requirement["authority_text"])
+        units.append(_recovered_unit(
+            fragment["fragment_id"],
+            authority_text,
+            _intended_subject(authority_text, proposal, registry),
+            registry,
+            destination=str(requirement["destination"]),
+        ))
+    units.append(_unit(
+        fragment["fragment_id"],
+        match.group("common"),
+        None,
+        destination="metadata_only",
+        evidence_refs=[],
+        provenance_status="unresolved",
+        link_status=None,
+        shared_composite_evidence=False,
+        role="common",
+        notes=["common purpose retained in the correction history"],
+    ))
+    statuses = composite_status_dimensions(
+        units,
+        "deterministic",
+        human_review_recorded=True,
+        transverse_materialization_ready=False,
+    )
+    remaining_blockers = []
+    if any(
+        unit["provenance_status"] == "unresolved"
+        for unit in units if unit["role"] == "subject_content"
+    ):
+        remaining_blockers.append("action_provenance_unresolved")
+    if any(unit["destination"] == "transverse_document_request" for unit in units):
+        remaining_blockers.append("transverse_document_request_materialization_unavailable")
+    payload = {
+        "fragment_id": fragment["fragment_id"],
+        "split_status": "deterministic",
+        "units": units,
+        "blockers": remaining_blockers,
+        "authority_rewrite_requirements": requirements,
+        "authority_rewrite_validation_id": validation["validation_id"],
+        "authority_rewrite_validation_hash": _document_hash(validation),
+    }
+    return {
+        "split_plan_id": stable_id("composite-split-plan", payload),
+        "derived_from_fragment_id": fragment["fragment_id"],
+        **statuses,
+        "original_fragment_retained": True,
+        "units": units,
+        "blockers": remaining_blockers,
+        "authority_rewrite_requirements": requirements,
+        "authority_rewrite_validation_id": validation["validation_id"],
+        "authority_rewrite_validation_hash": _document_hash(validation),
     }
 
 

@@ -97,7 +97,24 @@
         "publication_allowed": {"type": "boolean"},
         "original_fragment_retained": {"const": true},
         "units": {"type": "array", "items": {"$ref": "#/$defs/composite_split_unit"}, "minItems": 1},
-        "blockers": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+        "blockers": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "authority_rewrite_requirements": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["requirement_id", "source_text", "authority_text", "destination", "evidence_occurrence_ids"],
+            "properties": {
+              "requirement_id": {"type": "string", "pattern": "^authority-rewrite-requirement:[0-9a-f]{64}$"},
+              "source_text": {"type": "string", "minLength": 1},
+              "authority_text": {"type": "string", "minLength": 1},
+              "destination": {"oneOf": [{"type": "string", "pattern": "^subject:[1-9][0-9]*$"}, {"const": "transverse_document_request"}]},
+              "evidence_occurrence_ids": {"$ref": "#/$defs/evidence_ids"}
+            }
+          }
+        },
+        "authority_rewrite_validation_id": {"type": "string", "pattern": "^authority-rewrite-validation:[0-9a-f]{64}$"},
+        "authority_rewrite_validation_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       }
     },
     "operation": {
