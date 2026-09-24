@@ -18,11 +18,87 @@ from pass3f_apply import (  # noqa: E402
     document_hash,
     write_application,
 )
+from pass3f_composites import build_composite_split_plan  # noqa: E402
 from pass3f_provenance import stable_id  # noqa: E402
 
 
 DECISIONS_SCHEMA = ROOT / "pipeline" / "schemas" / "pass3f_decisions.v1.schema.json"
 APPLIED_SCHEMA = ROOT / "pipeline" / "schemas" / "pass3f_applied.v2.schema.json"
+COLLIDING_EVIDENCE_ID = "evidence-occurrence:" + "d" * 64
+
+
+def a007_composite_registry():
+    cc_text = (
+        "La maison du 12 avenue de Girardin n'a pas pu être visitée en raison de l'absence "
+        "des occupants et du retour du courrier recommandé non retiré. Le mur en béton côté "
+        "rue de Malleville présente des déformations, fissures et une fragilité avancée "
+        "visibles depuis l'extérieur. La maison du 15 avenue de Girardin, occupée par M. P166 "
+        "et Mme P167, est une construction de la première moitié du XXe siècle en maçonnerie "
+        "enduite, bien entretenue mais avec de petites fissures au niveau des murets de "
+        "l'escalier et des soubassements, ainsi qu'un dallage en mauvais état attribué aux "
+        "variations du sous-sol."
+    )
+    de_text = (
+        "Actions et demandes de documents identifiées : obtenir les coordonnées des occupants "
+        "du 12 avenue de Girardin pour organiser une visite, fournir des photographies "
+        "détaillées du mur en béton côté 54 rue de Malleville, et fournir des documents "
+        "techniques ou historiques relatifs à la construction du 15 avenue de Girardin. "
+        "Aucun désaccord n'est signalé dans la synthèse fournie."
+    )
+    f2_text = (
+        "Recommandation factuelle : obtenir les coordonnées des occupants du 12 avenue de "
+        "Girardin pour organiser la visite intérieure, recueillir les photographies détaillées "
+        "du mur en béton côté 54 rue de Malleville et rassembler les documents techniques ou "
+        "historiques relatifs à la construction du 15 avenue de Girardin afin de poursuivre "
+        "l'expertise et permettre des conclusions techniques motivées."
+    )
+    values = {
+        "cc": fragment("18", cc_text, 0),
+        "de": fragment("18", de_text, 1),
+        "f2": fragment("18", f2_text, 2),
+    }
+    for key in values:
+        values[key]["links"] = [{
+            "evidence_occurrence_id": COLLIDING_EVIDENCE_ID if key == "cc" else None,
+            "link_status": "candidate" if key == "cc" else "unresolved",
+            "method": "token_overlap" if key == "cc" else "none",
+            "score": 0.8 if key == "cc" else 0.0,
+        }]
+    action_texts = [
+        "Obtenir les coordonnées des occupants du 12 avenue de Girardin pour organiser une visite",
+        "Fournir des photographies détaillées du mur en béton côté 54 rue de Malleville",
+        "Fournir des documents techniques ou historiques relatifs à la construction du 15 avenue de Girardin",
+    ]
+    neighbors = [fragment("18", text, 10 + index) for index, text in enumerate(action_texts)]
+    for item in neighbors:
+        item["stage"] = "2E"
+        item["links"] = [{
+            "evidence_occurrence_id": COLLIDING_EVIDENCE_ID,
+            "link_status": "candidate",
+            "method": "token_overlap",
+            "score": 0.8,
+        }]
+    registry = {
+        "schema": "pass3f.provenance.v2",
+        "run": {"run_id": stable_id("run", "a007-composites"), "pipeline_kind": "generaliste", "input_hashes": {}},
+        "subjects": [
+            {"subject_id": "18", "title": "État descriptif technique du 12 avenue de Girardin", "location": "parcelle AE163"},
+            {"subject_id": "19", "title": "État descriptif technique du 15 avenue de Girardin", "location": "parcelle AE6"},
+        ],
+        "evidence": [
+            {"evidence_occurrence_id": COLLIDING_EVIDENCE_ID, "exact_text": f"preuve distincte {index}"}
+            for index in range(4)
+        ],
+        "truncation_events": [],
+        "derived_fragments": [*values.values(), *neighbors],
+        "stats": {},
+    }
+    proposal = {
+        "source_subject": "18",
+        "target_subject": "19",
+        "composite_fragment_ids": [item["fragment_id"] for item in values.values()],
+    }
+    return registry, proposal, values
 
 
 def fragment(subject_id, text, index):
@@ -219,7 +295,66 @@ class Pass3FApplyTest(unittest.TestCase):
             result["applied"]["operations"][0]["pending_composite_fragment_ids"],
             [composite[0]["fragment_id"]],
         )
+        split_plan = result["applied"]["operations"][0]["composite_split_plans"][0]
+        self.assertFalse(split_plan["publication_allowed"])
+        self.assertTrue(split_plan["original_fragment_retained"])
         self.assertIn(composite[0]["text"], global_doc["sujets"][0]["synthese_echanges"])
+
+    def test_cc0311_deterministic_split_preserves_exact_text_and_candidate_evidence(self):
+        registry, proposal, values = a007_composite_registry()
+        plan = build_composite_split_plan(values["cc"], proposal, registry)
+        sentences = [
+            "La maison du 12 avenue de Girardin n'a pas pu être visitée en raison de l'absence des occupants et du retour du courrier recommandé non retiré.",
+            "Le mur en béton côté rue de Malleville présente des déformations, fissures et une fragilité avancée visibles depuis l'extérieur.",
+            "La maison du 15 avenue de Girardin, occupée par M. P166 et Mme P167, est une construction de la première moitié du XXe siècle en maçonnerie enduite, bien entretenue mais avec de petites fissures au niveau des murets de l'escalier et des soubassements, ainsi qu'un dallage en mauvais état attribué aux variations du sous-sol.",
+        ]
+        self.assertEqual(plan["classification"], "deterministic_split_ready")
+        self.assertEqual([unit["text"] for unit in plan["units"]], sentences)
+        self.assertEqual(
+            [unit["intended_subject"] for unit in plan["units"]],
+            ["18", None, "19"],
+        )
+        self.assertTrue(plan["requires_human_review"])
+        self.assertFalse(plan["publication_allowed"])
+        self.assertTrue(plan["original_fragment_retained"])
+        self.assertIn("unit_destination_unresolved", plan["blockers"])
+        for unit in plan["units"]:
+            self.assertEqual(unit["derived_from_fragment_id"], values["cc"]["fragment_id"])
+            self.assertEqual(unit["evidence_refs"], [COLLIDING_EVIDENCE_ID])
+            self.assertEqual(unit["link_status"], "candidate")
+            self.assertEqual(unit["provenance_status"], "candidate")
+            self.assertTrue(unit["shared_composite_evidence"])
+
+    def test_de81_action_units_are_preserved_but_colliding_provenance_is_not_promoted(self):
+        registry, proposal, values = a007_composite_registry()
+        plan = build_composite_split_plan(values["de"], proposal, registry)
+        self.assertEqual(plan["classification"], "human_resolution_required")
+        subject_units = [unit for unit in plan["units"] if unit["role"] == "subject_content"]
+        common_units = [unit for unit in plan["units"] if unit["role"] == "common"]
+        self.assertEqual(
+            [unit["intended_subject"] for unit in subject_units],
+            ["18", None, "19"],
+        )
+        self.assertEqual(len(common_units), 2)
+        self.assertIn("Aucun désaccord n'est signalé", common_units[1]["text"])
+        self.assertTrue(all(unit["evidence_refs"] == [] for unit in subject_units))
+        self.assertTrue(all(unit["provenance_status"] == "unresolved" for unit in subject_units))
+        self.assertTrue(all(
+            "non-unique evidence_occurrence_id" in " ".join(unit["notes"])
+            for unit in subject_units
+        ))
+        self.assertFalse(plan["publication_allowed"])
+
+    def test_f2cb_common_purpose_is_retained_and_bounded_rewrite_remains_required(self):
+        registry, proposal, values = a007_composite_registry()
+        plan = build_composite_split_plan(values["f2"], proposal, registry)
+        self.assertEqual(plan["classification"], "llm_bounded_required")
+        common_units = [unit for unit in plan["units"] if unit["role"] == "common"]
+        self.assertEqual(len(common_units), 2)
+        self.assertEqual(common_units[0]["text"], "Recommandation factuelle :")
+        self.assertTrue(common_units[1]["text"].startswith("afin de poursuivre l'expertise"))
+        self.assertIn("bounded_rewrite_required", plan["blockers"])
+        self.assertFalse(plan["publication_allowed"])
 
     def test_unresolved_blocks_whole_proposal(self):
         (global_doc, _registry, _audit, _proposal, simple, _c, unresolved), _decisions, result = self.apply_fixture(
@@ -252,6 +387,7 @@ class Pass3FApplyTest(unittest.TestCase):
         registry["schema"] = "pass3f.provenance.v1"
         with self.assertRaisesRegex(StaleDecisionError, "provenance registry schema"):
             build_application(global_doc, registry, audit, decisions)
+
     def test_double_execution_writes_identical_bytes(self):
         values = fixture(composite_count=1)
         global_doc, registry, audit, proposal, simple, _c, _u = values

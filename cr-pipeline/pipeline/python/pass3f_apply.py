@@ -11,6 +11,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from pass3f_composites import build_composite_split_plans
 from pass3f_provenance import (
     canonical_bytes,
     read_json,
@@ -291,6 +292,10 @@ def build_application(
             "pending_composite_fragment_ids": list(proposal["composite_fragment_ids"]),
             "blocked_unresolved_fragment_ids": list(proposal["unresolved_fragment_ids"]),
             "blocked_fragments": [],
+            "composite_split_plans": (
+                build_composite_split_plans(proposal, registry)
+                if decision["decision"] == "accepted" else []
+            ),
         }
         if decision["decision"] != "accepted":
             operation["status"] = decision["decision"]

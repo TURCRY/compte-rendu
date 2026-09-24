@@ -45,6 +45,11 @@
       "items": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"},
       "uniqueItems": true
     },
+    "evidence_ids": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^evidence:[0-9a-f]{64}$"},
+      "uniqueItems": true
+    },
     "blocked_fragment": {
       "type": "object",
       "additionalProperties": false,
@@ -54,10 +59,43 @@
         "blocker": {"type": "string", "minLength": 1}
       }
     },
+    "composite_split_unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit_id", "derived_from_fragment_id", "text", "intended_subject", "evidence_refs", "provenance_status", "link_status", "shared_composite_evidence", "role", "source_fragment_refs", "notes"],
+      "properties": {
+        "unit_id": {"type": "string", "pattern": "^composite-unit:[0-9a-f]{64}$"},
+        "derived_from_fragment_id": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"},
+        "text": {"type": "string", "minLength": 1},
+        "intended_subject": {"type": ["string", "null"], "pattern": "^[1-9][0-9]*$"},
+        "evidence_refs": {"$ref": "#/$defs/evidence_ids"},
+        "provenance_status": {"enum": ["verified", "candidate", "unresolved"]},
+        "link_status": {"type": ["string", "null"], "enum": ["verified", "candidate", null]},
+        "shared_composite_evidence": {"type": "boolean"},
+        "role": {"enum": ["subject_content", "common"]},
+        "source_fragment_refs": {"$ref": "#/$defs/fragment_ids"},
+        "notes": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "composite_split_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["split_plan_id", "derived_from_fragment_id", "classification", "requires_human_review", "publication_allowed", "original_fragment_retained", "units", "blockers"],
+      "properties": {
+        "split_plan_id": {"type": "string", "pattern": "^composite-split-plan:[0-9a-f]{64}$"},
+        "derived_from_fragment_id": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"},
+        "classification": {"enum": ["deterministic_split_ready", "provenance_recovered_split_ready", "llm_bounded_required", "human_resolution_required"]},
+        "requires_human_review": {"const": true},
+        "publication_allowed": {"const": false},
+        "original_fragment_retained": {"const": true},
+        "units": {"type": "array", "items": {"$ref": "#/$defs/composite_split_unit"}, "minItems": 1},
+        "blockers": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+      }
+    },
     "operation": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["proposal_id", "decision_id", "action", "source_subject", "target_subject", "status", "applied_fragment_ids", "already_applied_fragment_ids", "pending_simple_fragment_ids", "pending_composite_fragment_ids", "blocked_unresolved_fragment_ids", "blocked_fragments"],
+      "required": ["proposal_id", "decision_id", "action", "source_subject", "target_subject", "status", "applied_fragment_ids", "already_applied_fragment_ids", "pending_simple_fragment_ids", "pending_composite_fragment_ids", "blocked_unresolved_fragment_ids", "blocked_fragments", "composite_split_plans"],
       "properties": {
         "proposal_id": {"type": "string", "pattern": "^proposal:[0-9a-f]{64}$"},
         "decision_id": {"type": "string", "pattern": "^decision:[0-9a-f]{64}$"},
@@ -73,6 +111,10 @@
         "blocked_fragments": {
           "type": "array",
           "items": {"$ref": "#/$defs/blocked_fragment"}
+        },
+        "composite_split_plans": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/composite_split_plan"}
         }
       }
     }
