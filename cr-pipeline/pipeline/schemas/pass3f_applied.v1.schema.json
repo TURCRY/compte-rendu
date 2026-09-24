@@ -62,12 +62,18 @@
     "composite_split_unit": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["unit_id", "derived_from_fragment_id", "text", "intended_subject", "evidence_refs", "provenance_status", "link_status", "shared_composite_evidence", "role", "source_fragment_refs", "notes"],
+      "required": ["unit_id", "derived_from_fragment_id", "text", "intended_subject", "destination", "evidence_refs", "provenance_status", "link_status", "shared_composite_evidence", "role", "source_fragment_refs", "notes"],
       "properties": {
         "unit_id": {"type": "string", "pattern": "^composite-unit:[0-9a-f]{64}$"},
         "derived_from_fragment_id": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"},
         "text": {"type": "string", "minLength": 1},
         "intended_subject": {"type": ["string", "null"], "pattern": "^[1-9][0-9]*$"},
+        "destination": {
+          "oneOf": [
+            {"type": "string", "pattern": "^subject:[1-9][0-9]*$"},
+            {"enum": ["transverse_document_request", "metadata_only", "discard_editorial_wrapper", "unresolved"]}
+          ]
+        },
         "evidence_refs": {"$ref": "#/$defs/evidence_ids"},
         "provenance_status": {"enum": ["verified", "candidate", "unresolved"]},
         "link_status": {"type": ["string", "null"], "enum": ["verified", "candidate", null]},

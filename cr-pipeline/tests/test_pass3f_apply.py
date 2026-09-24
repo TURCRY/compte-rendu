@@ -307,6 +307,8 @@ class Pass3FApplyTest(unittest.TestCase):
         split_plan = result["applied"]["operations"][0]["composite_split_plans"][0]
         self.assertFalse(split_plan["publication_allowed"])
         self.assertTrue(split_plan["original_fragment_retained"])
+        self.assertEqual(result["manifest"]["composite_split_plans"], [split_plan])
+        self.assertEqual(split_plan["units"][0]["text"], composite[0]["text"])
         self.assertIn(composite[0]["text"], global_doc["sujets"][0]["synthese_echanges"])
 
     def test_cc0311_deterministic_split_preserves_exact_text_and_candidate_evidence(self):
@@ -341,12 +343,22 @@ class Pass3FApplyTest(unittest.TestCase):
         plan = build_composite_split_plan(values["de"], proposal, registry)
         self.assertEqual(plan["split_status"], "deterministic")
         self.assertEqual(plan["provenance_status"], "recovered")
-        self.assertEqual(plan["destination_status"], "partial")
+        self.assertEqual(plan["destination_status"], "resolved")
         subject_units = [unit for unit in plan["units"] if unit["role"] == "subject_content"]
         common_units = [unit for unit in plan["units"] if unit["role"] == "common"]
         self.assertEqual(
             [unit["intended_subject"] for unit in subject_units],
             ["18", None, "19"],
+        )
+        self.assertEqual(
+            [unit["destination"] for unit in plan["units"]],
+            [
+                "discard_editorial_wrapper",
+                "subject:18",
+                "transverse_document_request",
+                "subject:19",
+                "metadata_only",
+            ],
         )
         self.assertEqual(len(common_units), 2)
         self.assertIn("Aucun désaccord n'est signalé", common_units[1]["text"])
@@ -356,7 +368,49 @@ class Pass3FApplyTest(unittest.TestCase):
         )
         self.assertTrue(all(unit["provenance_status"] == "candidate" for unit in subject_units))
         self.assertNotIn("action_provenance_unresolved", plan["blockers"])
+        self.assertNotIn("unit_destination_unresolved", plan["blockers"])
+        self.assertIn(
+            "transverse_document_request_materialization_unavailable",
+            plan["blockers"],
+        )
         self.assertFalse(plan["publication_allowed"])
+
+    def test_transverse_destination_requires_materialization_before_publication(self):
+        units = [
+            {
+                "role": "subject_content",
+                "destination": "subject:18",
+                "provenance_status": "candidate",
+                "evidence_refs": ["evidence-occurrence:" + "a" * 64],
+                "shared_composite_evidence": False,
+            },
+            {
+                "role": "subject_content",
+                "destination": "transverse_document_request",
+                "provenance_status": "candidate",
+                "evidence_refs": ["evidence-occurrence:" + "b" * 64],
+                "shared_composite_evidence": False,
+            },
+            {
+                "role": "common",
+                "destination": "metadata_only",
+                "provenance_status": "unresolved",
+                "evidence_refs": [],
+                "shared_composite_evidence": False,
+            },
+        ]
+        pending = composite_status_dimensions(
+            units, "deterministic", human_review_recorded=True
+        )
+        ready = composite_status_dimensions(
+            units,
+            "deterministic",
+            human_review_recorded=True,
+            transverse_materialization_ready=True,
+        )
+        self.assertEqual(pending["destination_status"], "resolved")
+        self.assertFalse(pending["publication_allowed"])
+        self.assertTrue(ready["publication_allowed"])
 
     def test_f2cb_common_purpose_is_retained_and_bounded_rewrite_remains_required(self):
         registry, proposal, values = a007_composite_registry()
@@ -375,6 +429,7 @@ class Pass3FApplyTest(unittest.TestCase):
         units = [
             {
                 "role": "subject_content", "intended_subject": subject,
+                "destination": f"subject:{subject}",
                 "provenance_status": "candidate", "evidence_refs": [evidence],
                 "shared_composite_evidence": False,
             }
@@ -404,6 +459,7 @@ class Pass3FApplyTest(unittest.TestCase):
             *units,
             {
                 "role": "common", "intended_subject": None,
+                "destination": "unresolved",
                 "provenance_status": "unresolved", "evidence_refs": [],
                 "shared_composite_evidence": False,
             },

@@ -453,6 +453,11 @@ def build_application(
             "source_global_hash": source_hashes["global_by_sujet"],
         },
         "changes": changes,
+        "composite_split_plans": [
+            split_plan
+            for operation in operations
+            for split_plan in operation["composite_split_plans"]
+        ],
         "unaffected_subject_ids": invariant_subjects,
         "controls": controls,
     }

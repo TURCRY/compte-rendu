@@ -19,6 +19,12 @@ SPLIT_STATUSES = {
 }
 PROVENANCE_STATUSES = {"recovered", "partial", "unresolved"}
 DESTINATION_STATUSES = {"resolved", "partial", "unresolved"}
+NON_SUBJECT_DESTINATIONS = {
+    "transverse_document_request",
+    "metadata_only",
+    "discard_editorial_wrapper",
+    "unresolved",
+}
 _SENTENCE_RE = re.compile(r"(?<!M\.)(?<!Mme\.)(?<!Dr\.)(?<=[.!?])\s+")
 _ACTIONS_RE = re.compile(
     r"^(?P<prefix>Actions et demandes de documents identifiées :) "
@@ -35,6 +41,9 @@ _RECOMMENDATION_RE = re.compile(
     r"(?P<third>rassembler .*?) "
     r"(?P<common>afin de .*)$",
     re.IGNORECASE,
+)
+_MALLEVILLE_PHOTO_REQUEST = normalize_text(
+    "fournir des photographies détaillées du mur en béton côté 54 rue de Malleville"
 )
 
 
@@ -81,6 +90,7 @@ def _unit(
     text: str,
     intended_subject: str | None,
     *,
+    destination: str | None = None,
     evidence_refs: list[str],
     provenance_status: str,
     link_status: str | None,
@@ -89,10 +99,19 @@ def _unit(
     source_fragment_refs: list[str] | None = None,
     notes: list[str] | None = None,
 ) -> dict[str, Any]:
+    resolved_destination = destination or (
+        f"subject:{intended_subject}" if intended_subject is not None else "unresolved"
+    )
+    if not (
+        resolved_destination in NON_SUBJECT_DESTINATIONS
+        or re.fullmatch(r"subject:[1-9][0-9]*", resolved_destination)
+    ):
+        raise ValueError(f"unsupported composite unit destination: {resolved_destination}")
     payload = {
         "derived_from_fragment_id": fragment_id,
         "text": text,
         "intended_subject": intended_subject,
+        "destination": resolved_destination,
         "evidence_refs": sorted(set(evidence_refs)),
         "provenance_status": provenance_status,
         "link_status": link_status,
@@ -112,6 +131,7 @@ def composite_status_dimensions(
     split_status: str,
     *,
     human_review_recorded: bool = False,
+    transverse_materialization_ready: bool = False,
 ) -> dict[str, Any]:
     if split_status not in SPLIT_STATUSES:
         raise ValueError(f"unsupported split status: {split_status}")
@@ -130,24 +150,35 @@ def composite_status_dimensions(
     else:
         provenance_status = "unresolved"
 
-    destinations = [unit for unit in required if unit.get("intended_subject") is not None]
-    if required and len(destinations) == len(required):
+    resolved_destinations = [
+        unit for unit in units
+        if unit.get("destination") not in {None, "unresolved"}
+    ]
+    if units and len(resolved_destinations) == len(units):
         destination_status = "resolved"
-    elif destinations:
+    elif resolved_destinations:
         destination_status = "partial"
     else:
         destination_status = "unresolved"
 
+    provenance_required = [
+        unit for unit in units
+        if str(unit.get("destination") or "").startswith("subject:")
+        or unit.get("destination") == "transverse_document_request"
+    ]
     unresolved_required = any(
         unit.get("provenance_status") == "unresolved"
-        or unit.get("intended_subject") is None
-        for unit in units
+        for unit in provenance_required
     )
+    transverse_pending = any(
+        unit.get("destination") == "transverse_document_request" for unit in units
+    ) and not transverse_materialization_ready
     publication_allowed = (
         split_status in {"deterministic", "bounded_llm_completed"}
         and provenance_status == "recovered"
         and destination_status == "resolved"
         and not unresolved_required
+        and not transverse_pending
         and human_review_recorded
     )
     return {
@@ -177,6 +208,8 @@ def _recovered_unit(
     text: str,
     intended_subject: str | None,
     registry: dict[str, Any],
+    *,
+    destination: str | None = None,
 ) -> dict[str, Any]:
     matches = _exact_neighbor_matches(text, original_fragment_id, registry)
     counts = _evidence_counts(registry)
@@ -211,6 +244,7 @@ def _recovered_unit(
         original_fragment_id,
         text,
         intended_subject,
+        destination=destination,
         evidence_refs=refs,
         provenance_status=status,
         link_status=status if status != "unresolved" else None,
@@ -288,6 +322,7 @@ def _action_audit_plan(
             fragment["fragment_id"],
             match.group("prefix"),
             None,
+            destination="discard_editorial_wrapper",
             evidence_refs=[],
             provenance_status="unresolved",
             link_status=None,
@@ -303,11 +338,20 @@ def _action_audit_plan(
             unit_text,
             _intended_subject(unit_text, proposal, registry),
             registry,
+            destination=(
+                "transverse_document_request"
+                if match.re is _ACTIONS_RE
+                and normalize_text(unit_text) == _MALLEVILLE_PHOTO_REQUEST
+                else None
+            ),
         ))
     units.append(_unit(
         fragment["fragment_id"],
         match.group("common"),
         None,
+        destination=(
+            "metadata_only" if match.re is _ACTIONS_RE else "unresolved"
+        ),
         evidence_refs=[],
         provenance_status="unresolved",
         link_status=None,
@@ -315,9 +359,11 @@ def _action_audit_plan(
         role="common",
         notes=["common clause retained without destination"],
     ))
-    blockers = ["common_unit_destination_unresolved"]
-    if any(unit["intended_subject"] is None and unit["role"] == "subject_content" for unit in units):
+    blockers = []
+    if any(unit["destination"] == "unresolved" for unit in units):
         blockers.append("unit_destination_unresolved")
+    if any(unit["destination"] == "transverse_document_request" for unit in units):
+        blockers.append("transverse_document_request_materialization_unavailable")
     if any(unit["provenance_status"] == "unresolved" for unit in units if unit["role"] == "subject_content"):
         blockers.append("action_provenance_unresolved")
     if split_status == "bounded_llm_required":
