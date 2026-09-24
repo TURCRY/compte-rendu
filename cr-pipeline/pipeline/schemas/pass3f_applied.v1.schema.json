@@ -80,13 +80,15 @@
     "composite_split_plan": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["split_plan_id", "derived_from_fragment_id", "classification", "requires_human_review", "publication_allowed", "original_fragment_retained", "units", "blockers"],
+      "required": ["split_plan_id", "derived_from_fragment_id", "split_status", "provenance_status", "destination_status", "requires_human_review", "publication_allowed", "original_fragment_retained", "units", "blockers"],
       "properties": {
         "split_plan_id": {"type": "string", "pattern": "^composite-split-plan:[0-9a-f]{64}$"},
         "derived_from_fragment_id": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"},
-        "classification": {"enum": ["deterministic_split_ready", "provenance_recovered_split_ready", "llm_bounded_required", "human_resolution_required"]},
+        "split_status": {"enum": ["deterministic", "bounded_llm_required", "bounded_llm_completed", "unresolved"]},
+        "provenance_status": {"enum": ["recovered", "partial", "unresolved"]},
+        "destination_status": {"enum": ["resolved", "partial", "unresolved"]},
         "requires_human_review": {"const": true},
-        "publication_allowed": {"const": false},
+        "publication_allowed": {"type": "boolean"},
         "original_fragment_retained": {"const": true},
         "units": {"type": "array", "items": {"$ref": "#/$defs/composite_split_unit"}, "minItems": 1},
         "blockers": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}

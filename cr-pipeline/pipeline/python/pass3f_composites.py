@@ -11,12 +11,14 @@ from pass3f_candidates import extract_addresses
 from pass3f_provenance import normalize_text, stable_id
 
 
-SPLIT_CLASSIFICATIONS = {
-    "deterministic_split_ready",
-    "provenance_recovered_split_ready",
-    "llm_bounded_required",
-    "human_resolution_required",
+SPLIT_STATUSES = {
+    "deterministic",
+    "bounded_llm_required",
+    "bounded_llm_completed",
+    "unresolved",
 }
+PROVENANCE_STATUSES = {"recovered", "partial", "unresolved"}
+DESTINATION_STATUSES = {"resolved", "partial", "unresolved"}
 _SENTENCE_RE = re.compile(r"(?<!M\.)(?<!Mme\.)(?<!Dr\.)(?<=[.!?])\s+")
 _ACTIONS_RE = re.compile(
     r"^(?P<prefix>Actions et demandes de documents identifiées :) "
@@ -102,6 +104,58 @@ def _unit(
     return {
         "unit_id": stable_id("composite-unit", payload),
         **payload,
+    }
+
+
+def composite_status_dimensions(
+    units: list[dict[str, Any]],
+    split_status: str,
+    *,
+    human_review_recorded: bool = False,
+) -> dict[str, Any]:
+    if split_status not in SPLIT_STATUSES:
+        raise ValueError(f"unsupported split status: {split_status}")
+    required = [unit for unit in units if unit.get("role") == "subject_content"]
+
+    proven = [
+        unit for unit in required
+        if unit.get("provenance_status") in {"verified", "candidate"}
+        and unit.get("evidence_refs")
+    ]
+    shared = [unit for unit in proven if unit.get("shared_composite_evidence")]
+    if required and len(proven) == len(required) and not shared:
+        provenance_status = "recovered"
+    elif proven:
+        provenance_status = "partial"
+    else:
+        provenance_status = "unresolved"
+
+    destinations = [unit for unit in required if unit.get("intended_subject") is not None]
+    if required and len(destinations) == len(required):
+        destination_status = "resolved"
+    elif destinations:
+        destination_status = "partial"
+    else:
+        destination_status = "unresolved"
+
+    unresolved_required = any(
+        unit.get("provenance_status") == "unresolved"
+        or unit.get("intended_subject") is None
+        for unit in units
+    )
+    publication_allowed = (
+        split_status in {"deterministic", "bounded_llm_completed"}
+        and provenance_status == "recovered"
+        and destination_status == "resolved"
+        and not unresolved_required
+        and human_review_recorded
+    )
+    return {
+        "split_status": split_status,
+        "provenance_status": provenance_status,
+        "destination_status": destination_status,
+        "publication_allowed": publication_allowed,
+        "requires_human_review": True,
     }
 
 
@@ -209,7 +263,7 @@ def _sentence_split_plan(
     if any(counts[ref] > 1 for ref in refs):
         blockers.append("evidence_occurrence_id_not_unique")
     return {
-        "classification": "deterministic_split_ready",
+        "split_status": "deterministic",
         "units": units,
         "blockers": blockers,
     }
@@ -222,10 +276,10 @@ def _action_audit_plan(
 ) -> dict[str, Any] | None:
     text = str(fragment["text"]).strip()
     match = _ACTIONS_RE.fullmatch(text)
-    classification = "human_resolution_required"
+    split_status = "deterministic"
     if match is None:
         match = _RECOMMENDATION_RE.fullmatch(text)
-        classification = "llm_bounded_required"
+        split_status = "bounded_llm_required"
     if match is None:
         return None
 
@@ -266,12 +320,10 @@ def _action_audit_plan(
         blockers.append("unit_destination_unresolved")
     if any(unit["provenance_status"] == "unresolved" for unit in units if unit["role"] == "subject_content"):
         blockers.append("action_provenance_unresolved")
-    if classification == "llm_bounded_required":
+    if split_status == "bounded_llm_required":
         blockers.append("bounded_rewrite_required")
-    elif not blockers:
-        classification = "provenance_recovered_split_ready"
     return {
-        "classification": classification,
+        "split_status": split_status,
         "units": units,
         "blockers": sorted(set(blockers)),
     }
@@ -286,7 +338,7 @@ def build_composite_split_plan(
         _sentence_split_plan(fragment, proposal, registry)
         or _action_audit_plan(fragment, proposal, registry)
         or {
-            "classification": "llm_bounded_required",
+            "split_status": "bounded_llm_required",
             "units": [_unit(
                 fragment["fragment_id"],
                 fragment["text"],
@@ -303,16 +355,19 @@ def build_composite_split_plan(
     )
     payload = {
         "fragment_id": fragment["fragment_id"],
-        "classification": analysis["classification"],
+        "split_status": analysis["split_status"],
         "units": analysis["units"],
         "blockers": analysis["blockers"],
     }
+    statuses = composite_status_dimensions(
+        analysis["units"],
+        analysis["split_status"],
+        human_review_recorded=False,
+    )
     return {
         "split_plan_id": stable_id("composite-split-plan", payload),
         "derived_from_fragment_id": fragment["fragment_id"],
-        "classification": analysis["classification"],
-        "requires_human_review": True,
-        "publication_allowed": False,
+        **statuses,
         "original_fragment_retained": True,
         "units": analysis["units"],
         "blockers": analysis["blockers"],

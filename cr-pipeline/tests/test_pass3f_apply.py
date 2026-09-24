@@ -18,13 +18,19 @@ from pass3f_apply import (  # noqa: E402
     document_hash,
     write_application,
 )
-from pass3f_composites import build_composite_split_plan  # noqa: E402
+from pass3f_composites import (  # noqa: E402
+    build_composite_split_plan,
+    composite_status_dimensions,
+)
 from pass3f_provenance import stable_id  # noqa: E402
 
 
 DECISIONS_SCHEMA = ROOT / "pipeline" / "schemas" / "pass3f_decisions.v1.schema.json"
 APPLIED_SCHEMA = ROOT / "pipeline" / "schemas" / "pass3f_applied.v2.schema.json"
-COLLIDING_EVIDENCE_ID = "evidence-occurrence:" + "d" * 64
+COMPOSITE_EVIDENCE_ID = "evidence-occurrence:" + "d" * 64
+ACTION_EVIDENCE_IDS = [
+    "evidence-occurrence:" + character * 64 for character in ("a", "b", "c")
+]
 
 
 def a007_composite_registry():
@@ -59,7 +65,7 @@ def a007_composite_registry():
     }
     for key in values:
         values[key]["links"] = [{
-            "evidence_occurrence_id": COLLIDING_EVIDENCE_ID if key == "cc" else None,
+            "evidence_occurrence_id": COMPOSITE_EVIDENCE_ID if key == "cc" else None,
             "link_status": "candidate" if key == "cc" else "unresolved",
             "method": "token_overlap" if key == "cc" else "none",
             "score": 0.8 if key == "cc" else 0.0,
@@ -70,10 +76,10 @@ def a007_composite_registry():
         "Fournir des documents techniques ou historiques relatifs à la construction du 15 avenue de Girardin",
     ]
     neighbors = [fragment("18", text, 10 + index) for index, text in enumerate(action_texts)]
-    for item in neighbors:
+    for item, evidence_id in zip(neighbors, ACTION_EVIDENCE_IDS):
         item["stage"] = "2E"
         item["links"] = [{
-            "evidence_occurrence_id": COLLIDING_EVIDENCE_ID,
+            "evidence_occurrence_id": evidence_id,
             "link_status": "candidate",
             "method": "token_overlap",
             "score": 0.8,
@@ -86,8 +92,11 @@ def a007_composite_registry():
             {"subject_id": "19", "title": "État descriptif technique du 15 avenue de Girardin", "location": "parcelle AE6"},
         ],
         "evidence": [
-            {"evidence_occurrence_id": COLLIDING_EVIDENCE_ID, "exact_text": f"preuve distincte {index}"}
-            for index in range(4)
+            {"evidence_occurrence_id": COMPOSITE_EVIDENCE_ID, "exact_text": cc_text},
+            *[
+                {"evidence_occurrence_id": evidence_id, "exact_text": text}
+                for evidence_id, text in zip(ACTION_EVIDENCE_IDS, action_texts)
+            ],
         ],
         "truncation_events": [],
         "derived_fragments": [*values.values(), *neighbors],
@@ -308,7 +317,9 @@ class Pass3FApplyTest(unittest.TestCase):
             "Le mur en béton côté rue de Malleville présente des déformations, fissures et une fragilité avancée visibles depuis l'extérieur.",
             "La maison du 15 avenue de Girardin, occupée par M. P166 et Mme P167, est une construction de la première moitié du XXe siècle en maçonnerie enduite, bien entretenue mais avec de petites fissures au niveau des murets de l'escalier et des soubassements, ainsi qu'un dallage en mauvais état attribué aux variations du sous-sol.",
         ]
-        self.assertEqual(plan["classification"], "deterministic_split_ready")
+        self.assertEqual(plan["split_status"], "deterministic")
+        self.assertEqual(plan["provenance_status"], "partial")
+        self.assertEqual(plan["destination_status"], "partial")
         self.assertEqual([unit["text"] for unit in plan["units"]], sentences)
         self.assertEqual(
             [unit["intended_subject"] for unit in plan["units"]],
@@ -320,15 +331,17 @@ class Pass3FApplyTest(unittest.TestCase):
         self.assertIn("unit_destination_unresolved", plan["blockers"])
         for unit in plan["units"]:
             self.assertEqual(unit["derived_from_fragment_id"], values["cc"]["fragment_id"])
-            self.assertEqual(unit["evidence_refs"], [COLLIDING_EVIDENCE_ID])
+            self.assertEqual(unit["evidence_refs"], [COMPOSITE_EVIDENCE_ID])
             self.assertEqual(unit["link_status"], "candidate")
             self.assertEqual(unit["provenance_status"], "candidate")
             self.assertTrue(unit["shared_composite_evidence"])
 
-    def test_de81_action_units_are_preserved_but_colliding_provenance_is_not_promoted(self):
+    def test_de81_action_units_recover_distinct_occurrence_provenance(self):
         registry, proposal, values = a007_composite_registry()
         plan = build_composite_split_plan(values["de"], proposal, registry)
-        self.assertEqual(plan["classification"], "human_resolution_required")
+        self.assertEqual(plan["split_status"], "deterministic")
+        self.assertEqual(plan["provenance_status"], "recovered")
+        self.assertEqual(plan["destination_status"], "partial")
         subject_units = [unit for unit in plan["units"] if unit["role"] == "subject_content"]
         common_units = [unit for unit in plan["units"] if unit["role"] == "common"]
         self.assertEqual(
@@ -337,24 +350,68 @@ class Pass3FApplyTest(unittest.TestCase):
         )
         self.assertEqual(len(common_units), 2)
         self.assertIn("Aucun désaccord n'est signalé", common_units[1]["text"])
-        self.assertTrue(all(unit["evidence_refs"] == [] for unit in subject_units))
-        self.assertTrue(all(unit["provenance_status"] == "unresolved" for unit in subject_units))
-        self.assertTrue(all(
-            "non-unique evidence_occurrence_id" in " ".join(unit["notes"])
-            for unit in subject_units
-        ))
+        self.assertEqual(
+            [unit["evidence_refs"] for unit in subject_units],
+            [[evidence_id] for evidence_id in ACTION_EVIDENCE_IDS],
+        )
+        self.assertTrue(all(unit["provenance_status"] == "candidate" for unit in subject_units))
+        self.assertNotIn("action_provenance_unresolved", plan["blockers"])
         self.assertFalse(plan["publication_allowed"])
 
     def test_f2cb_common_purpose_is_retained_and_bounded_rewrite_remains_required(self):
         registry, proposal, values = a007_composite_registry()
         plan = build_composite_split_plan(values["f2"], proposal, registry)
-        self.assertEqual(plan["classification"], "llm_bounded_required")
+        self.assertEqual(plan["split_status"], "bounded_llm_required")
+        self.assertEqual(plan["provenance_status"], "unresolved")
+        self.assertEqual(plan["destination_status"], "partial")
         common_units = [unit for unit in plan["units"] if unit["role"] == "common"]
         self.assertEqual(len(common_units), 2)
         self.assertEqual(common_units[0]["text"], "Recommandation factuelle :")
         self.assertTrue(common_units[1]["text"].startswith("afin de poursuivre l'expertise"))
         self.assertIn("bounded_rewrite_required", plan["blockers"])
         self.assertFalse(plan["publication_allowed"])
+
+    def test_publication_requires_resolved_dimensions_and_recorded_human_review(self):
+        units = [
+            {
+                "role": "subject_content", "intended_subject": subject,
+                "provenance_status": "candidate", "evidence_refs": [evidence],
+                "shared_composite_evidence": False,
+            }
+            for subject, evidence in (
+                ("18", "evidence-occurrence:" + "a" * 64),
+                ("19", "evidence-occurrence:" + "b" * 64),
+            )
+        ]
+        pending = composite_status_dimensions(units, "deterministic")
+        reviewed = composite_status_dimensions(
+            units, "deterministic", human_review_recorded=True
+        )
+        bounded_pending = composite_status_dimensions(
+            units, "bounded_llm_required", human_review_recorded=True
+        )
+        bounded_completed = composite_status_dimensions(
+            units, "bounded_llm_completed", human_review_recorded=True
+        )
+        self.assertEqual(pending["provenance_status"], "recovered")
+        self.assertEqual(pending["destination_status"], "resolved")
+        self.assertFalse(pending["publication_allowed"])
+        self.assertTrue(reviewed["publication_allowed"])
+        self.assertFalse(bounded_pending["publication_allowed"])
+        self.assertTrue(bounded_completed["publication_allowed"])
+
+        unresolved_common = [
+            *units,
+            {
+                "role": "common", "intended_subject": None,
+                "provenance_status": "unresolved", "evidence_refs": [],
+                "shared_composite_evidence": False,
+            },
+        ]
+        reviewed_with_common = composite_status_dimensions(
+            unresolved_common, "deterministic", human_review_recorded=True
+        )
+        self.assertFalse(reviewed_with_common["publication_allowed"])
 
     def test_unresolved_blocks_whole_proposal(self):
         (global_doc, _registry, _audit, _proposal, simple, _c, unresolved), _decisions, result = self.apply_fixture(
