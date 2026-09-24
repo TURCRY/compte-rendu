@@ -109,7 +109,7 @@
     "proposal": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["proposal_id", "candidate_id", "action", "source_subject", "target_subject", "source_fragment_ids", "composite_fragment_ids", "evidence_refs", "original_pass1_subjects", "origin_stage", "reason", "confidence", "ambiguous", "requires_human_review", "truncation_context"],
+      "required": ["proposal_id", "candidate_id", "action", "source_subject", "target_subject", "source_fragment_ids", "composite_fragment_ids", "unresolved_fragment_ids", "evidence_refs", "original_pass1_subjects", "origin_stage", "reason", "confidence", "ambiguous", "requires_human_review", "truncation_context"],
       "properties": {
         "proposal_id": {"type": "string", "pattern": "^proposal:[0-9a-f]{64}$"},
         "candidate_id": {"type": "string", "pattern": "^candidate:[0-9a-f]{64}$"},
@@ -118,6 +118,7 @@
         "target_subject": {"type": ["string", "null"], "pattern": "^[1-9][0-9]*$"},
         "source_fragment_ids": {"type": "array", "items": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"}, "uniqueItems": true},
         "composite_fragment_ids": {"type": "array", "items": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"}, "uniqueItems": true},
+        "unresolved_fragment_ids": {"type": "array", "items": {"type": "string", "pattern": "^fragment:[0-9a-f]{64}$"}, "uniqueItems": true},
         "evidence_refs": {"type": "array", "items": {"type": "string", "pattern": "^evidence:[0-9a-f]{64}$"}, "uniqueItems": true},
         "original_pass1_subjects": {"type": "array", "items": {"type": "string", "pattern": "^[1-9][0-9]*$"}, "uniqueItems": true},
         "origin_stage": {"enum": ["pass1", "2e", "3e", "indeterminate"]},

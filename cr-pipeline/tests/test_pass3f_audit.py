@@ -19,6 +19,7 @@ from pass3f_audit import (  # noqa: E402
     build_group_packet,
     build_groups,
     call_openai_compatible,
+    classify_candidate_fragments,
     parse_and_validate_response,
     run_audit,
     user_prompt,
@@ -111,9 +112,6 @@ def valid_response(packet, *, action="retain_overlap"):
                 subject_id for subject_id in candidate["allowed_subject_ids"]
                 if subject_id != candidate["source_subject"]
             )
-        selected_fragment_ids = []
-        if action in {"move", "merge", "remove_duplicate"}:
-            selected_fragment_ids = [candidate["allowed_fragment_ids"][0]]
         proposals.append({
             "candidate_id": candidate["candidate_id"],
             "action": action,
@@ -121,8 +119,6 @@ def valid_response(packet, *, action="retain_overlap"):
             "confidence": 0.62,
             "ambiguous": True,
             "cited_evidence_ids": candidate["allowed_evidence_refs"],
-            "selected_fragment_ids": selected_fragment_ids,
-            "composite_fragment_ids": [],
             "reason": "Le même extrait peut légitimement éclairer les deux objets; validation humaine requise.",
         })
     return {"proposals": proposals}
@@ -242,7 +238,10 @@ class Pass3FAuditTest(unittest.TestCase):
         self.assertTrue(packet["candidates"][0]["allowed_fragment_ids"])
         self.assertEqual(
             set(packet["candidates"][0]["allowed_fragment_ids"]),
-            {item["fragment_id"] for item in packet["pass3e_fragments"]},
+            {
+                item["fragment_id"]
+                for item in packet["candidate_fragments"] + packet["pass3e_fragments"]
+            },
         )
 
     def test_packet_omits_identities_without_identity_signal(self):
@@ -314,8 +313,8 @@ class Pass3FAuditTest(unittest.TestCase):
         self.assertIn("Pass1 sont des données historiques à auditer", SYSTEM_PROMPT)
         self.assertIn("ne prouvent jamais que l'affectation est correcte", SYSTEM_PROMPT)
         self.assertIn("conflit explicite d'adresse, lieu, acteur ou objet", SYSTEM_PROMPT)
-        self.assertIn("uniquement les fragments entièrement compatibles", SYSTEM_PROMPT)
-        self.assertIn("Ne force jamais un fragment composite", SYSTEM_PROMPT)
+        self.assertIn("Ne sélectionne et ne classe aucun fragment", SYSTEM_PROMPT)
+        self.assertNotIn("selected_fragment_ids", SYSTEM_PROMPT)
 
     def test_strict_parser_rejects_markdown_invented_target_and_evidence(self):
         packet = build_group_packet(self.registry, [self.candidates["candidates"][0]])
@@ -341,8 +340,9 @@ class Pass3FAuditTest(unittest.TestCase):
             self.assertEqual(set(final), self.schema["$defs"]["proposal"]["properties"].keys())
             self.assertEqual(final["proposal_id"], candidate["proposal_id"])
             self.assertEqual(final["source_subject"], candidate["source_subject"])
-            self.assertEqual(final["source_fragment_ids"], [candidate["allowed_fragment_ids"][0]])
+            self.assertEqual(final["source_fragment_ids"], [])
             self.assertEqual(final["composite_fragment_ids"], [])
+            self.assertEqual(final["unresolved_fragment_ids"], sorted(source["fragment_refs"]))
             self.assertEqual(final["original_pass1_subjects"], candidate["original_pass1_subjects"])
             self.assertEqual(final["truncation_context"], candidate["truncation_context"])
             self.assertEqual(final["origin_stage"], "indeterminate")
@@ -375,8 +375,6 @@ class Pass3FAuditTest(unittest.TestCase):
                 "confidence": 0.9,
                 "ambiguous": False,
                 "cited_evidence_ids": [address_evidence_id],
-                "selected_fragment_ids": [],
-                "composite_fragment_ids": [],
                 "reason": "Pass1 avait affecté la preuve à S16.",
             }],
         }
@@ -397,57 +395,73 @@ class Pass3FAuditTest(unittest.TestCase):
         self.assertEqual(final["original_pass1_subjects"], ["16"])
         self.assertTrue(final["ambiguous"])
 
-    def test_move_selects_simple_fragments_and_separates_composite_fragments(self):
-        source = next(item for item in self.candidates["candidates"] if item["target_subject"] is not None)
-        packet = build_group_packet(self.registry, [source])
-        allowed = packet["candidates"][0]["allowed_fragment_ids"]
-        composite_id = "fragment:" + "e" * 64
-        packet["candidates"][0]["allowed_fragment_ids"] = sorted([*allowed, composite_id])
-        decision = valid_response(packet, action="move")
-        decision["proposals"][0]["selected_fragment_ids"] = [allowed[0]]
-        decision["proposals"][0]["composite_fragment_ids"] = [composite_id]
-        final = parse_and_validate_response(json.dumps(decision), packet, self.schema)["proposals"][0]
-        self.assertEqual(final["source_fragment_ids"], [allowed[0]])
-        self.assertEqual(final["composite_fragment_ids"], [composite_id])
+    def test_deterministic_fragment_classifier_handles_target_composite_and_unresolved(self):
+        rows = [
+            ("fragment:" + "1" * 64, "Constat effectué au 15 avenue de Girardin."),
+            ("fragment:" + "2" * 64, "Comparaison entre le 12 avenue de Girardin et le 15 avenue de Girardin."),
+            ("fragment:" + "3" * 64, "Le 15 avenue de Girardin est comparé au 20 rue Gamma."),
+            ("fragment:" + "4" * 64, "Une fissure ancienne reste à examiner."),
+        ]
+        candidate = {
+            "kind": "subject_reference_conflict",
+            "fragment_refs": [fragment_id for fragment_id, _text in rows],
+        }
+        packet = {
+            "subject_definitions": [
+                {"subject_id": "18", "title": "12 avenue de Girardin", "location": "12 avenue de Girardin"},
+                {"subject_id": "19", "title": "15 avenue de Girardin", "location": "15 avenue de Girardin"},
+            ],
+            "other_subject_index": [
+                {"subject_id": "20", "title": "20 rue Gamma", "location": "20 rue Gamma"},
+            ],
+            "candidate_fragments": [
+                {"fragment_id": fragment_id, "text": text} for fragment_id, text in rows
+            ],
+            "pass3e_fragments": [],
+        }
+        classified = classify_candidate_fragments(candidate, {"target_subject": "19"}, packet)
+        self.assertEqual(classified["applicable"], [rows[0][0]])
+        self.assertEqual(classified["composite"], [rows[1][0], rows[2][0]])
+        self.assertEqual(classified["unresolved"], [rows[3][0]])
 
-    def test_fragment_selection_lists_must_be_disjoint(self):
-        source = next(item for item in self.candidates["candidates"] if item["target_subject"] is not None)
-        packet = build_group_packet(self.registry, [source])
-        fragment_id = packet["candidates"][0]["allowed_fragment_ids"][0]
-        decision = valid_response(packet, action="move")
-        decision["proposals"][0]["selected_fragment_ids"] = [fragment_id]
-        decision["proposals"][0]["composite_fragment_ids"] = [fragment_id]
-        with self.assertRaisesRegex(ValueError, "must be disjoint"):
-            parse_and_validate_response(json.dumps(decision), packet, self.schema)
-
-    def test_unknown_selected_or_composite_fragment_is_rejected(self):
-        source = next(item for item in self.candidates["candidates"] if item["target_subject"] is not None)
-        packet = build_group_packet(self.registry, [source])
-        unknown = "fragment:" + "f" * 64
-        for key, message in (
-            ("selected_fragment_ids", "invented selected fragment"),
-            ("composite_fragment_ids", "invented composite fragment"),
-        ):
-            with self.subTest(key=key):
-                decision = valid_response(packet, action="move")
-                decision["proposals"][0]["selected_fragment_ids"] = []
-                decision["proposals"][0]["composite_fragment_ids"] = []
-                decision["proposals"][0][key] = [unknown]
-                with self.assertRaisesRegex(ValueError, message):
-                    parse_and_validate_response(json.dumps(decision), packet, self.schema)
-
-    def test_move_requires_fragment_but_retain_overlap_allows_empty_lists(self):
-        source = next(item for item in self.candidates["candidates"] if item["target_subject"] is not None)
-        packet = build_group_packet(self.registry, [source])
-        move = valid_response(packet, action="move")
-        move["proposals"][0]["selected_fragment_ids"] = []
-        with self.assertRaisesRegex(ValueError, "requires selected or composite fragments"):
-            parse_and_validate_response(json.dumps(move), packet, self.schema)
-        retained = parse_and_validate_response(
-            json.dumps(valid_response(packet, action="retain_overlap")), packet, self.schema,
-        )["proposals"][0]
-        self.assertEqual(retained["source_fragment_ids"], [])
-        self.assertEqual(retained["composite_fragment_ids"], [])
+    def test_a007_is_classified_as_nine_applicable_three_composite_zero_unresolved(self):
+        rows = [
+            ("fragment:30a7bce88540d60c11f8d670458a2afc9aa13f2e860fe2f6c747ecf65afc99e4", "Maison du 15 avenue de Girardin (occupée par M. P166 et Mme P167) : décrite comme une construction de la première moitié du XXe siècle en maçonnerie enduite et globalement bien entretenue. Sont relevés de petites fissures au niveau des murets de l'escalier et des soubassements."),
+            ("fragment:358839e1e6ea97b57f2e08d54d8b4935a1d00c9d1000bfcdb352d721c51aefed", "Dallage du 15 avenue de Girardin : signalé en mauvais état, cet état est attribué dans la synthèse aux variations du sous-sol. Cette explication est présentée comme l'interprétation des observations rapportées."),
+            ("fragment:580b29e9b6fb49b2a1f1c140f0ab5b62921c69bb9b3f61369d912895f3604222", "Pour le 15 avenue de Girardin, la maison est décrite comme une construction en maçonnerie enduite de la première moitié du XXe siècle, globalement bien entretenue mais présentant de petites fissures sur les murets de l'escalier et les soubassements, ainsi qu'un dallage en mauvais état attribué aux variations du sous-sol. Ces constats, tels que fournis, indiquent des désordres localisés et une pathologie possible liée au sous-sol, mais ne permettent pas d'établir un diagnostic précis ni l'origine exacte sans documents techniques/historiques et investigations complémentaires."),
+            ("fragment:cc0311b495680f6d9aa6b1b4bdd689572bc039a2b3c39f750bca0080643fcd5b", "La maison du 12 avenue de Girardin n'a pas pu être visitée en raison de l'absence des occupants et du retour du courrier recommandé non retiré. Le mur en béton côté rue de Malleville présente des déformations, fissures et une fragilité avancée visibles depuis l'extérieur. La maison du 15 avenue de Girardin, occupée par M. P166 et Mme P167, est une construction de la première moitié du XXe siècle en maçonnerie enduite, bien entretenue mais avec de petites fissures au niveau des murets de l'escalier et des soubassements, ainsi qu'un dallage en mauvais état attribué aux variations du sous-sol."),
+            ("fragment:cde8f40fdf0aa50b2deb34e65e8b79e066e63ad0b8a575d63ba9c305dde8bd49", "Fournir des documents techniques ou historiques relatifs à la construction du 15 avenue de Girardin"),
+            ("fragment:de81b9b212317827ee14040db6515879dd070883e3081701f72f8d57aba07125", "Actions et demandes de documents identifiées : obtenir les coordonnées des occupants du 12 avenue de Girardin pour organiser une visite, fournir des photographies détaillées du mur en béton côté 54 rue de Malleville, et fournir des documents techniques ou historiques relatifs à la construction du 15 avenue de Girardin. Aucun désaccord n'est signalé dans la synthèse fournie."),
+            ("fragment:df19e4bb85d8f2e59c58b57ac8a124bb6e6e38788fdcd7c1209e9732f714c459", "Maison du 15 avenue de Girardin datant de la première moitié du XXe siècle"),
+            ("fragment:e016a0168cbd2626f6c763d6578308e8709b94fc7be244e89abf8d211e119ba9", "Documents techniques ou historiques relatifs à la construction du 15 avenue de Girardin"),
+            ("fragment:ea45965cb3b9258c48885ed6fd6797c427d341ae1a8313bd0af8c6d4834a07ac", "Petites fissures sur les murets de l'escalier et soubassements du 15 avenue de Girardin"),
+            ("fragment:ebcf90591a08103f59a681b4374ed17bcb6316344bf02d0d07c83024392352d0", "occupante (15 avenue de Girardin)"),
+            ("fragment:f2cb66309f87ea20138fcb07fc73f8ca553bef566e7363767b653c235fa4254d", "Recommandation factuelle : obtenir les coordonnées des occupants du 12 avenue de Girardin pour organiser la visite intérieure, recueillir les photographies détaillées du mur en béton côté 54 rue de Malleville et rassembler les documents techniques ou historiques relatifs à la construction du 15 avenue de Girardin afin de poursuivre l'expertise et permettre des conclusions techniques motivées."),
+            ("fragment:f445596e7fc24d162acfa18fa3da3ee2b30c3c6541a76ea1b3432c7fe2481f9b", "occupant (15 avenue de Girardin)"),
+        ]
+        candidate = {
+            "kind": "subject_reference_conflict",
+            "fragment_refs": [fragment_id for fragment_id, _text in rows],
+        }
+        packet = {
+            "subject_definitions": [
+                {"subject_id": "18", "title": "12 avenue de Girardin", "location": "12 avenue de Girardin"},
+                {"subject_id": "19", "title": "15 avenue de Girardin", "location": "15 avenue de Girardin"},
+            ],
+            "other_subject_index": [],
+            "candidate_fragments": [
+                {"fragment_id": fragment_id, "text": text} for fragment_id, text in rows
+            ],
+            "pass3e_fragments": [],
+        }
+        classified = classify_candidate_fragments(candidate, {"target_subject": "19"}, packet)
+        self.assertEqual(len(classified["applicable"]), 9)
+        self.assertEqual(len(classified["composite"]), 3)
+        self.assertEqual(classified["unresolved"], [])
+        self.assertEqual(
+            set(classified["composite"]),
+            {rows[3][0], rows[5][0], rows[10][0]},
+        )
 
     def test_invalid_contract_preserves_raw_response_before_raising_without_retry(self):
         seen = []
