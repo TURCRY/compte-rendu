@@ -15,6 +15,21 @@ from typing import Any, Iterable
 
 SCHEMA_VERSION = "pass3f.provenance.v1"
 _WORD_RE = re.compile(r"[a-z0-9]+")
+_CIVILITY_RE = re.compile(
+    r"\b(?:M(?:onsieur)?\.?|Mme\.?|Madame|Mlle\.?|Mademoiselle|Ma[iî]tre)\s+",
+    re.IGNORECASE,
+)
+_COMPANY_RE = re.compile(
+    r"\b(?P<form>S\.?\s*C\.?\s*I\.?|S\.?\s*C\.?\s*C\.?\s*V\.?|S\.?\s*A\.?\s*R\.?\s*L\.?|"
+    r"S\.?\s*A\.?\s*S\.?|S\.?\s*A\.?|E\.?\s*U\.?\s*R\.?\s*L\.?)\s+"
+    r"(?P<name>[\wÀ-ÖØ-öø-ÿ'’-]+(?:\s+[\wÀ-ÖØ-öø-ÿ'’-]+){0,5})",
+    re.IGNORECASE,
+)
+_NAMED_ORGANIZATION_RE = re.compile(
+    r"\b(?P<form>soci[ée]t[ée]|organisme|association)\s+"
+    r"(?P<name>[\wÀ-ÖØ-öø-ÿ'’-]+(?:\s+[\wÀ-ÖØ-öø-ÿ'’-]+){0,5})",
+    re.IGNORECASE,
+)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _CHUNK_RUN_RE = re.compile(r"Pass2E sujet_(\d+)\s+.*?chunk\s+(\d+)/(\d+)", re.IGNORECASE)
 _CHUNK_TRUNC_RE = re.compile(r"Pass2E sujet_(\d+)\s+chunk\s+(\d+)/(\d+).*?prompt tronqu", re.IGNORECASE)
@@ -65,6 +80,85 @@ def content_tokens(value: Any) -> set[str]:
     return {token for token in normalize_text(value).split() if token not in _STOP_WORDS}
 
 
+def normalize_identity(value: Any) -> str:
+    text = _CIVILITY_RE.sub("", str(value or ""), count=1).strip()
+    for form, compact in (
+        (r"S\.?\s*C\.?\s*C\.?\s*V\.?", "SCCV"),
+        (r"S\.?\s*A\.?\s*R\.?\s*L\.?", "SARL"),
+        (r"E\.?\s*U\.?\s*R\.?\s*L\.?", "EURL"),
+        (r"S\.?\s*C\.?\s*I\.?", "SCI"),
+        (r"S\.?\s*A\.?\s*S\.?", "SAS"),
+        (r"S\.?\s*A\.?", "SA"),
+    ):
+        text = re.sub(rf"\b{form}\b", compact, text, flags=re.IGNORECASE)
+    return normalize_text(text)
+
+
+def _identity_role(prefix: str) -> str:
+    normalized = normalize_text(prefix)
+    markers = (
+        ("propriete de", "proprietaire"),
+        ("appartient a", "proprietaire"),
+        ("occupe par", "occupant"),
+        ("occupee par", "occupant"),
+        ("occupant", "occupant"),
+        ("partie", "partie"),
+        ("representee par", "other"),
+        ("represente par", "other"),
+    )
+    found = [(normalized.rfind(marker), role) for marker, role in markers]
+    position, role = max(found, default=(-1, "other"))
+    return role if position >= 0 else "other"
+
+
+def _clean_identity_name(value: str) -> str:
+    text = re.split(r"[,.;]", value, maxsplit=1)[0]
+    text = re.sub(r"\s+(?:et|ainsi\s+que)\s*$", "", text, flags=re.IGNORECASE)
+    return text.strip(" \t\r\n,-")
+
+
+def extract_subject_identities(item: dict[str, Any], subject_id: str) -> list[dict[str, str]]:
+    identities: dict[tuple[str, str, str], dict[str, str]] = {}
+    fields = (
+        ("Titre", str(item.get("Titre", item.get("titre", "")) or "")),
+        ("Localisation", str(item.get("Localisation", item.get("localisation", "")) or "")),
+        ("Description", str(item.get("Description", item.get("description", "")) or "")),
+    )
+    for field_name, text in fields:
+        source = f"sujets_ref.json#/Numero/{subject_id}/{field_name}"
+        civility_matches = list(_CIVILITY_RE.finditer(text))
+        for index, match in enumerate(civility_matches):
+            end = civility_matches[index + 1].start() if index + 1 < len(civility_matches) else len(text)
+            canonical = _clean_identity_name(text[match.end():end])
+            normalized = normalize_identity(canonical)
+            if not normalized:
+                continue
+            role = _identity_role(text[:match.start()])
+            key = (normalized, role, source)
+            identities[key] = {
+                "canonical": canonical,
+                "normalized": normalized,
+                "role": role,
+                "source": source,
+            }
+        for pattern, default_role in ((_COMPANY_RE, "societe"), (_NAMED_ORGANIZATION_RE, "organisme")):
+            for match in pattern.finditer(text):
+                name = _clean_identity_name(match.group("name"))
+                form = re.sub(r"[.\s]", "", match.group("form")).upper()
+                canonical = f"{form} {name}" if pattern is _COMPANY_RE else f"{match.group('form')} {name}"
+                normalized = normalize_identity(canonical)
+                if not normalized:
+                    continue
+                key = (normalized, default_role, source)
+                identities[key] = {
+                    "canonical": canonical,
+                    "normalized": normalized,
+                    "role": default_role,
+                    "source": source,
+                }
+    return [identities[key] for key in sorted(identities)]
+
+
 def _subject_number(value: Any) -> int:
     try:
         return int(value)
@@ -74,12 +168,14 @@ def _subject_number(value: Any) -> int:
 
 def _subject_reference(item: dict[str, Any]) -> dict[str, Any]:
     number = _subject_number(item.get("Numero", item.get("numero")))
+    subject_id = str(number)
     return {
-        "subject_id": str(number),
+        "subject_id": subject_id,
         "numero": number,
         "title": str(item.get("Titre", item.get("titre", "")) or ""),
         "location": str(item.get("Localisation", item.get("localisation", "")) or ""),
         "description": str(item.get("Description", item.get("description", "")) or ""),
+        "identities": extract_subject_identities(item, subject_id),
     }
 
 

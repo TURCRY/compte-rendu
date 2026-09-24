@@ -1,3 +1,4 @@
+import copy
 import json
 import sys
 import tempfile
@@ -239,6 +240,61 @@ class Pass3FAuditTest(unittest.TestCase):
             {item["fragment_id"] for item in packet["pass3e_fragments"]},
         )
 
+    def test_packet_omits_identities_without_identity_signal(self):
+        registry = copy.deepcopy(self.registry)
+        for subject in registry["subjects"]:
+            subject["identities"] = [{
+                "canonical": f"Personne {subject['subject_id']}",
+                "normalized": f"personne {subject['subject_id']}",
+                "role": "proprietaire",
+                "source": "fixture",
+            }]
+        candidate = next(item for item in self.candidates["candidates"] if item["kind"] == "shared_evidence")
+        packet = build_group_packet(registry, [candidate])
+        self.assertTrue(all(
+            set(item) == {"subject_id", "title", "location"}
+            for item in packet["subject_definitions"] + packet["other_subject_index"]
+        ))
+        self.assertTrue(all("identities" not in item for item in packet["subject_definitions"]))
+        self.assertTrue(all("identities" not in item for item in packet["other_subject_index"]))
+
+    def test_packet_keeps_only_identities_involved_in_target_signals(self):
+        registry = copy.deepcopy(self.registry)
+        for subject in registry["subjects"]:
+            subject["identities"] = [{
+                "canonical": f"Personne {subject['subject_id']}",
+                "normalized": f"personne {subject['subject_id']}",
+                "role": "proprietaire",
+                "source": "fixture",
+            }]
+        candidate = copy.deepcopy(next(
+            item for item in self.candidates["candidates"]
+            if item["source_subject"] == "1" and item.get("target_subject") == "2"
+        ))
+        candidate["target_signals"] = {
+            "address_matches": ["2"],
+            "identity_matches": ["3"],
+            "combined_matches": [],
+        }
+        packet = build_group_packet(registry, [candidate])
+        definitions = {item["subject_id"]: item for item in packet["subject_definitions"]}
+        index = {item["subject_id"]: item for item in packet["other_subject_index"]}
+        self.assertNotIn("identities", definitions["1"])
+        self.assertIn("identities", definitions["2"])
+        self.assertIn("identities", index["3"])
+        self.assertNotIn("identities", index["99"])
+
+        candidate["target_signals"] = {
+            "address_matches": ["2"],
+            "identity_matches": ["2"],
+            "combined_matches": ["2"],
+        }
+        packet = build_group_packet(registry, [candidate])
+        definitions = {item["subject_id"]: item for item in packet["subject_definitions"]}
+        self.assertNotIn("identities", definitions["1"])
+        self.assertIn("identities", definitions["2"])
+        self.assertTrue(all("identities" not in item for item in packet["other_subject_index"]))
+
     def test_groups_are_deterministic_and_respect_candidate_limit(self):
         first = build_groups(self.registry, self.candidates, max_candidates=1)
         second = build_groups(self.registry, self.candidates, max_candidates=1)
@@ -294,12 +350,15 @@ class Pass3FAuditTest(unittest.TestCase):
         self.assertEqual(packet["pass1_assignments_role"], "historical_audit_input_not_correctness_evidence")
         self.assertEqual(packet["allowed_subject_ids"], ["16"])
         self.assertEqual({item["subject_id"] for item in packet["other_subject_index"]}, {"18", "19"})
+        self.assertTrue(all("identities" not in item for item in packet["subject_definitions"]))
+        self.assertTrue(all("identities" not in item for item in packet["other_subject_index"]))
         self.assertEqual(candidate["direct_evidence_refs"], [address_evidence_id])
         self.assertEqual(candidate["context_evidence_refs"], [context_evidence_id])
         self.assertEqual(candidate["allowed_evidence_refs"], [address_evidence_id])
         self.assertIn("61 rue de Malleville", prompt)
         self.assertIn("61 avenue Gérardin", prompt)
         self.assertIn("aucune réaffectation suffisamment étayée", SYSTEM_PROMPT)
+        self.assertIn("absent de allowed_subject_ids", SYSTEM_PROMPT)
         decision = {
             "proposals": [{
                 "candidate_id": candidate["candidate_id"],

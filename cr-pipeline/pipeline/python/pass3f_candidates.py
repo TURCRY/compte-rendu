@@ -36,7 +36,7 @@ def extract_addresses(text: str) -> list[dict[str, str]]:
 def _candidate(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     identity_payload = {
         key: value for key, value in payload.items()
-        if key not in {"direct_evidence_refs", "context_evidence_refs"}
+        if key not in {"direct_evidence_refs", "context_evidence_refs", "target_signals"}
     }
     return {
         "candidate_id": stable_id("candidate", {"kind": kind, **identity_payload}),
@@ -49,6 +49,70 @@ def _candidate(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         "ambiguous": True,
         "requires_llm_review": True,
     }
+
+
+def _subject_signal_indexes(registry: dict[str, Any]) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    address_subjects: dict[str, set[str]] = defaultdict(set)
+    identity_subjects: dict[str, set[str]] = defaultdict(set)
+    for subject in registry["subjects"]:
+        subject_id = subject["subject_id"]
+        reference = " ".join((subject["title"], subject["location"], subject["description"]))
+        for address in extract_addresses(reference):
+            address_subjects[address["canonical"]].add(subject_id)
+        for identity in subject.get("identities") or []:
+            normalized = str(identity.get("normalized") or "")
+            if normalized:
+                identity_subjects[normalized].add(subject_id)
+    return address_subjects, identity_subjects
+
+
+def _contains_normalized_identity(text: str, identity: str) -> bool:
+    return f" {identity} " in f" {normalize_text(text)} "
+
+
+def _enrich_target_signals(registry: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    evidence = {item["evidence_id"]: item for item in registry["evidence"]}
+    fragments = {item["fragment_id"]: item for item in registry["derived_fragments"]}
+    address_subjects, identity_subjects = _subject_signal_indexes(registry)
+    texts = [candidate.get("excerpt", "")]
+    texts.extend(
+        fragments[ref]["text"] for ref in candidate.get("fragment_refs") or [] if ref in fragments
+    )
+    texts.extend(
+        evidence[ref]["exact_text"]
+        for ref in candidate.get("direct_evidence_refs") or candidate.get("evidence_refs") or []
+        if ref in evidence
+    )
+    corpus = "\n".join(dict.fromkeys(text for text in texts if text))
+    address_matches = {
+        subject_id
+        for address in extract_addresses(candidate.get("excerpt", ""))
+        for subject_id in address_subjects.get(address["canonical"], set())
+    }
+    identity_matches = {
+        subject_id
+        for identity, subject_ids in identity_subjects.items()
+        if _contains_normalized_identity(corpus, identity)
+        for subject_id in subject_ids
+    }
+    combined_matches = address_matches & identity_matches
+    result = dict(candidate)
+    result["target_signals"] = {
+        "address_matches": sorted(address_matches, key=int),
+        "identity_matches": sorted(identity_matches, key=int),
+        "combined_matches": sorted(combined_matches, key=int),
+    }
+    signals = list(result["signals"])
+    if combined_matches:
+        signals.append("exact address and identity signals converge")
+    elif identity_matches and not address_matches:
+        signals.append("exact identity signal without an exact address target")
+    elif address_matches and identity_matches:
+        signals.append("exact address and identity signals point to different subjects")
+    if len(identity_matches) > 1:
+        signals.append("the same normalized identity is associated with multiple subjects")
+    result["signals"] = list(dict.fromkeys(signals))
+    return result
 
 
 def _shared_evidence(registry: dict[str, Any]) -> Iterable[dict[str, Any]]:
@@ -159,6 +223,7 @@ def build_candidates(registry: dict[str, Any]) -> dict[str, Any]:
     values = list(_shared_evidence(registry))
     values.extend(_reference_conflicts(registry))
     values.extend(_derived_duplicates(registry))
+    values = [_enrich_target_signals(registry, item) for item in values]
     candidates = sorted({item["candidate_id"]: item for item in values}.values(), key=lambda item: item["candidate_id"])
     by_kind: dict[str, int] = defaultdict(int)
     for item in candidates:

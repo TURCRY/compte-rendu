@@ -21,8 +21,13 @@
     }}
   },
   "$defs": {
-    "subject": {"type": "object", "additionalProperties": false, "required": ["subject_id", "numero", "title", "location", "description", "truncation"], "properties": {
-      "subject_id": {"type": "string", "pattern": "^[1-9][0-9]*$"}, "numero": {"type": "integer", "minimum": 1}, "title": {"type": "string"}, "location": {"type": "string"}, "description": {"type": "string"}, "truncation": {"$ref": "#/$defs/truncation"}
+    "subject": {"type": "object", "additionalProperties": false, "required": ["subject_id", "numero", "title", "location", "description", "identities", "truncation"], "properties": {
+      "subject_id": {"type": "string", "pattern": "^[1-9][0-9]*$"}, "numero": {"type": "integer", "minimum": 1}, "title": {"type": "string"}, "location": {"type": "string"}, "description": {"type": "string"},
+      "identities": {"type": "array", "items": {"$ref": "#/$defs/identity"}}, "truncation": {"$ref": "#/$defs/truncation"}
+    }},
+    "identity": {"type": "object", "additionalProperties": false, "required": ["canonical", "normalized", "role", "source"], "properties": {
+      "canonical": {"type": "string", "minLength": 1}, "normalized": {"type": "string", "minLength": 1},
+      "role": {"enum": ["proprietaire", "occupant", "partie", "societe", "organisme", "other"]}, "source": {"type": "string", "minLength": 1}
     }},
     "evidence": {"type": "object", "additionalProperties": false, "required": ["evidence_id", "segment_id", "row_ref", "timecode", "speaker", "exact_text", "pass1_subjects", "projection_classification", "reported_subject_count"], "properties": {
       "evidence_id": {"type": "string", "pattern": "^evidence:[0-9a-f]{64}$"}, "segment_id": {"type": "string"}, "row_ref": {"type": ["integer", "string", "null"]}, "timecode": {"type": "string"}, "speaker": {"type": "string"}, "exact_text": {"type": "string", "minLength": 1},

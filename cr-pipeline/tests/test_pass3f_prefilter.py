@@ -11,7 +11,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "pipeline" / "python"))
 
 from pass3f_candidates import build_candidates  # noqa: E402
-from pass3f_provenance import build_registry, write_json_deterministic  # noqa: E402
+from pass3f_provenance import (  # noqa: E402
+    build_registry,
+    extract_subject_identities,
+    stable_id,
+    write_json_deterministic,
+)
 
 
 RUN_A = Path(
@@ -91,7 +96,109 @@ def find_pair(candidates, kind, left, right, term=""):
     ]
 
 
+def identity_signal_registry(text):
+    raw_subjects = [
+        {"Numero": 1, "Titre": "État du 10 rue Alpha", "Localisation": "parcelle A", "Description": "Propriété de Madame Alice SOURCE."},
+        {"Numero": 2, "Titre": "État du 20 rue Beta", "Localisation": "parcelle B", "Description": "Propriété de Monsieur Jean DUPONT."},
+        {"Numero": 3, "Titre": "État du 30 rue Gamma", "Localisation": "parcelle C", "Description": "Propriété de Madame Claire MARTIN."},
+        {"Numero": 4, "Titre": "État du 40 rue Delta", "Localisation": "parcelle D", "Description": "Occupé par M. Jean DUPONT."},
+    ]
+    truncation = {
+        "status": "none", "stage": "2E", "scope": "subject", "source_file": "",
+        "source_hash": "", "details": "fixture", "event_refs": [],
+    }
+    subjects = []
+    for raw in raw_subjects:
+        subject_id = str(raw["Numero"])
+        subjects.append({
+            "subject_id": subject_id, "numero": raw["Numero"], "title": raw["Titre"],
+            "location": raw["Localisation"], "description": raw["Description"],
+            "identities": extract_subject_identities(raw, subject_id), "truncation": dict(truncation),
+        })
+    locator = {
+        "segment_id": "segment_identity", "row_ref": 1, "timecode": "00:00:01",
+        "speaker": "Expert", "exact_text": text,
+    }
+    evidence = {
+        "evidence_id": stable_id("evidence", locator), **locator,
+        "pass1_subjects": ["1"], "projection_classification": "specifique", "reported_subject_count": 1,
+    }
+    fragment_base = {
+        "stage": "3E", "subject_id": "1", "field_path": "/synthese_echanges/0",
+        "text": text, "source_artifact": "pass3E_sujets/sujet_001_synthese.json",
+    }
+    fragment = {
+        "fragment_id": stable_id("fragment", fragment_base), **fragment_base,
+        "links": [{"evidence_id": evidence["evidence_id"], "link_status": "verified", "method": "normalized_exact_containment", "score": 1.0}],
+        "truncation": dict(truncation),
+    }
+    return {
+        "schema": "pass3f.provenance.v1",
+        "run": {"run_id": stable_id("run", "identity-signals"), "pipeline_kind": "generaliste", "input_hashes": {}},
+        "subjects": subjects, "evidence": [evidence], "truncation_events": [],
+        "derived_fragments": [fragment], "stats": {},
+    }
+
+
+def identity_conflict(text):
+    return next(
+        item for item in build_candidates(identity_signal_registry(text))["candidates"]
+        if item["kind"] == "subject_reference_conflict"
+    )
+
 class Pass3FProvenanceTest(unittest.TestCase):
+    def test_subject_identity_reference_is_explicit_and_normalized(self):
+        raw = {
+            "Numero": 14, "Titre": "Sujet", "Localisation": "",
+            "Description": "Propriété de la S.C.I. ELDEC, représentée par Madame Élodie DUPRÉ.",
+        }
+        identities = extract_subject_identities(raw, "14")
+        self.assertEqual(
+            [(item["normalized"], item["role"]) for item in identities],
+            [("elodie dupre", "other"), ("sci eldec", "societe")],
+        )
+        self.assertTrue(all(item["source"].endswith("/Description") for item in identities))
+
+    def test_identity_only_signal_never_promotes_a_target(self):
+        candidate = identity_conflict("Visite au 99 rue Omega avec Claire MARTIN.")
+        self.assertIsNone(candidate["target_subject"])
+        self.assertEqual(candidate["target_signals"]["address_matches"], [])
+        self.assertEqual(candidate["target_signals"]["identity_matches"], ["3"])
+        self.assertEqual(candidate["target_signals"]["combined_matches"], [])
+
+    def test_name_alone_does_not_create_an_automatic_move_candidate(self):
+        candidates = build_candidates(identity_signal_registry("Monsieur Jean DUPONT intervient."))["candidates"]
+        self.assertFalse(any(item["kind"] == "subject_reference_conflict" for item in candidates))
+    def test_exact_address_and_identity_converge_without_hiding_shared_name(self):
+        candidate = identity_conflict("Visite du 20 rue Beta avec Monsieur Jean DUPONT.")
+        self.assertEqual(candidate["target_subject"], "2")
+        self.assertEqual(candidate["target_signals"]["address_matches"], ["2"])
+        self.assertEqual(candidate["target_signals"]["identity_matches"], ["2", "4"])
+        self.assertEqual(candidate["target_signals"]["combined_matches"], ["2"])
+        self.assertTrue(candidate["ambiguous"])
+        self.assertIn("multiple subjects", " ".join(candidate["signals"]))
+
+    def test_near_address_does_not_fuzzily_match_and_incompatible_name_stays_identity_only(self):
+        candidate = identity_conflict("Visite du 21 rue Beta avec Claire MARTIN.")
+        self.assertIsNone(candidate["target_subject"])
+        self.assertEqual(candidate["target_signals"], {"address_matches": [], "identity_matches": ["3"], "combined_matches": []})
+
+    def test_address_and_identity_pointing_to_different_subjects_are_explicitly_ambiguous(self):
+        candidate = identity_conflict("Visite du 20 rue Beta avec Claire MARTIN.")
+        self.assertEqual(candidate["target_subject"], "2")
+        self.assertEqual(candidate["target_signals"]["address_matches"], ["2"])
+        self.assertEqual(candidate["target_signals"]["identity_matches"], ["3"])
+        self.assertEqual(candidate["target_signals"]["combined_matches"], [])
+        self.assertTrue(candidate["ambiguous"])
+        self.assertIn("different subjects", " ".join(candidate["signals"]))
+
+    def test_candidate_id_is_stable_when_no_relevant_identity_is_present(self):
+        registry = identity_signal_registry("Visite du 20 rue Beta sans personne identifiée.")
+        with_identities = build_candidates(registry)["candidates"]
+        for subject in registry["subjects"]:
+            subject["identities"] = []
+        without_identities = build_candidates(registry)["candidates"]
+        self.assertEqual([item["candidate_id"] for item in with_identities], [item["candidate_id"] for item in without_identities])
     def test_confirmed_chunk_stays_subject_scoped_for_fragments(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = synthetic_run(Path(tmp))

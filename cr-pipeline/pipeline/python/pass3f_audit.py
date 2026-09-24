@@ -58,6 +58,7 @@ Règles absolues :
 - Chaque décision contient exclusivement : candidate_id, action, target_subject, confidence, ambiguous, cited_evidence_ids et reason.
 - Ne retourne aucune métadonnée déterministe telle que proposal_id, source_subject, fragments, affectations Pass1, provenance, troncature ou revue humaine ; Python les réinjecte après validation.
 - Une cible doit appartenir à allowed_subject_ids. N'invente ni sujet, ni fragment, ni preuve.
+- Les identités de other_subject_index servent uniquement à la comparaison. Elles ne permettent jamais de choisir comme cible un sujet absent de allowed_subject_ids.
 - cited_evidence_ids doit être un sous-ensemble exact de direct_evidence_refs. Les context_evidence_refs peuvent être lues pour comprendre la séquence, mais ne sont jamais citables comme preuves de la décision.
 - Les affectations Pass1 sont des données historiques à auditer et ne prouvent jamais que l'affectation est correcte. Une preuve affectée à un sujet peut précisément être mal classée. La décision doit comparer le contenu factuel de la preuve au référentiel canonique des sujets.
 - Un conflit explicite d'adresse, lieu, acteur ou objet avec le référentiel canonique ne peut pas être rejeté comme faux positif uniquement parce que Pass1 avait affecté la preuve au sujet courant.
@@ -107,6 +108,31 @@ def _candidate_subjects(candidate: dict[str, Any]) -> set[str]:
     if candidate.get("target_subject") is not None:
         values.add(str(candidate["target_subject"]))
     return values
+
+
+def _identity_relevant_subjects(candidates: Iterable[dict[str, Any]]) -> set[str]:
+    relevant: set[str] = set()
+    for candidate in candidates:
+        target_signals = candidate.get("target_signals") or {}
+        address_matches = {str(value) for value in target_signals.get("address_matches") or []}
+        identity_matches = {str(value) for value in target_signals.get("identity_matches") or []}
+        combined_matches = {str(value) for value in target_signals.get("combined_matches") or []}
+        relevant.update(identity_matches)
+        relevant.update(combined_matches)
+        if address_matches and identity_matches and address_matches != identity_matches:
+            relevant.update(address_matches)
+    return relevant
+
+
+def _subject_for_packet(subject: dict[str, Any], *, include_identities: bool) -> dict[str, Any]:
+    value = {
+        "subject_id": subject["subject_id"],
+        "title": subject["title"],
+        "location": subject["location"],
+    }
+    if include_identities and subject.get("identities"):
+        value["identities"] = subject["identities"]
+    return value
 
 
 def candidate_components(candidates: Iterable[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -245,6 +271,7 @@ def build_group_packet(
         {subject for item in candidates for subject in _candidate_subjects(item)},
         key=_subject_sort,
     )
+    identity_subject_ids = _identity_relevant_subjects(candidates)
     evidence_refs = {
         ref for item in candidates
         for ref in (
@@ -286,13 +313,20 @@ def build_group_packet(
         "pipeline_kind": registry["run"]["pipeline_kind"],
         "pass1_assignments_role": "historical_audit_input_not_correctness_evidence",
         "allowed_subject_ids": subject_ids,
-        "subject_definitions": [subjects[subject_id] for subject_id in subject_ids],
+        "subject_definitions": [
+            _subject_for_packet(
+                subjects[subject_id],
+                include_identities=subject_id in identity_subject_ids,
+            )
+            for subject_id in subject_ids
+        ],
         "other_subject_index": [
-            {
+            _subject_for_packet({
                 "subject_id": subject_id,
                 "title": subjects[subject_id]["title"],
                 "location": subjects[subject_id]["location"],
-            }
+                "identities": subjects[subject_id].get("identities") or [],
+            }, include_identities=subject_id in identity_subject_ids)
             for subject_id in sorted(set(subjects) - set(subject_ids), key=_subject_sort)
         ],
         "candidates": candidate_values,
