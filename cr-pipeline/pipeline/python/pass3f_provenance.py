@@ -15,6 +15,7 @@ from typing import Any, Iterable
 
 SCHEMA_VERSION = "pass3f.provenance.v2"
 EVIDENCE_OCCURRENCE_ALGORITHM = "pass3f.evidence-occurrence.v2"
+PHOTO_OCCURRENCE_ALGORITHM = "pass3f.photo-occurrence.v1"
 EVIDENCE_CONTENT_ALGORITHM = "pass3f.evidence-content.v1"
 FRAGMENT_STRUCTURE_ALGORITHM = "pass3f.fragment-structure.v1"
 _WORD_RE = re.compile(r"[a-z0-9]+")
@@ -94,6 +95,29 @@ def fragment_representation_type(stage: str, field_path: str) -> str:
     if re.match(r"^/(?:numero|titre|localisation|description)(?:/|$)", field_path):
         return "metadata"
     return "unsupported"
+
+
+def recompute_registry_stats(registry: dict[str, Any]) -> None:
+    """Refresh common counters after an input adapter adds evidence or links."""
+    evidence = registry["evidence"]
+    derived = registry["derived_fragments"]
+    stats = registry["stats"]
+    stats.update({
+        "evidence_count": len(evidence),
+        "evidence_occurrence_count": len(evidence),
+        "evidence_content_count": len({item["evidence_content_id"] for item in evidence}),
+        "derived_fragment_count": len(derived),
+        "verified_link_count": sum(
+            link["link_status"] == "verified" for item in derived for link in item["links"]
+        ),
+        "candidate_link_count": sum(
+            link["link_status"] == "candidate" for item in derived for link in item["links"]
+        ),
+        "unresolved_fragment_count": sum(
+            bool(item["links"]) and item["links"][0]["link_status"] == "unresolved"
+            for item in derived
+        ),
+    })
 
 
 def content_tokens(value: Any) -> set[str]:

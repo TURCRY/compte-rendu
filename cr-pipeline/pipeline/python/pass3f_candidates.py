@@ -199,6 +199,80 @@ def _reference_conflicts(registry: dict[str, Any]) -> Iterable[dict[str, Any]]:
         yield _candidate("subject_reference_conflict", value)
 
 
+def _human_photo_assignment_conflicts(
+    registry: dict[str, Any],
+) -> Iterable[dict[str, Any]]:
+    evidence_by_id = _index_unique(registry["evidence"], "evidence_occurrence_id")
+    subject_addresses: dict[str, set[str]] = {}
+    for subject in registry["subjects"]:
+        reference = " ".join((
+            subject["title"], subject["location"], subject["description"]
+        ))
+        subject_addresses[subject["subject_id"]] = {
+            item["canonical"] for item in extract_addresses(reference)
+        }
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for fragment in registry["derived_fragments"]:
+        source = fragment["subject_id"]
+        for link in fragment["links"]:
+            evidence_id = link.get("evidence_occurrence_id")
+            evidence = evidence_by_id.get(evidence_id)
+            if not evidence or evidence.get("evidence_kind") != "photo":
+                continue
+            assignment = next((
+                relation for relation in evidence.get("provenance_links") or []
+                if relation.get("relation_type") == "subject_assignment"
+                and relation.get("stage") == "photo_assignment"
+                and relation.get("authority") == "human"
+            ), None)
+            if not assignment or assignment.get("subject_numero") is None:
+                continue
+            target = str(assignment["subject_numero"])
+            if target == source:
+                continue
+            key = (source, target, evidence_id)
+            if key not in grouped:
+                signals = [
+                    "reference_kind=human_photo_assignment",
+                    "the linked photo has an explicit human assignment to another subject",
+                ]
+                fragment_addresses = {
+                    item["canonical"] for item in extract_addresses(fragment["text"])
+                }
+                if fragment_addresses & subject_addresses.get(target, set()):
+                    signals.append("reference_kind=combined")
+                context_ids = {
+                    relation["source_id"]
+                    for relation in evidence.get("provenance_links") or []
+                    if relation.get("relation_type") == "context"
+                    and relation.get("stage") == "photo_asr_window"
+                }
+                context_subjects = {
+                    str(subject_id)
+                    for context_id in context_ids
+                    for subject_id in (
+                        evidence_by_id.get(context_id, {}).get("pass1_subjects") or []
+                    )
+                }
+                if source in context_subjects:
+                    signals.append("reference_kind=visit_window")
+                grouped[key] = {
+                    "source_subject": source,
+                    "target_subject": target,
+                    "excerpt": fragment["text"],
+                    "evidence_refs": [evidence_id],
+                    "direct_evidence_refs": [evidence_id],
+                    "context_evidence_refs": sorted(context_ids),
+                    "fragment_refs": [],
+                    "signals": signals,
+                    "score": 1.0,
+                }
+            grouped[key]["fragment_refs"].append(fragment["fragment_id"])
+    for value in grouped.values():
+        value["fragment_refs"] = sorted(set(value["fragment_refs"]))
+        yield _candidate("subject_reference_conflict", value)
+
+
 def _derived_duplicates(registry: dict[str, Any]) -> Iterable[dict[str, Any]]:
     fragments = [item for item in registry["derived_fragments"] if len(content_tokens(item["text"])) >= 8]
     for left, right in itertools.combinations(fragments, 2):
@@ -238,6 +312,7 @@ def build_candidates(registry: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("unsupported provenance registry schema")
     values = list(_shared_evidence(registry))
     values.extend(_reference_conflicts(registry))
+    values.extend(_human_photo_assignment_conflicts(registry))
     values.extend(_derived_duplicates(registry))
     values = [_enrich_target_signals(registry, item) for item in values]
     candidates = sorted({item["candidate_id"]: item for item in values}.values(), key=lambda item: item["candidate_id"])
