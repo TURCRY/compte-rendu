@@ -1,0 +1,3 @@
+start;end;speaker;text;confidence
+0;4.5;Alice;Bonjour;0.98
+00:00:05;00:00:09;Bob;Point suivant;0.95

@@ -75,6 +75,7 @@ param(
   [string] $OnlySubjectsCsv = "",
   [switch] $RunInternalSelfTests,
   [switch] $PlanOnly,
+  [switch] $ValidateCsvOnly,
   [int] $MaxSegmentSeconds = 600,
   [int] $MaxAsrGapSeconds = 120,
   [switch] $Force
@@ -152,10 +153,10 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 # Lecture des sujets numérotés (Excel)
 # via ImportExcel module, ou CSV si tu convertis avant
 # On attend par ex. colonnes : Numero, Titre
-if (-not $SujetsPath) { throw "SujetsPath est obligatoire." }
-if (-not (Test-Path $SujetsPath)) { throw "SujetsPath introuvable: $SujetsPath" }
-if (-not $ParticipantsPath) { throw "ParticipantsPath est obligatoire." }
-if (-not (Test-Path $ParticipantsPath)) { throw "ParticipantsPath introuvable: $ParticipantsPath" }
+if (-not $ValidateCsvOnly -and -not $SujetsPath) { throw "SujetsPath est obligatoire." }
+if (-not $ValidateCsvOnly -and -not (Test-Path $SujetsPath)) { throw "SujetsPath introuvable: $SujetsPath" }
+if (-not $ValidateCsvOnly -and -not $ParticipantsPath) { throw "ParticipantsPath est obligatoire." }
+if (-not $ValidateCsvOnly -and -not (Test-Path $ParticipantsPath)) { throw "ParticipantsPath introuvable: $ParticipantsPath" }
 
 if ($SujetsPath) {
     $Sujets = Import-Excel -Path $SujetsPath
@@ -684,6 +685,121 @@ function Hms-To-Seconds([string]$hms){
   return $hh*3600 + $mm*60 + $ss
 }
 
+function Convert-TranscriptionTimestampToSeconds {
+  param(
+    [Parameter(Mandatory=$true)][object]$Value,
+    [Parameter(Mandatory=$true)][string]$Column,
+    [Parameter(Mandatory=$true)][int]$LineNumber,
+    [switch]$NootaRelativeOnly
+  )
+
+  $raw = ([string]$Value).Trim()
+  if ([string]::IsNullOrWhiteSpace($raw)) {
+    throw "Horodatage vide dans '$Column' à la ligne $LineNumber."
+  }
+  if ($raw -match '^\d{4}-\d{2}-\d{2}' -or $raw -match '[T ]\d{1,2}:\d{2}:\d{2}') {
+    throw "Horodatage absolu non pris en charge dans '$Column' à la ligne $LineNumber ('$raw') : une origine audio explicite est requise."
+  }
+
+  if ($NootaRelativeOnly) {
+    if ($raw -notmatch '^(?<h>\d+):(?<m>\d{2}):(?<s>\d{2})$') {
+      throw "Horodatage Noota.io invalide dans '$Column' à la ligne $LineNumber ('$raw') : format relatif HH:MM:SS attendu."
+    }
+    $hours = [int]$Matches.h
+    $minutes = [int]$Matches.m
+    $seconds = [int]$Matches.s
+    if ($minutes -ge 60 -or $seconds -ge 60) {
+      throw "Horodatage Noota.io invalide dans '$Column' à la ligne $LineNumber ('$raw') : minutes et secondes doivent être inférieures à 60."
+    }
+    return [double]($hours * 3600 + $minutes * 60 + $seconds)
+  }
+
+  if ($raw -match '^\d+([.,]\d+)?$') {
+    return [double]($raw -replace ',', '.')
+  }
+  if ($raw -match '^(?<m>\d+):(?<s>\d{2})(?<fraction>[.,]\d+)?$') {
+    $minutes = [int]$Matches.m
+    $seconds = [int]$Matches.s
+    if ($seconds -ge 60) { throw "Horodatage invalide dans '$Column' à la ligne $LineNumber ('$raw')." }
+    $fraction = if ($Matches.fraction) { [double](('0' + $Matches.fraction) -replace ',', '.') } else { 0.0 }
+    return [double]($minutes * 60 + $seconds + $fraction)
+  }
+  if ($raw -match '^(?<h>\d+):(?<m>\d{2}):(?<s>\d{2})(?<fraction>[.,]\d+)?$') {
+    $hours = [int]$Matches.h
+    $minutes = [int]$Matches.m
+    $seconds = [int]$Matches.s
+    if ($minutes -ge 60 -or $seconds -ge 60) { throw "Horodatage invalide dans '$Column' à la ligne $LineNumber ('$raw')." }
+    $fraction = if ($Matches.fraction) { [double](('0' + $Matches.fraction) -replace ',', '.') } else { 0.0 }
+    return [double]($hours * 3600 + $minutes * 60 + $seconds + $fraction)
+  }
+  if ($raw -match '^(?<h>\d+):(?<m>\d{2}):(?<s>\d{2}):(?<ms>\d{1,3})$') {
+    $hours = [int]$Matches.h
+    $minutes = [int]$Matches.m
+    $seconds = [int]$Matches.s
+    $milliseconds = [int]$Matches.ms
+    if ($minutes -ge 60 -or $seconds -ge 60 -or $milliseconds -ge 1000) {
+      throw "Horodatage invalide dans '$Column' à la ligne $LineNumber ('$raw')."
+    }
+    return [double]($hours * 3600 + $minutes * 60 + $seconds + $milliseconds / 1000.0)
+  }
+  throw "Horodatage invalide dans '$Column' à la ligne $LineNumber ('$raw')."
+}
+
+function Read-NormalizedTranscriptionCsv {
+  param([Parameter(Mandatory=$true)][string]$Path)
+
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "CSV introuvable: $Path" }
+  $firstLine = Get-Content -LiteralPath $Path -Encoding UTF8 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
+  if ([string]::IsNullOrWhiteSpace([string]$firstLine)) { throw "CSV vide: $Path" }
+  if ([string]$firstLine -notmatch ';') {
+    throw "Séparateur CSV incompatible dans '$Path' : le point-virgule (;) est requis."
+  }
+
+  $rows = @(Import-Csv -LiteralPath $Path -Delimiter ';' -Encoding UTF8)
+  if ($rows.Count -eq 0) { throw "CSV vide ou sans ligne de transcription: $Path" }
+  $headers = @($rows[0].PSObject.Properties.Name)
+  $canonical = @('start', 'speaker', 'text')
+  $noota = @('horodatage', 'locuteur', 'texte')
+  $isCanonical = @($canonical | Where-Object { $headers -notcontains $_ }).Count -eq 0
+  $isNoota = @($noota | Where-Object { $headers -notcontains $_ }).Count -eq 0
+  if ($isCanonical -and $isNoota) {
+    throw "Schéma CSV ambigu dans '$Path' : colonnes Voxtral et Noota.io présentes simultanément."
+  }
+  if (-not $isCanonical -and -not $isNoota) {
+    throw "Schéma CSV incompatible dans '$Path'. En-têtes trouvés: $($headers -join ';'). Attendu: start;speaker;text (end facultatif) ou horodatage;locuteur;texte."
+  }
+
+  $normalized = New-Object System.Collections.Generic.List[object]
+  for ($index = 0; $index -lt $rows.Count; $index++) {
+    $row = $rows[$index]
+    $lineNumber = $index + 2
+    if ($isCanonical) {
+      $null = Convert-TranscriptionTimestampToSeconds -Value $row.start -Column 'start' -LineNumber $lineNumber
+      if ($headers -contains 'end' -and -not [string]::IsNullOrWhiteSpace([string]$row.end)) {
+        $null = Convert-TranscriptionTimestampToSeconds -Value $row.end -Column 'end' -LineNumber $lineNumber
+      }
+      $normalized.Add($row) | Out-Null
+      continue
+    }
+
+    $seconds = Convert-TranscriptionTimestampToSeconds -Value $row.horodatage -Column 'horodatage' -LineNumber $lineNumber -NootaRelativeOnly
+    $mapped = [ordered]@{ start = $seconds; speaker = [string]$row.locuteur; text = [string]$row.texte }
+    foreach ($property in $row.PSObject.Properties) {
+      if ($property.Name -notin $noota -and -not $mapped.Contains($property.Name)) {
+        $mapped[$property.Name] = $property.Value
+      }
+    }
+    $normalized.Add([pscustomobject]$mapped) | Out-Null
+  }
+
+  return [pscustomobject]@{
+    Format = if ($isCanonical) { 'voxtral' } else { 'noota' }
+    Rows = [object[]]$normalized.ToArray()
+    Headers = [string[]]$headers
+    HasEnd = [bool]($isCanonical -and $headers -contains 'end')
+  }
+}
+
 
 function To-TotalSeconds([object]$v){
   if($null -eq $v){ return 0.0 }
@@ -799,6 +915,7 @@ function Normalize-Timecodes {
 function Update-ContexteGeneralFromCsv {
   param(
     [Parameter(Mandatory=$true)][string]$CsvPath,
+    [Parameter(Mandatory=$true)][object[]]$Rows,
     [Parameter(Mandatory=$true)][string]$ContexteJsonPath,
     [string]$StartCol = "start",
     [string]$EndCol   = "end"
@@ -811,7 +928,7 @@ function Update-ContexteGeneralFromCsv {
     throw "contexte_general.json introuvable: $ContexteJsonPath"
   }
 
-  $rows = Import-Csv -Path $CsvPath -Delimiter ';'
+  $rows = @($Rows)
   if (-not $rows -or $rows.Count -eq 0) {
     throw "CSV vide: $CsvPath"
   }
@@ -1949,8 +2066,28 @@ function Truncate-For-Context {
 
 # maxSec = max(end) si end existe et est non vide, sinon max(start)
 Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Début calcul durée max / lecture CSV : {0}" -f $CsvPath) -ForegroundColor Yellow
-$rows = Import-Csv $csvPath -Delimiter ';'
-Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Après Import-Csv : rows={0}" -f @($rows).Count) -ForegroundColor Yellow
+$transcription = Read-NormalizedTranscriptionCsv -Path $CsvPath
+$TranscriptionRows = @($transcription.Rows)
+Microsoft.PowerShell.Utility\Write-Host ("[DEBUG] Après chargement CSV normalisé : format={0} rows={1}" -f $transcription.Format, $TranscriptionRows.Count) -ForegroundColor Yellow
+
+if ($ValidateCsvOnly) {
+  $seconds = @($TranscriptionRows | ForEach-Object {
+    Convert-TranscriptionTimestampToSeconds -Value $_.start -Column 'start' -LineNumber 0
+  })
+  [pscustomobject]@{
+    valid = $true
+    path = (Resolve-Path -LiteralPath $CsvPath).Path
+    format = $transcription.Format
+    rows = $TranscriptionRows.Count
+    has_end = $transcription.HasEnd
+    min_start_seconds = [double](($seconds | Measure-Object -Minimum).Minimum)
+    max_start_seconds = [double](($seconds | Measure-Object -Maximum).Maximum)
+    headers = @($transcription.Headers)
+  } | ConvertTo-Json -Depth 5
+  return
+}
+
+$rows = $TranscriptionRows
 
 $maxSec = 0
 $maxSecLoopIndex = 0
@@ -1991,6 +2128,7 @@ if ($contextePath -and (Test-Path $contextePath)) {
     Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step E - avant appel Update-ContexteGeneralFromCsv" -ForegroundColor Yellow
     $ctxUpdate = Update-ContexteGeneralFromCsv `
         -CsvPath $CsvPath `
+        -Rows $TranscriptionRows `
         -ContexteJsonPath $contextePath `
         -StartCol "start" `
         -EndCol "end"
@@ -3864,7 +4002,7 @@ Microsoft.PowerShell.Utility\Write-Host "Lecture CSV: $CsvPath"
 
 # passe 0+1 technique
 
-$rows = Import-Csv -Path $CsvPath -Delimiter ';'
+$rows = @($TranscriptionRows)
 # Détection forcée (beaucoup plus robuste)
 $colSpeaker = 'speaker'
 $colTime    = 'start'
