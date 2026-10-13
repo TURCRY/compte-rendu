@@ -1,4 +1,5 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $pipelinePath = Join-Path $repoRoot "cr-pipeline/pipeline/powershell/cr_reunion_point_mumerotes_pipeline_json.ps1"
@@ -48,6 +49,12 @@ function Assert-ThrowsLike([scriptblock]$Action, [string]$Pattern, [string]$Mess
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("cr_csv_normalizer_" + [guid]::NewGuid().ToString("N"))
 [void](New-Item -ItemType Directory -Path $tempRoot)
 try {
+  Assert-Eq (Convert-TranscriptionTimestampToSeconds "0" "start" 2) 0 "timestamp numérique entier"
+  Assert-Eq (Convert-TranscriptionTimestampToSeconds "4.5" "end" 2) 4.5 "timestamp numérique décimal"
+  Assert-Eq (Convert-TranscriptionTimestampToSeconds "00:00:05" "start" 2) 5 "HH:MM:SS sans fraction"
+  Assert-Eq (Convert-TranscriptionTimestampToSeconds "00:00:05.250" "end" 2) 5.25 "HH:MM:SS avec fraction"
+  Assert-Eq (Convert-TranscriptionTimestampToSeconds "01:02:03" "start" 2) 3723 "HH:MM:SS avec heure supérieure à zéro"
+
   $voxEnd = Read-NormalizedTranscriptionCsv (Join-Path $fixtures "voxtral_with_end.csv")
   Assert-Eq $voxEnd.Format "voxtral" "Voxtral avec end détecté"
   Assert-True $voxEnd.HasEnd "end conservé lorsqu'il existe"
@@ -63,23 +70,32 @@ try {
   Assert-Eq $noota.Format "noota" "Noota.io détecté"
   Assert-Eq $noota.Rows[0].start 62 "HH:MM:SS Noota converti directement en secondes"
   Assert-Eq $noota.Rows[2].start 3723 "durée Noota supérieure à une heure"
-  Assert-Eq $noota.Rows[0].speaker "Élodie" "locuteur et accents conservés"
-  Assert-Eq $noota.Rows[0].text "Texte cité; avec point-virgule et accents" "champ CSV cité conservé"
-  Assert-Eq $noota.Rows[0].note "n°1" "colonne Noota supplémentaire conservée"
+  $elodie = ([char]0x00C9) + "lodie"
+  Assert-Eq $noota.Rows[0].speaker $elodie "locuteur et accents conservés"
+  $quotedText = "Texte cit" + ([char]0x00E9) + "; avec point-virgule et accents"
+  $noteOne = "n" + ([char]0x00B0) + "1"
+  Assert-Eq $noota.Rows[0].text $quotedText "champ CSV cité conservé"
+  Assert-Eq $noota.Rows[0].note $noteOne "colonne Noota supplémentaire conservée"
   Assert-True ($null -eq $noota.Rows[0].PSObject.Properties['end']) "aucun end artificiel pour Noota"
 
+  $rowIndex = 0
   $ordered = @($noota.Rows | ForEach-Object {
     $_ | Add-Member __sec ([double]$_.start) -Force
     $_ | Add-Member __end_sec ([double]$_.start) -Force
+    $_ | Add-Member __row_index $rowIndex -Force
+    $rowIndex++
     $_
   } | Sort-Object __sec)
   $segments = Get-IntelligentSegments -rows $ordered -colTime start -colSpeaker speaker -colText text -logPath (Join-Path $tempRoot "segments.log") -ChunkSize 25
   Assert-Eq $ordered[0].speaker "André" "ordre temporel normalisé exploitable par la segmentation"
   Assert-True (@($segments).Count -gt 0) "segmentation synthétique Noota produite sans LLM"
 
+  $rowIndex = 0
   $voxOrdered = @($voxNoEnd.Rows | ForEach-Object {
     $_ | Add-Member __sec ([double]$_.start) -Force
     $_ | Add-Member __end_sec ([double]$_.start) -Force
+    $_ | Add-Member __row_index $rowIndex -Force
+    $rowIndex++
     $_
   } | Sort-Object __sec)
   $voxSegments = Get-IntelligentSegments -rows $voxOrdered -colTime start -colSpeaker speaker -colText text -logPath (Join-Path $tempRoot "vox_segments.log") -ChunkSize 25

@@ -721,7 +721,8 @@ function Convert-TranscriptionTimestampToSeconds {
     $minutes = [int]$Matches.m
     $seconds = [int]$Matches.s
     if ($seconds -ge 60) { throw "Horodatage invalide dans '$Column' à la ligne $LineNumber ('$raw')." }
-    $fraction = if ($Matches.fraction) { [double](('0' + $Matches.fraction) -replace ',', '.') } else { 0.0 }
+    $fractionRaw = if ($Matches.ContainsKey('fraction')) { [string]$Matches['fraction'] } else { '' }
+    $fraction = if ($fractionRaw) { [double](('0' + $fractionRaw) -replace ',', '.') } else { 0.0 }
     return [double]($minutes * 60 + $seconds + $fraction)
   }
   if ($raw -match '^(?<h>\d+):(?<m>\d{2}):(?<s>\d{2})(?<fraction>[.,]\d+)?$') {
@@ -729,7 +730,8 @@ function Convert-TranscriptionTimestampToSeconds {
     $minutes = [int]$Matches.m
     $seconds = [int]$Matches.s
     if ($minutes -ge 60 -or $seconds -ge 60) { throw "Horodatage invalide dans '$Column' à la ligne $LineNumber ('$raw')." }
-    $fraction = if ($Matches.fraction) { [double](('0' + $Matches.fraction) -replace ',', '.') } else { 0.0 }
+    $fractionRaw = if ($Matches.ContainsKey('fraction')) { [string]$Matches['fraction'] } else { '' }
+    $fraction = if ($fractionRaw) { [double](('0' + $fractionRaw) -replace ',', '.') } else { 0.0 }
     return [double]($hours * 3600 + $minutes * 60 + $seconds + $fraction)
   }
   if ($raw -match '^(?<h>\d+):(?<m>\d{2}):(?<s>\d{2}):(?<ms>\d{1,3})$') {
