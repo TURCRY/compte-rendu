@@ -423,7 +423,35 @@ scan_placeholder_file() {
   local payload_file="$1"
   local label="$2"
 
-  python3 "$SCRIPT_DIR/placeholder_scan.py" json "$payload_file" "$label" "${CR_PLACEHOLDER_ALLOWLIST:-}"
+  python3 - "$SCRIPT_DIR" "$payload_file" "$label" "${CR_PLACEHOLDER_ALLOWLIST:-}" <<'PY'
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1])
+path = Path(sys.argv[2])
+label = sys.argv[3]
+allowlist = [item.strip() for item in sys.argv[4].split(",") if item.strip()]
+module_path = script_dir / "render_compte_rendu_from_infos.py"
+spec = importlib.util.spec_from_file_location("render_compte_rendu_from_infos", module_path)
+module = importlib.util.module_from_spec(spec)
+assert spec and spec.loader
+spec.loader.exec_module(module)
+
+payload = json.loads(path.read_text(encoding="utf-8-sig"))
+hits = module.find_publishable_placeholders(payload, allowlist)
+
+if hits:
+    print(f"ERREUR: placeholders résiduels dans {label}: {path}")
+    for hit in hits[:40]:
+        print(f"- {hit['token']} ({hit['path']}): {hit['context']}")
+    if len(hits) > 40:
+        print(f"... {len(hits) - 40} occurrence(s) supplémentaire(s)")
+    raise SystemExit(32)
+
+print(f"QA placeholders OK: {label}")
+PY
 }
 
 scan_docx_placeholders() {
@@ -497,6 +525,7 @@ PY
     python3 - "$SCRIPT_DIR" "$source_json" "$payload_json" "$PSEUDO_API_BASE" "$PSEUDO_API_KEY" "$PSEUDO_JOB_ID" <<'PY' || return $?
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -514,12 +543,23 @@ assert spec and spec.loader
 spec.loader.exec_module(module)
 
 payload_text = source_path.read_text(encoding="utf-8")
-payload_json = module.depseudonymize_final_payload(
-    payload_text,
-    pseudo_api_base=pseudo_api_base,
-    pseudo_api_key=pseudo_api_key,
-    job_id=job_id,
-)
+try:
+    payload_json = module.depseudonymize_final_payload(
+        payload_text,
+        pseudo_api_base=pseudo_api_base,
+        pseudo_api_key=pseudo_api_key,
+        job_id=job_id,
+        placeholder_allowlist=[
+            item.strip()
+            for item in os.environ.get("CR_PLACEHOLDER_ALLOWLIST", "").split(",")
+            if item.strip()
+        ],
+    )
+except module.ResidualPlaceholderError as exc:
+    print(f"ERREUR: placeholders résiduels dans payload DOCX déseudonymisé: {source_path}")
+    for hit in exc.hits[:40]:
+        print(f"- {hit['token']} ({hit['path']}): {hit['context']}")
+    raise SystemExit(32)
 target_path.write_text(json.dumps(payload_json, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
     scan_placeholder_file "$payload_json" "payload DOCX déseudonymisé" || return $?

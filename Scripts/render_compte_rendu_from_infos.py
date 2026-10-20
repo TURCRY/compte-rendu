@@ -37,6 +37,97 @@ FINAL_JSON_FILENAMES = (
     "global_final.json",
 )
 
+PSEUDO_ALIAS_RE = re.compile(r"(?i)\b(?:P\s*\d+|ENT\s*\d+)\b")
+PRESERVED_METADATA_KEYS = frozenset(
+    {
+        "debug",
+        "diagnostics",
+        "indices_source",
+        "meta",
+        "metadata",
+        "provenance",
+        "source",
+        "sources",
+        "stats",
+    }
+)
+PRESERVED_TECHNICAL_KEYS = frozenset(
+    {
+        "compact_status",
+        "date",
+        "file",
+        "filename",
+        "hash",
+        "id",
+        "job_id",
+        "link",
+        "model",
+        "numero",
+        "path",
+        "provider",
+        "sha256",
+        "source_name",
+        "status",
+        "timecode",
+        "url",
+    }
+)
+
+
+class ResidualPlaceholderError(ValueError):
+    def __init__(self, hits: list[dict[str, str]]):
+        self.hits = hits
+        super().__init__("pseudonymes résiduels dans le contenu publiable")
+
+
+def _preserve_json_value(key: str, parent_preserved: bool) -> bool:
+    normalized = str(key or "").casefold()
+    return (
+        parent_preserved
+        or normalized in PRESERVED_METADATA_KEYS
+        or normalized in PRESERVED_TECHNICAL_KEYS
+        or normalized.endswith(("_id", "_path", "_url", "_file", "_hash"))
+    )
+
+
+def _map_publishable_strings(value, transform, *, path: str = "$", preserved: bool = False):
+    if isinstance(value, dict):
+        return {
+            key: _map_publishable_strings(
+                item,
+                transform,
+                path=f"{path}.{key}",
+                preserved=_preserve_json_value(key, preserved),
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _map_publishable_strings(item, transform, path=f"{path}[{index}]", preserved=preserved)
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, str) and not preserved:
+        return transform(value, path)
+    return value
+
+
+def find_publishable_placeholders(payload, allowlist=()) -> list[dict[str, str]]:
+    allowed = {str(item).strip().upper().replace(" ", "") for item in allowlist if str(item).strip()}
+    hits: list[dict[str, str]] = []
+
+    def inspect(text: str, path: str) -> str:
+        for match in PSEUDO_ALIAS_RE.finditer(text):
+            token = match.group(0).upper().replace(" ", "")
+            if token in allowed:
+                continue
+            start = max(0, match.start() - 70)
+            end = min(len(text), match.end() + 70)
+            hits.append({"path": path, "token": match.group(0), "context": text[start:end].replace("\n", " ")})
+        return text
+
+    _map_publishable_strings(payload, inspect)
+    return hits
+
 
 def pipeline_uses_remote_llm(provider: str, *models: str) -> bool:
     if (provider or "").strip().lower() != "openai":
@@ -151,11 +242,35 @@ def resolve_compte_rendu_config(infos: dict) -> dict:
     return compte_rendu if isinstance(compte_rendu, dict) else {}
 
 
-def depseudonymize_final_payload(payload_text: str, *, pseudo_api_base: str, pseudo_api_key: str, job_id: str) -> dict:
+def depseudonymize_final_payload(
+    payload_text: str,
+    *,
+    pseudo_api_base: str,
+    pseudo_api_key: str,
+    job_id: str,
+    placeholder_allowlist=(),
+) -> dict:
+    payload = json.loads(payload_text.lstrip("\ufeff"))
+    values: list[str] = []
+
+    def collect(text: str, _path: str) -> str:
+        if text.strip():
+            values.append(text)
+        return text
+
+    _map_publishable_strings(payload, collect)
+    if not values:
+        return payload
+
+    separator = f"\x1eCR_DEPSEUDO_{uuid.uuid4().hex}\x1f"
+    while any(separator in value for value in values):
+        separator = f"\x1eCR_DEPSEUDO_{uuid.uuid4().hex}\x1f"
+    joined_text = separator.join(values)
+
     response = requests.post(
         pseudo_api_base.rstrip("/") + "/depseudonymize",
         json={
-            "text": payload_text,
+            "text": joined_text,
             "job_id": job_id,
             "mode": "compte_rendu_final",
         },
@@ -168,10 +283,24 @@ def depseudonymize_final_payload(payload_text: str, *, pseudo_api_base: str, pse
         data.get("text_depseudonymized")
         or data.get("text_clear")
         or data.get("text")
-        or payload_text
+        or joined_text
     )
-    clear_text = (clear_text or "").lstrip("\ufeff").strip()
-    return json.loads(clear_text)
+    clear_values = str(clear_text or "").split(separator)
+    if len(clear_values) != len(values):
+        raise ValueError(
+            "Réponse de déseudonymisation incohérente : "
+            f"{len(clear_values)} valeur(s) reçue(s), {len(values)} attendue(s)."
+        )
+
+    clear_values_iter = iter(clear_values)
+    clear_payload = _map_publishable_strings(
+        payload,
+        lambda text, _path: next(clear_values_iter) if text.strip() else text,
+    )
+    residuals = find_publishable_placeholders(clear_payload, placeholder_allowlist)
+    if residuals:
+        raise ResidualPlaceholderError(residuals)
+    return clear_payload
 
 
 
