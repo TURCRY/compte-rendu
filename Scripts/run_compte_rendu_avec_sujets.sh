@@ -389,8 +389,8 @@ assert_pipeline_qa_ok_for_docx() {
   local qa_file="${host_out_dir}/pipeline_qa_status.json"
 
   if [[ ! -f "$qa_file" ]]; then
-    echo "QA DOCX: aucun pipeline_qa_status.json trouvé, rendu autorisé."
-    return 0
+    echo "ERREUR: rendu DOCX bloqué: pipeline_qa_status.json absent: $qa_file"
+    return 30
   fi
 
   python3 - "$qa_file" "$ALLOW_CRITICAL_QA" <<'PY'
@@ -452,6 +452,80 @@ if hits:
 
 print(f"QA placeholders OK: {label}")
 PY
+}
+
+scan_publishable_terminology_file() {
+  local payload_file="$1"
+  local label="$2"
+  local report_file="$3"
+  local scanner="$PROJECT_ROOT/cr-pipeline/pipeline/python/publishable_terminology.py"
+  local rc=0
+
+  if [[ ! -f "$scanner" ]]; then
+    echo "ERREUR: scanner rédactionnel introuvable: $scanner"
+    return 36
+  fi
+  if python3 "$scanner" --input "$payload_file" --stage "$label" --report "$report_file"; then
+    return 0
+  else
+    rc=$?
+  fi
+  if [[ $rc -eq 42 ]]; then
+    python3 - "$report_file" "$label" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+report_path = Path(sys.argv[1])
+status_path = report_path.parent / "publication_status.json"
+status = {
+    "ok": False,
+    "status": "FAILED",
+    "error_type": "PUBLISHABLE_TERMINOLOGY_BLOCKED",
+    "stage": sys.argv[2],
+    "scanner_exit_code": 42,
+    "report_path": str(report_path),
+    "occurred_at": datetime.now(timezone.utc).isoformat(),
+}
+status_path.write_text(json.dumps(status, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+    echo "ERREUR REDACTIONNELLE: publication bloquée; terminologie interne détectée dans $label. Rapport: $report_file"
+    return 33
+  fi
+  echo "ERREUR: contrôle rédactionnel impossible pour $label (code=$rc)."
+  return 36
+}
+
+record_pipeline_execution_failure() {
+  local host_out_dir="$1"
+  local pipeline_rc="$2"
+
+  if ! python3 - "$host_out_dir" "$pipeline_rc" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+out_dir = Path(sys.argv[1])
+status = {
+    "ok": False,
+    "status": "FAILED",
+    "error_type": "POWERSHELL_PIPELINE_FAILED",
+    "pipeline_exit_code": int(sys.argv[2]),
+    "docx_render_attempted": False,
+    "canonical_publication_attempted": False,
+    "occurred_at": datetime.now(timezone.utc).isoformat(),
+}
+(out_dir / "pipeline_execution_status.json").write_text(
+    json.dumps(status, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+  then
+    echo "WARNING: impossible d'écrire pipeline_execution_status.json; le code initial $pipeline_rc reste prioritaire."
+  fi
+  return 0
 }
 
 scan_docx_placeholders() {
@@ -566,6 +640,11 @@ PY
   else
     scan_placeholder_file "$payload_json" "payload DOCX" || return $?
   fi
+
+  scan_publishable_terminology_file \
+    "$payload_json" \
+    "payload_depseudonymized" \
+    "${host_out_dir}/publishable_terminology_depseudonymized.json" || return $?
 
   PREPARED_DOCX_PAYLOAD="$payload_json"
 }
@@ -1231,6 +1310,13 @@ set -e
 # Post-traitements sur OUT_DIR (NAS)
 # ----------------------------
 HOST_OUT_DIR="/volume1/Affaires${OUT_DIR#/data/Affaires}"
+
+if [[ $rc -ne 0 ]]; then
+  record_pipeline_execution_failure "$HOST_OUT_DIR" "$rc"
+  echo "ERREUR: pipeline PowerShell en échec (code=$rc). Rendu DOCX et publication canonique annulés; artefacts conservés dans $HOST_OUT_DIR."
+  echo "=== FIN (exit=$rc): $(date -Is) ==="
+  exit "$rc"
+fi
 
 echo "=== Generation DOCX final ==="
 HOST_OUT_JSON="${HOST_OUT_DIR}/global_final.json"

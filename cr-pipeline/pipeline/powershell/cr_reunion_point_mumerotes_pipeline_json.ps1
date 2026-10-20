@@ -84,6 +84,73 @@ param(
 $dependencyPlanModule = Join-Path $PSScriptRoot "dependency_plan.psm1"
 if (-not (Test-Path -LiteralPath $dependencyPlanModule)) { throw "Module de dépendances introuvable: $dependencyPlanModule" }
 Import-Module $dependencyPlanModule -Force
+$PublishableTerminologyScanner = Join-Path (Split-Path $PSScriptRoot -Parent) "python/publishable_terminology.py"
+if (-not (Test-Path -LiteralPath $PublishableTerminologyScanner)) {
+  throw "Scanner rédactionnel introuvable: $PublishableTerminologyScanner"
+}
+function Invoke-PublishableTerminologyScan {
+  param(
+    [Parameter(Mandatory=$true)] [string] $JsonPath,
+    [Parameter(Mandatory=$true)] [string] $Stage,
+    [Parameter(Mandatory=$true)] [string] $ReportPath
+  )
+  & python3 $PublishableTerminologyScanner --input $JsonPath --stage $Stage --report $ReportPath
+  $scanExit = $LASTEXITCODE
+  if ($scanExit -eq 42) {
+    $publicationStatusPath = Join-Path $OutDir "publication_status.json"
+    $publicationStatus = [ordered]@{
+      ok = $false
+      status = "FAILED"
+      error_type = "PUBLISHABLE_TERMINOLOGY_BLOCKED"
+      stage = $Stage
+      scanner_exit_code = $scanExit
+      report_path = $ReportPath
+      occurred_at = (Get-Date).ToString("o")
+    }
+    [System.IO.File]::WriteAllText(
+      $publicationStatusPath,
+      ($publicationStatus | ConvertTo-Json -Depth 10),
+      [System.Text.UTF8Encoding]::new($false)
+    )
+    throw "PUBLISHABLE_TERMINOLOGY_BLOCKED: contenu publiable contaminé à l'étape $Stage; rapport=$ReportPath"
+  }
+  if ($scanExit -ne 0) {
+    $publicationStatusPath = Join-Path $OutDir "publication_status.json"
+    $publicationStatus = [ordered]@{
+      ok = $false
+      status = "FAILED"
+      error_type = "PUBLISHABLE_TERMINOLOGY_SCAN_ERROR"
+      stage = $Stage
+      scanner_exit_code = $scanExit
+      report_path = $ReportPath
+      occurred_at = (Get-Date).ToString("o")
+    }
+    [System.IO.File]::WriteAllText(
+      $publicationStatusPath,
+      ($publicationStatus | ConvertTo-Json -Depth 10),
+      [System.Text.UTF8Encoding]::new($false)
+    )
+    throw "PUBLISHABLE_TERMINOLOGY_SCAN_ERROR: échec du scanner à l'étape $Stage (code=$scanExit); rapport=$ReportPath"
+  }
+}
+function Assert-TargetedSubjectReuseCompatible {
+  param(
+    [Parameter(Mandatory=$true)] [bool] $TargetedSubjectResume,
+    [Parameter(Mandatory=$true)] [hashtable] $PlanByName
+  )
+  if (-not $TargetedSubjectResume) { return }
+
+  $pass2EDecision = $PlanByName["Pass2E"]
+  $pass2EAction = if ($null -ne $pass2EDecision -and $pass2EDecision.PSObject.Properties['action']) {
+    [string]$pass2EDecision.action
+  } else {
+    ""
+  }
+  if ($pass2EAction -ne "REUSE") {
+    throw ("REPRISE_SUJETS_INCOMPATIBLE: les sorties Pass2E hors cible ne sont pas compatibles avec la PipelineVersion courante " +
+      "(décision Pass2E='{0}'). Aucun artefact historique n'a été modifié. Créer un nouveau run complet sans --only-subjects." -f $pass2EAction)
+  }
+}
 $PipelineVersion = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
 $DependencyParameters = @{
   pipeline_schema = "dependency-state-v1"
@@ -139,6 +206,7 @@ if ($HasOnlyPass2BBatches -and (-not $RebuildFromPass2B)) {
 if ($HasOnlySubjects -and (-not $RebuildFromSubjects)) {
   $RebuildFromSubjects = $true
 }
+Assert-TargetedSubjectReuseCompatible -TargetedSubjectResume $HasOnlySubjects -PlanByName $DependencyPlanByName
 $onlySubjectsSet = @{}
 foreach ($n in @($OnlySubjectsEffective)) {
   if ($n -gt 0) { $onlySubjectsSet[[int]$n] = $true }
@@ -2493,6 +2561,8 @@ Règles :
 - Dédupliquer partout.
 - Si les données sont insuffisantes, renvoyer quand même un JSON conforme avec chaînes vides et tableaux vides (pas de texte).
 - La réponse doit commencer par { et se terminer par }.
+- Les textes destinés au compte rendu doivent être autonomes : ne jamais citer le nom d'une passe, un prompt, un pipeline, un modèle LLM, une étape interne ou une synthèse intermédiaire de traitement.
+- Décrire uniquement les pièces, déclarations, échanges de la réunion, constatations et éléments techniques utiles au lecteur final.
 '@
 
 
@@ -3198,6 +3268,8 @@ Règles :
 - Aucune date au format "YYYY-MM-DD" dans "indices_source.speaker".
 - "indices_source.extrait" : sans puce "-" en tête.
 - sortie STRICTEMENT au format JSON.
+- Les textes destinés au compte rendu doivent être autonomes : ne jamais citer le nom d'une passe, un prompt, un pipeline, un modèle LLM, une étape interne ou une synthèse intermédiaire de traitement.
+- Décrire uniquement les pièces, déclarations, échanges de la réunion, constatations et éléments techniques utiles au lecteur final.
 
 Normalisation des dates (obligatoire) :
 
@@ -3347,7 +3419,7 @@ Règles rédactionnelles autonomes par sujet :
 - Si des échanges sont identifiés, produire une synthèse factuelle fondée uniquement sur ces échanges.
 - Si le sujet est évoqué comme corrigé, réglé, repris ou fait, le mentionner comme "déclaré repris", sans conclure à la conformité technique.
 - Si aucun échange n’est identifié, utiliser exactement :
-  "Aucun élément relatif à ce point n’a été identifié dans les échanges analysés."
+  "Aucun élément relatif à ce point n’a été identifié dans les échanges de la réunion."
 - Ne jamais inventer de constat matériel.
 - Distinguer ce qui est dit dans les échanges de ce qui est effectivement constaté.
 
@@ -3364,8 +3436,8 @@ même si aucun échange n’existe pour un sujet donné.
 
 Si aucun échange n’est présent pour un sujet :
 - "avis_participants" = []
-- "synthese_echanges" = "Aucun élément relatif à ce point n’a été identifié dans les échanges analysés."
-- "conclusion_expert" = "Aucune conclusion technique ne peut être formulée à partir des échanges analysés."
+- "synthese_echanges" = "Aucun élément relatif à ce point n’a été identifié dans les échanges de la réunion."
+- "conclusion_expert" = "Aucune conclusion technique ne peut être formulée à partir des échanges de la réunion."
 
 Réponds STRICTEMENT au format JSON avec ce schéma :
 
@@ -3485,13 +3557,15 @@ Règles rédactionnelles autonomes :
 - Si des échanges sont identifiés, produire une synthèse factuelle fondée uniquement sur ces échanges.
 - Si le sujet est évoqué comme corrigé, réglé, repris ou fait, écrire qu’il est "déclaré repris", sans conclure à la conformité technique.
 - Si aucun échange n’est identifié, écrire exactement dans "synthese_echanges" :
-  "Aucun élément relatif à ce point n’a été identifié dans les échanges analysés."
+  "Aucun élément relatif à ce point n’a été identifié dans les échanges de la réunion."
 - Ne jamais inventer de constat matériel.
 - Distinguer ce qui est dit dans les échanges de ce qui est effectivement constaté.
-- Ne pas écrire "Aucun élément" lorsque la synthèse Pass2E fournie contient au moins un fait, une action, un désaccord, une demande de document ou un élément technique exploitable.
+- Ne pas écrire "Aucun élément" lorsque les éléments factuels fournis contiennent au moins un fait, une action, un désaccord, une demande de document ou un élément technique exploitable.
 - Conserver les désaccords, réserves, actions, documents demandés et éléments techniques présents dans l’entrée Pass2E.
 - Ne pas transformer une action proposée ou une demande en décision acquise.
 - Préserver les incertitudes et formuler prudemment les conclusions.
+- Les textes destinés au compte rendu doivent être autonomes : ne jamais citer le nom d'une passe, un prompt, un pipeline, un modèle LLM, une étape interne ou une synthèse intermédiaire de traitement.
+- Ne jamais qualifier les sources comme « synthèse fournie », « échanges analysés » ou « éléments analysés » ; employer une formulation métier précise telle que « échanges de la réunion », « déclarations recueillies » ou « éléments disponibles ».
 
 Réponds STRICTEMENT au format JSON (aucun texte hors JSON) :
 
@@ -3552,7 +3626,7 @@ Interventions rattachées à ce sujet :
 
 Rappels :
 - Ne pas inventer de faits.
-- Si aucune intervention : avis_participants=[], synthese_echanges="Aucun élément relatif à ce point n’a été identifié dans les échanges analysés.", conclusion_expert="Aucune conclusion technique ne peut être formulée à partir des échanges analysés."
+- Si aucune intervention : avis_participants=[], synthese_echanges="Aucun élément relatif à ce point n’a été identifié dans les échanges de la réunion.", conclusion_expert="Aucune conclusion technique ne peut être formulée à partir des échanges de la réunion."
 - Si un point est seulement indiqué comme corrigé, réglé, repris ou fait, l’écrire comme "déclaré repris", sans conclure à la conformité technique.
 - Les interventions dont l’auteur est "Expert" et/ou sans timecode peuvent correspondre au débrief post-réunion : à intégrer en priorité dans conclusion_expert, sans les mettre dans avis_participants.
 
@@ -3562,7 +3636,7 @@ Renvoie uniquement le JSON conforme au schéma.
 # ── Passe 2E : condensation intermédiaire par sujet ───────────────────────────
 Microsoft.PowerShell.Utility\Write-Host "[DEBUG] step F32 - avant BasePass2E_System" -ForegroundColor Yellow
 $BasePass2E_System = @'
-Tu es un assistant chargé de produire une synthèse intermédiaire STRICTEMENT factuelle
+Tu es un assistant chargé de produire un résumé factuel structuré
 pour un bloc d’interventions rattachées à un sujet d’expertise judiciaire.
 
 Entrées :
@@ -3593,6 +3667,8 @@ Règles impératives :
 - distinguer les mesures de distance, hauteur, profondeur, duree et quantite ;
 - conserver separement les propositions independantes lorsque leur relation semantique n'est pas certaine ;
 - respecter les marqueurs d'approximation comme "environ" ou "a peu pres" ;
+- Le contenu rédactionnel doit être autonome : ne jamais citer le nom d'une passe, un prompt, un pipeline, un modèle LLM, une étape interne ou un traitement intermédiaire.
+- Décrire uniquement les déclarations, échanges de la réunion, constatations, pièces et éléments techniques utiles au lecteur final.
 - respecter les positions relatives comme "plus haut" ou "en contrebas" sans les convertir en altitude chiffree ;
 - si la ponctuation ASR est incertaine, produire une formulation prudente plutot qu'une relation causale ou quantitative inventee ;
 - si une phrase ASR juxtapose un marqueur spatial comme "la-haut" ou "plus haut" avec une mesure comme "a 400 metres", ne jamais transformer cette mesure en hauteur, altitude, profondeur ou etendue de dommage ;
@@ -5816,6 +5892,9 @@ $globalMeetingPath = Join-Path $OutDir "global_meeting.json"
 $json = $globalMeetingObj | ConvertTo-Json -Depth 50
 [System.IO.File]::WriteAllText($globalMeetingPath, $json, $utf8NoBom)
 
+$pass2BTerminologyReport = Join-Path $logsDir "publishable_terminology_pass2b.json"
+Invoke-PublishableTerminologyScan -JsonPath $globalMeetingPath -Stage "pass2b" -ReportPath $pass2BTerminologyReport
+
 Microsoft.PowerShell.Utility\Write-Host "GLOBAL réunion → $globalMeetingPath"
 
 
@@ -6184,7 +6263,7 @@ Controle des mesures et de la ponctuation ASR :
     $chunkJson = $ChunkObj | ConvertTo-Json -Depth 50 -Compress
 
     $userPrompt = @"
-Tu réalises une synthèse intermédiaire de sujet d'expertise judiciaire.
+Tu réalises un résumé factuel structuré de sujet d'expertise judiciaire.
 
 Objectif :
 - condenser fidèlement les interventions du bloc ;
@@ -6448,7 +6527,7 @@ function Invoke-Pass2EForSujetFile {
             $sujetRaw = [pscustomobject]@{}
         }
 
-        $fallbackText = "Aucun élément relatif à ce point n’a été identifié dans les échanges analysés."
+        $fallbackText = "Aucun élément relatif à ce point n’a été identifié dans les échanges de la réunion."
         $compact = [pscustomobject]@{
             resume_factuel      = $fallbackText
             points_cles         = @()
@@ -6847,22 +6926,24 @@ else {
     Sujet :
     $($meta | ConvertTo-Json -Depth 10)
 
-    Synthèse intermédiaire Pass2E à utiliser exclusivement :
+    Éléments factuels disponibles à utiliser exclusivement :
     $($compactSynth | ConvertTo-Json -Depth 50)
 
-    À partir de cette synthèse intermédiaire, produis la synthèse finale du sujet.
+    À partir de ces éléments factuels, produis la synthèse finale du sujet.
 
     Règles :
-    - Utiliser exclusivement la synthèse Pass2E fournie ; ne pas ajouter de faits absents.
+    - Utiliser exclusivement les éléments factuels fournis ; ne pas ajouter de faits absents.
     - Si des échanges ou éléments exploitables sont identifiés, produire une synthèse factuelle.
     - Conserver les désaccords, réserves, actions, documents demandés et éléments techniques.
     - Ne pas écrire "Aucun élément" si un champ Pass2E contient une information exploitable.
     - Si le sujet est évoqué comme corrigé, réglé, repris ou fait, écrire qu'il est "déclaré repris", sans conclure à la conformité technique.
-    - Si aucun échange n'est identifié, utiliser exactement : "Aucun élément relatif à ce point n'a été identifié dans les échanges analysés."
+    - Si aucun échange n'est identifié, utiliser exactement : "Aucun élément relatif à ce point n'a été identifié dans les échanges de la réunion."
     - Ne jamais inventer de constat matériel.
     - Distinguer ce qui est dit dans les échanges de ce qui est effectivement constaté.
     - Distinguer avis ou positions des participants, synthèse factuelle des échanges, et conclusion de l'expert.
     - Préserver les incertitudes et ne pas transformer une action proposée en décision acquise.
+    - Ne jamais citer le nom d'une passe, un prompt, un pipeline, un modèle LLM, une étape interne ou un traitement intermédiaire dans les champs rédactionnels.
+    - Ne jamais qualifier les sources comme « synthèse fournie », « échanges analysés » ou « éléments analysés ».
 
     Renvoie uniquement le JSON conforme au schéma.
 "@
@@ -7046,6 +7127,10 @@ else {
           synthese_aucun_element = [bool]$hasAucun
           warning = $(if ($hasAucun -and [int]$compactDiagnostics.total_semantic_items -gt 0) { "Pass3E a produit Aucun élément malgré un compact Pass2E exploitable." } else { "" })
         })
+        Invoke-PublishableTerminologyScan `
+          -JsonPath (Join-Path $attemptDir "normalized.json") `
+          -Stage "pass3e" `
+          -ReportPath (Join-Path $attemptDir "publishable_terminology_report.json")
       }
       # Puis seulement maintenant sérialiser
       $jsonOne = $finalOne | ConvertTo-Json -Depth 50
@@ -7342,6 +7427,12 @@ if (-not $partBObj.PSObject.Properties['themes_abordes']) {
   $partBObj | Add-Member -Force -NotePropertyName themes_abordes -NotePropertyValue @()
 }
 Ensure-List $partBObj "themes_abordes"
+$pass3BOutputPath = Join-Path $logsDir "pass3B_output.json"
+[System.IO.File]::WriteAllText($pass3BOutputPath, ($partBObj | ConvertTo-Json -Depth 50), $utf8NoBom)
+Invoke-PublishableTerminologyScan `
+  -JsonPath $pass3BOutputPath `
+  -Stage "pass3b" `
+  -ReportPath (Join-Path $logsDir "publishable_terminology_pass3b.json")
 #------------------------------------------------------------
 # 3C : actions / perspectives / annexes
 #------------------------------------------------------------
@@ -7755,6 +7846,12 @@ $finalObj | Add-Member -Force -NotePropertyName annexes        -NotePropertyValu
 
 
 $finalJson  = $finalObj | ConvertTo-Json -Depth 100
+$finalCandidatePath = Join-Path $logsDir "global_final_prepublication.json"
+[System.IO.File]::WriteAllText($finalCandidatePath, $finalJson, $utf8NoBom)
+Invoke-PublishableTerminologyScan `
+  -JsonPath $finalCandidatePath `
+  -Stage "final" `
+  -ReportPath (Join-Path $logsDir "publishable_terminology_final.json")
 $finalPath  = Join-Path $OutDir "global_final.json"
 [System.IO.File]::WriteAllText(
     $finalPath,
