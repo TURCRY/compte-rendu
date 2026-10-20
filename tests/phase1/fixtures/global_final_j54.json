@@ -1,0 +1,14 @@
+{
+  "sujets": [
+    {
+      "numero": 1,
+      "titre": "Sujet synthétique de validation",
+      "synthese_echanges": "Selon la synthèse fournie, les éléments analysés appellent une vérification.",
+      "conclusion_expert": "La synthèse Pass2E a produit cette conclusion."
+    }
+  ],
+  "metadata": {
+    "description": "Fixture synthétique sans donnée de production",
+    "source_name": "fixture_phase1"
+  }
+}
