@@ -31,7 +31,7 @@ function Import-PipelineFunction {
 $script:CsvWarnings = New-Object System.Collections.ArrayList
 function Write-CrWarn { param([string] $Message) [void]$script:CsvWarnings.Add([string]$Message) }
 
-$functionNames = @("Get-CrLeafName", "ConvertTo-ContainerAsrPath", "Test-IsPhotoAsrCsvName", "Get-AsrCsvPartKey", "Resolve-AsrCsvPath")
+$functionNames = @("Get-CrLeafName", "ConvertTo-ContainerAsrPath", "Test-IsPhotoAsrCsvName", "Get-AsrCsvPartKey", "Get-CrProp", "Test-IsAuxiliaryAsrCsvName", "Get-AsrCsvHeaderFields", "Test-AsrCsvHeader", "Get-DeclaredAsrCsvSources", "Resolve-DeclaredAsrCsvPath", "Resolve-AsrCsvFallback", "Resolve-AsrCsvPath")
 $definitions = @()
 foreach ($name in $functionNames) { $definitions += (Import-PipelineFunction -Text $scriptText -Name $name) }
 Invoke-Expression ($definitions -join "`n")
@@ -79,20 +79,20 @@ try {
     [void](New-Csv $dir1 "J48 Enghien PDS 20 11 2025 part 1_mono16_16000Hz(wav)(photo).csv" 11)
     [void](New-Csv $dir1 "J48 Enghien PDS 20 11 2025 part 2_mono16_16000Hz(wav).csv" 12)
     [void](New-Csv $dir1 "J48 Enghien PDS 20 11 2025 part 2_mono16_16000Hz(wav)(photo).csv" 13)
-    [void](New-Csv $dir1 "J48_Enghien_PDS_20_11_2025_complet_mono16_16000Hz.csv" 5)
+    $ag1 = New-Csv $dir1 "J48_Enghien_PDS_20_11_2025_complet_mono16_16000Hz.csv" 5
     [void](New-Csv $dir1 "Sujets.csv" 20)
-    $infos1 = @{ fichier_transcription = "\\192.168.1.20\Affaires\2025-J48\AF_Expert_ASR\transcriptions\accedit-2025-11-20\J48_Enghien_PDS_20_11_2025_complet_mono16_16000Hz.csv" }
+    $infos1 = @{ fichier_transcription = $ag1 }
     $got1 = Resolve-AsrCsvPath -Paths @{ TranscriptionDir = $dir1 } -Infos $infos1
-    Assert-Eq (Get-Name $got1) "J48_Enghien_PDS_20_11_2025_complet_mono16_16000Hz.csv" "1) legacy : le CSV agrege _complet_ est retenu (UNC Windows)"
+    Assert-Eq (Get-Name $got1) "J48_Enghien_PDS_20_11_2025_complet_mono16_16000Hz.csv" "1) legacy : le CSV agrege _complet_ declare est retenu"
 
     # ------------------------------------------------- 2) actuel (wav).csv + variante (photo) (accedit-2026-05-28)
     $dir2 = New-CaseDir "actuel_wav"
-    [void](New-Csv $dir2 "J48_Enghien_2026-05-28_mono16_16000Hz(wav).csv" 10)
+    $wav2 = New-Csv $dir2 "J48_Enghien_2026-05-28_mono16_16000Hz(wav).csv" 10
     [void](New-Csv $dir2 "J48_Enghien_2026-05-28_mono16_16000Hz(wav)(photo).csv" 30)
     [void](New-Csv $dir2 "Sujets.csv" 20)
-    $infos2 = @{ fichier_transcription = "\\192.168.1.20\Affaires\2025-J48\AF_Expert_ASR\transcriptions\accedit-2026-05-28\J48_Enghien_2026-05-28_mono16_16000Hz(wav).csv" }
+    $infos2 = @{ fichier_transcription = $wav2 }
     $got2 = Resolve-AsrCsvPath -Paths @{ TranscriptionDir = $dir2 } -Infos $infos2
-    Assert-Eq (Get-Name $got2) "J48_Enghien_2026-05-28_mono16_16000Hz(wav).csv" "2) actuel : (wav).csv retenu depuis un UNC Windows"
+    Assert-Eq (Get-Name $got2) "J48_Enghien_2026-05-28_mono16_16000Hz(wav).csv" "2) actuel : (wav).csv retenu depuis la source declaree"
     Assert-True ($got2 -notlike "*(photo)*") "2b) la variante (photo).csv n'est jamais retenue"
 
     # --------------------------------- 3) sans fichier_transcription : (wav).csv malgre (photo) plus recent
@@ -122,24 +122,67 @@ try {
     Assert-True (($message5 -like "*part 1*") -and ($message5 -like "*part 2*")) "5c) le message cite les deux candidats"
     Assert-True ($message5 -like "*_complet_*") "5d) le message indique la sortie attendue (CSV agrege)"
 
-    # --------------------------------- 6) fichier_transcription pointant un dossier
+    # --------------------------------- 6) source explicite = dossier : erreur, pas de scan
     $dir6 = New-CaseDir "dossier_source"
     [void](New-Csv $dir6 "A_mono16_16000Hz(wav).csv" 10)
     [void](New-Csv $dir6 "A_mono16_16000Hz(wav)(photo).csv" 40)
     [void](New-Csv $dir6 "B_mono16_16000Hz(wav).csv" 30)
-    $got6 = Resolve-AsrCsvPath -Paths @{ TranscriptionDir = (New-CaseDir "vide_pour_dossier") } -Infos @{ fichier_transcription = $dir6 }
-    Assert-Eq (Get-Name $got6) "B_mono16_16000Hz(wav).csv" "6) fichier_transcription = dossier : .csv non (photo) le plus recent"
+    $threw6 = $false
+    $message6 = ""
+    try { $null = Resolve-AsrCsvPath -Paths @{ TranscriptionDir = (New-CaseDir "vide_pour_dossier") } -Infos @{ fichier_transcription = $dir6 } }
+    catch { $threw6 = $true; $message6 = $_.Exception.Message }
+    Assert-True $threw6 "6) fichier_transcription = dossier : erreur explicite (aucun fallback)"
+    Assert-True ($message6 -like "*introuvable*") "6b) le message qualifie la source explicite invalide"
 
-    # --------------------------- 7) garde-fou : pointeur sur part 1 alors qu un agrege existe
+    # --------------------------- 7) source explicite prioritaire sur un agrege present
     $dir7 = New-CaseDir "garde_fou_agrege"
-    [void](New-Csv $dir7 "J48 part 1_mono16_16000Hz(wav).csv" 10)
+    $p1_7 = New-Csv $dir7 "J48 part 1_mono16_16000Hz(wav).csv" 10
     [void](New-Csv $dir7 "J48 part 2_mono16_16000Hz(wav).csv" 12)
     [void](New-Csv $dir7 "J48_complet_mono16_16000Hz.csv" 5)
-    $script:CsvWarnings.Clear()
-    $infos7 = @{ fichier_transcription = "\\192.168.1.20\Affaires\2025-J48\AF_Expert_ASR\transcriptions\2025-11-20\J48 part 1_mono16_16000Hz(wav).csv" }
+    $infos7 = @{ fichier_transcription = $p1_7 }
     $got7 = Resolve-AsrCsvPath -Paths @{ TranscriptionDir = $dir7 } -Infos $infos7
-    Assert-Eq (Get-Name $got7) "J48_complet_mono16_16000Hz.csv" "7) pointeur sur une partie + agrege present : agrege prefere (pas de troncature)"
-    Assert-True ($script:CsvWarnings.Count -ge 1) "7b) un avertissement explicite est emis"
+    Assert-Eq (Get-Name $got7) "J48 part 1_mono16_16000Hz(wav).csv" "7) partie explicitement declaree : utilisee telle quelle, pas d agregat substitue"
+
+    # --------------------------- 10) declare (wav) valide + (photo) plus recent
+    $dir10 = New-CaseDir "declare_wav_photo"
+    $wav10 = New-Csv $dir10 "J58 Sceaux 12 03 2026_mono16_16000Hz(wav).csv" 10
+    [void](New-Csv $dir10 "J58 Sceaux 12 03 2026_mono16_16000Hz(wav)(photo).csv" 90)
+    $got10 = Resolve-AsrCsvPath -Paths @{ TranscriptionDir = $dir10 } -Infos @{ fichier_transcription = $wav10 }
+    Assert-Eq (Get-Name $got10) "J58 Sceaux 12 03 2026_mono16_16000Hz(wav).csv" "10) CSV declare avec (wav) : retenu tel quel"
+    Assert-True ($got10 -notlike "*(photo)*") "10b) le CSV (photo) simultane n est jamais retenu"
+
+    # --------------------------- 11) pcfixe.fichier_transcription prioritaire
+    $dir11 = New-CaseDir "priorite_pcfixe"
+    $top11 = New-Csv $dir11 "top_level_mono16_16000Hz(wav).csv" 10
+    $pc11 = New-Csv $dir11 "pcfixe_source_mono16_16000Hz(wav).csv" 20
+    $infos11 = @{ fichier_transcription = $top11; pcfixe = @{ fichier_transcription = $pc11 } }
+    $got11 = Resolve-AsrCsvPath -Paths @{ TranscriptionDir = $dir11 } -Infos $infos11
+    Assert-Eq (Get-Name $got11) "pcfixe_source_mono16_16000Hz(wav).csv" "11) pcfixe.fichier_transcription prioritaire sur fichier_transcription"
+
+    # --------------------------- 12) source explicite invalide : aucun fallback
+    $dir12 = New-CaseDir "explicite_invalide"
+    [void](New-Csv $dir12 "valide_mono16_16000Hz(wav).csv" 10)
+    $threw12 = $false
+    $message12 = ""
+    try { $null = Resolve-AsrCsvPath -Paths @{ TranscriptionDir = $dir12 } -Infos @{ fichier_transcription = (Join-Path $dir12 "absent.csv") } }
+    catch { $threw12 = $true; $message12 = $_.Exception.Message }
+    Assert-True $threw12 "12) source explicite introuvable : erreur (pas de substitution)"
+    Assert-True ($message12 -like "*aucun fallback*") "12b) le message interdit explicitement le fallback"
+
+    # --------------------------- 13) aucune source explicite : fallback scan
+    $dir13 = New-CaseDir "fallback_sans_declaration"
+    [void](New-Csv $dir13 "CAPT_mono16_16000Hz(wav).csv" 10)
+    [void](New-Csv $dir13 "CAPT_mono16_16000Hz(wav)(photo).csv" 20)
+    [void](New-Csv $dir13 "Sujets.csv" 30)
+    $got13 = Resolve-AsrCsvPath -Paths @{ TranscriptionDir = $dir13 } -Infos @{ fichier_transcription = "" }
+    Assert-Eq (Get-Name $got13) "CAPT_mono16_16000Hz(wav).csv" "13) sans source explicite : fallback scan retenu"
+
+    # --------------------------- 14) CSV auxiliaire seul : exclu du fallback
+    $dir14 = New-CaseDir "auxiliaire_seul"
+    [void](New-Csv $dir14 "Sujets.csv" 10)
+    [void](New-Csv $dir14 "photos.csv" 20)
+    $got14 = Resolve-AsrCsvPath -Paths @{ TranscriptionDir = $dir14 } -Infos @{ fichier_transcription = "" }
+    Assert-Eq $got14 "" "14) CSV auxiliaires exclus : aucun candidat ASR"
 
     # ------------------------------------------------- 8) basename portable Windows/Linux
     Assert-Eq (Get-CrLeafName "\\192.168.1.20\Affaires\a\b\c.csv") "c.csv" "8) Get-CrLeafName : UNC Windows"

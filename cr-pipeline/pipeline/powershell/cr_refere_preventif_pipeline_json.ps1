@@ -733,6 +733,46 @@ function Test-IsPhotoAsrCsvName {
   return ([string]$Name).ToLowerInvariant().Contains('(photo)')
 }
 
+function Test-IsAuxiliaryAsrCsvName {
+  # CSV de travail presents dans le dossier de transcription et jamais ASR.
+  param([string] $Name)
+  $leaf = Get-CrLeafName $Name
+  if (-not $leaf) { return $false }
+  $stem = [System.IO.Path]::GetFileNameWithoutExtension($leaf)
+  if (-not $stem) { return $false }
+  $aux = @('sujets', 'participants', 'photos', 'photos_batch', 'config_llm', 'prompt_gpt', 'prompt_gpt_batch_only', 'lancement_transcrip')
+  $stemNorm = $stem.Trim().ToLowerInvariant()
+  if ($aux -contains $stemNorm) { return $true }
+  if ($stemNorm -like '*_progress') { return $true }
+  return $false
+}
+
+function Get-AsrCsvHeaderFields {
+  param([string] $Path)
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
+  $reader = $null
+  try {
+    $reader = [System.IO.StreamReader]::new($Path, [System.Text.Encoding]::UTF8, $true)
+    $header = $reader.ReadLine()
+  } catch {
+    return @()
+  } finally {
+    if ($null -ne $reader) { $reader.Dispose() }
+  }
+  if ([string]::IsNullOrWhiteSpace($header)) { return @() }
+  $header = $header.TrimStart([char]0xFEFF)
+  return @($header.Split(';') | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() })
+}
+
+function Test-AsrCsvHeader {
+  param([string] $Path)
+  $fields = @(Get-AsrCsvHeaderFields -Path $Path)
+  foreach ($required in @('start', 'end', 'speaker', 'text')) {
+    if ($fields -notcontains $required) { return $false }
+  }
+  return $true
+}
+
 function Get-AsrCsvPartKey {
   <#
     Cle de partie d'un CSV ASR : nom sans le marqueur (wav) ni l'extension.
@@ -746,74 +786,233 @@ function Get-AsrCsvPartKey {
   return $k.Trim()
 }
 
-function Resolve-AsrCsvPath {
-  <#
-    Resolution du CSV ASR principal, portable Windows/Linux. Priorite :
-      1) basename de infos.fichier_transcription (fichier precis) ; si ce chemin
-         designe un dossier, prendre le .csv non (photo) le plus recent
-         (logique ls -1t + grep -v (photo) du generaliste) ;
-      2) CSV agrege/legacy explicitement complet (*_complet_*.csv) ;
-      3) CSV principal actuel ..._mono16_16000Hz(wav).csv (ou legacy sans (wav)) ;
-      4) plusieurs parties distinctes sans agregat -> erreur explicite, aucune
-         selection arbitraire.
-    Les (photo).csv sont exclus a chaque etape.
-  #>
-  param($Paths, $Infos)
+function Get-DeclaredAsrCsvSources {
+  param($Infos)
+  $sources = New-Object System.Collections.ArrayList
+  $pcfixeObj = Get-CrProp $Infos 'pcfixe'
+  $pcFt = [string](Get-CrProp $pcfixeObj 'fichier_transcription')
+  $rawFt = [string](Get-CrProp $Infos 'fichier_transcription')
+  if (-not [string]::IsNullOrWhiteSpace($pcFt)) {
+    [void]$sources.Add(@{ field='pcfixe.fichier_transcription'; raw=([string]$pcFt).Trim().Trim([char]34) })
+  }
+  if (-not [string]::IsNullOrWhiteSpace($rawFt)) {
+    [void]$sources.Add(@{ field='fichier_transcription'; raw=([string]$rawFt).Trim().Trim([char]34) })
+  }
+  return @($sources)
+}
 
-  $dir = [string]$Paths.TranscriptionDir
+function Resolve-DeclaredAsrCsvPath {
+  param($Infos)
+  $sources = @(Get-DeclaredAsrCsvSources -Infos $Infos)
+  if ($sources.Count -eq 0) { return @{ declared=$false; path='' } }
+  $diag = New-Object System.Collections.ArrayList
+  foreach ($src in $sources) {
+    $raw = [string]$src.raw
+    $converted = ConvertTo-ContainerAsrPath $raw
+    $paths = New-Object System.Collections.ArrayList
+    if ($converted) { [void]$paths.Add([string]$converted) }
+    if ($raw -and ([string]$raw -ne [string]$converted) -and (Test-Path -LiteralPath $raw -PathType Leaf)) {
+      [void]$paths.Add($raw)
+    }
+    $picked = ''
+    foreach ($candidate in @($paths)) {
+      if (Test-Path -LiteralPath $candidate -PathType Leaf) { $picked = [string]$candidate; break }
+    }
+    if (-not $picked) {
+      [void]$diag.Add(($src.field + '=' + $raw + ' -> introuvable ou non-fichier'))
+      continue
+    }
+    $leaf = Get-CrLeafName $picked
+    if (Test-IsPhotoAsrCsvName $leaf) {
+      [void]$diag.Add(($src.field + '=' + $picked + ' -> CSV (photo) interdit'))
+      continue
+    }
+    if (Test-IsAuxiliaryAsrCsvName $leaf) {
+      [void]$diag.Add(($src.field + '=' + $picked + ' -> CSV auxiliaire interdit'))
+      continue
+    }
+    if (-not (Test-AsrCsvHeader -Path $picked)) {
+      [void]$diag.Add(($src.field + '=' + $picked + ' -> en-tetes ASR invalides'))
+      continue
+    }
+    return @{ declared=$true; path=$picked }
+  }
+  throw ('[Resolve-AsrCsvPath] source(s) explicite(s) invalide(s), aucun fallback par scan : ' + (@($diag) -join ' | '))
+}
 
+function Resolve-AsrCsvFallback {
+  param([string] $Dir)
   $allCsv = @()
-  if ($dir -and (Test-Path -LiteralPath $dir -PathType Container)) {
-    $allCsv = @(Get-ChildItem -LiteralPath $dir -Filter '*.csv' -File -ErrorAction SilentlyContinue)
+  if ($Dir -and (Test-Path -LiteralPath $Dir -PathType Container)) {
+    $allCsv = @(Get-ChildItem -LiteralPath $Dir -Filter '*.csv' -File -ErrorAction SilentlyContinue)
   }
-  $nonPhoto = @($allCsv | Where-Object { $_ -and (-not (Test-IsPhotoAsrCsvName $_.Name)) })
-  $sortSpec = @{ Expression = 'LastWriteTime'; Descending = $true }, @{ Expression = 'Name'; Descending = $false }
-  $aggregated = @($nonPhoto | Where-Object { $_.Name -like '*_complet_*' } | Sort-Object -Property $sortSpec)
-  $mainParts = @($nonPhoto | Where-Object { $_.Name -like '*_mono16_16000Hz*' -and $_.Name -notlike '*_complet_*' } | Sort-Object -Property $sortSpec)
-
-  $ft = ''
-  if ($Infos -and $Infos.fichier_transcription) { $ft = [string]$Infos.fichier_transcription }
-  $ft = ([string]$ft).Trim().Trim('"')
-
-  # --- 1) fichier_transcription : fichier precis, puis dossier ---
-  if ($ft) {
-    $leaf = Get-CrLeafName $ft
-    if ($leaf -and -not (Test-IsPhotoAsrCsvName $leaf)) {
-      $cand = Join-Path $dir $leaf
-      if ($dir -and (Test-Path -LiteralPath $cand -PathType Leaf)) {
-        # Garde-fou : un part N explicite ne doit pas tronquer une captation
-        # dont un CSV agrege existe.
-        if (($leaf -notlike '*_complet_*') -and ($mainParts.Count -gt 1) -and ($aggregated.Count -ge 1)) {
-          Write-CrWarn ("[Resolve-AsrCsvPath] fichier_transcription pointe une partie (" + $leaf + ") alors qu un CSV agrege existe ; agregat prefere : " + $aggregated[0].FullName)
-          return $aggregated[0].FullName
-        }
-        return $cand
-      }
-    }
-    $ftDir = ConvertTo-ContainerAsrPath $ft
-    if ($ftDir -and (Test-Path -LiteralPath $ftDir -PathType Container)) {
-      $dirCsv = @(Get-ChildItem -LiteralPath $ftDir -Filter '*.csv' -File -ErrorAction SilentlyContinue |
-                  Where-Object { $_ -and (-not (Test-IsPhotoAsrCsvName $_.Name)) } |
-                  Sort-Object -Property $sortSpec)
-      if ($dirCsv.Count -gt 0) { return $dirCsv[0].FullName }
-      throw "[Resolve-AsrCsvPath] dossier fichier_transcription sans .csv exploitable (hors (photo)) : $ftDir"
-    }
+  $scan = New-Object System.Collections.ArrayList
+  foreach ($f in @($allCsv)) {
+    if (-not $f) { continue }
+    if (Test-IsPhotoAsrCsvName $f.Name) { continue }
+    if (Test-IsAuxiliaryAsrCsvName $f.Name) { continue }
+    if (-not (Test-AsrCsvHeader -Path $f.FullName)) { continue }
+    [void]$scan.Add($f)
   }
-
-  # --- 2) CSV agrege/legacy explicitement complet ---
-  if ($aggregated.Count -ge 1) { return $aggregated[0].FullName }
-
-  # --- 3) CSV principal actuel (ou legacy sans (wav)) ---
+  if ($scan.Count -eq 0) { return '' }
+  if ($scan.Count -eq 1) { return [string]$scan[0].FullName }
+  $aggregated = @($scan | Where-Object { $_.Name -like '*_complet_*' } | Sort-Object Name)
+  if ($aggregated.Count -eq 1) { return [string]$aggregated[0].FullName }
+  if ($aggregated.Count -gt 1) {
+    $names = (@($aggregated | ForEach-Object { $_.Name }) -join ' | ')
+    throw ('[Resolve-AsrCsvPath] plusieurs CSV agreges sans source explicite : ' + $names + ' - aucune selection arbitraire.')
+  }
+  $mainParts = @($scan | Where-Object { $_.Name -like '*_mono16_16000Hz*' } | Sort-Object Name)
   $partKeys = @($mainParts | ForEach-Object { Get-AsrCsvPartKey $_.Name } | Sort-Object -Unique)
-  if ($partKeys.Count -eq 1) { return $mainParts[0].FullName }
-
-  # --- 4) plusieurs parties distinctes sans agregat : blocage explicite ---
+  if (($mainParts.Count -eq 1) -and ($partKeys.Count -eq 1)) { return [string]$mainParts[0].FullName }
   if ($partKeys.Count -gt 1) {
     $names = (@($mainParts | ForEach-Object { $_.Name }) -join ' | ')
-    throw ("[Resolve-AsrCsvPath] captation multi-parties sans CSV agrege : " + $mainParts.Count + " candidats ASR non (photo) dans " + $dir + " -> " + $names + " . Fournir un CSV agrege (*_complet_*.csv) ou pointer infos_projet.fichier_transcription sur le fichier a utiliser ; aucune selection arbitraire.")
+    throw ('[Resolve-AsrCsvPath] captation multi-parties sans CSV agrege : ' + $mainParts.Count + ' candidats ASR non (photo) dans ' + $Dir + ' -> ' + $names + ' . Fournir un CSV agrege (*_complet_*.csv) ou pointer infos_projet.fichier_transcription sur le fichier a utiliser ; aucune selection arbitraire.')
   }
+  $names = (@($scan | ForEach-Object { $_.Name }) -join ' | ')
+  throw ('[Resolve-AsrCsvPath] plusieurs CSV ASR valides sans source explicite : ' + $names + ' - aucune selection arbitraire.')
+}
 
-  return ''
+function Resolve-AsrCsvPath {
+  <#
+    Resolution du CSV ASR principal, portable Windows/Linux.
+    Contrat strict :
+      1) source(s) explicitement declaree(s) dans infos_projet.json :
+         pcfixe.fichier_transcription puis fichier_transcription ;
+         conversion vers le chemin conteneur, existence + en-tetes ASR valides.
+         Une source explicite invalide est une erreur : AUCUN fallback.
+      2) fallback par scan UNIQUEMENT si aucune source explicite n'est declaree.
+    Les CSV (photo) et auxiliaires (Sujets.csv, photos.csv, ...) sont exclus.
+  #>
+  param($Paths, $Infos)
+  $declared = Resolve-DeclaredAsrCsvPath -Infos $Infos
+  if ([bool]$declared.declared) { return [string]$declared.path }
+  return (Resolve-AsrCsvFallback -Dir ([string]$Paths.TranscriptionDir))
+}
+
+function Get-Pass2ECompactParts {
+  <#
+    Decouvre les compacts Pass2E d'un sujet, y compris les parties :
+      sujet_001_compact.json
+      sujet_001_part01_compact.json
+      sujet_001_part02_compact.json
+    Retour trie par numero de sujet puis numero de partie croissant.
+  #>
+  param([string] $Dir, [int] $Subject = 0)
+  if (-not $Dir -or -not (Test-Path -LiteralPath $Dir -PathType Container)) { return @() }
+  $found = New-Object System.Collections.ArrayList
+  $files = @(Get-ChildItem -LiteralPath $Dir -Filter 'sujet_*_compact.json' -File -ErrorAction SilentlyContinue)
+  foreach ($f in @($files)) {
+    if ($f.Name -notmatch '^sujet_(\d+)(?:_part(\d+))?_compact\.json$') { continue }
+    $numero = [int]$Matches[1]
+    $part = 1
+    if ($Matches[2]) { $part = [int]$Matches[2] }
+    if ($Subject -gt 0 -and $numero -ne $Subject) { continue }
+    $compact = $null
+    try { $compact = (([IO.File]::ReadAllText($f.FullName)) | ConvertFrom-Json) } catch { $compact = $null }
+    $objNumero = $numero
+    if ($null -ne $compact) {
+      $vn = Get-P3V $compact 'numero'
+      if ($null -ne $vn) { try { $objNumero = [int]$vn } catch { $objNumero = $numero } }
+    }
+    [void]$found.Add([pscustomobject]@{ numero=$objNumero; part=$part; name=$f.Name; path=$f.FullName; compact=$compact })
+  }
+  return @($found | Sort-Object -Property numero, part, name)
+}
+
+function Merge-Pass2ECompactParts {
+  <#
+    Fusionne toutes les parties Pass2E d'un meme sujet sans en perdre aucune.
+    Une seule partie est retournee telle quelle. Pour plusieurs parties, les
+    resumes et listes sont concatenes dans l'ordre numerique, les stats sont
+    additionnees et le detail de chaque partie est conserve sous .parts.
+  #>
+  param($Parts)
+  $list = @($Parts | Where-Object { $null -ne $_ -and $null -ne $_.compact })
+  if ($list.Count -eq 0) { return $null }
+  if ($list.Count -eq 1) { return $list[0].compact }
+  $numero = [int]$list[0].numero
+  $titre = ''
+  $localisation = ''
+  $description = ''
+  $resumes = New-Object System.Collections.ArrayList
+  $fields = @('points_cles', 'actions', 'desaccords', 'documents_demandes', 'elements_techniques')
+  $fieldValues = @{}
+  foreach ($field in $fields) { $fieldValues[$field] = New-Object System.Collections.ArrayList }
+  $chunkCount = 0
+  $interventionsCount = 0
+  $partMeta = New-Object System.Collections.ArrayList
+  foreach ($it in @($list)) {
+    $compact = $it.compact
+    if (-not $titre) { $titre = [string](Get-P3V $compact 'titre') }
+    if (-not $localisation) { $localisation = [string](Get-P3V $compact 'localisation') }
+    if (-not $description) { $description = [string](Get-P3V $compact 'description') }
+    $synth = Get-P3V $compact 'synthese_intermediaire'
+    $resume = [string](Get-P3V $synth 'resume_factuel')
+    if ((-not [string]::IsNullOrWhiteSpace($resume)) -and (Test-P3SynthesisHasMatter $resume)) {
+      [void]$resumes.Add('[partie ' + ('{0:D2}' -f [int]$it.part) + '] ' + $resume.Trim())
+    }
+    foreach ($field in $fields) {
+      $v = Get-P3V $synth $field
+      if ($null -eq $v) { continue }
+      foreach ($item in @($v)) {
+        if ($null -eq $item) { continue }
+        if ([string]::IsNullOrWhiteSpace([string]$item)) { continue }
+        [void]$fieldValues[$field].Add($item)
+      }
+    }
+    $stats = Get-P3V $compact 'stats'
+    $chunkCount += [int](Get-P3V $stats 'chunk_count')
+    $interventionsCount += [int](Get-P3V $stats 'interventions_count')
+    [void]$partMeta.Add([pscustomobject]@{
+      part = [int]$it.part
+      source_name = [string](Get-P3V $compact 'source_name')
+      path = [string]$it.path
+      stats = $stats
+      synthese_intermediaire = $synth
+    })
+  }
+  $synthMerged = [ordered]@{}
+  $synthMerged['resume_factuel'] = (@($resumes) -join "`n`n")
+  foreach ($field in $fields) { $synthMerged[$field] = @($fieldValues[$field]) }
+  $sourceBase = Get-P3V $list[0].compact 'source'
+  $out = [ordered]@{
+    source_name = ('sujet_' + ('{0:D3}' -f $numero))
+    numero = $numero
+    titre = $titre
+    localisation = $localisation
+    description = $description
+    synthese_intermediaire = $synthMerged
+    stats = [ordered]@{ chunk_count = $chunkCount; interventions_count = $interventionsCount }
+    source = [ordered]@{
+      global_json = [string](Get-P3V $sourceBase 'global_json')
+      merged_parts = @($partMeta | ForEach-Object { $_.part })
+    }
+    parts = @($partMeta)
+  }
+  return [pscustomobject]$out
+}
+
+function Get-Pass2EMergedCompacts {
+  param([string] $Dir)
+  $allParts = @(Get-Pass2ECompactParts -Dir $Dir)
+  if ($allParts.Count -eq 0) { return @() }
+  $byNumero = @{}
+  foreach ($p in @($allParts)) {
+    $n = [int]$p.numero
+    if (-not $byNumero.ContainsKey($n)) { $byNumero[$n] = New-Object System.Collections.ArrayList }
+    [void]$byNumero[$n].Add($p)
+  }
+  $out = New-Object System.Collections.ArrayList
+  foreach ($n in @($byNumero.Keys | Sort-Object)) {
+    $parts = @($byNumero[$n])
+    [void]$out.Add([pscustomobject]@{
+      numero = [int]$n
+      parts = @($parts)
+      compact = (Merge-Pass2ECompactParts -Parts @($parts))
+    })
+  }
+  return @($out)
 }
 
 function Read-CaptureSources {
@@ -5453,7 +5652,7 @@ function Get-P3V {
   param($Obj, [string]$Name)
   if ($null -eq $Obj) { return $null }
   if ($Obj -is [System.Collections.IDictionary]) {
-    if ($Obj.ContainsKey($Name)) { return $Obj[$Name] }
+    if ($Obj.Contains($Name)) { return $Obj[$Name] }
     return $null
   }
   $p = $Obj.PSObject.Properties[$Name]
@@ -5689,17 +5888,9 @@ function Invoke-Pass3Refere {
   # --- Phase 3 : Pass3E ------------------------------------------------------
   $eRows = New-Object System.Collections.ArrayList
   # LOT 3R-1E : chargement du contexte general (champs system/user) pour Pass3E_refere.
-  $eCtxUserText = ''
-  $eCtxSystemText = ''
-  if ($ContextJsonPath -and (Test-Path -LiteralPath $ContextJsonPath -PathType Leaf)) {
-    try {
-      $eCtxObj = (Read-P3RawText $ContextJsonPath) | ConvertFrom-Json
-      $eCtxV1 = Get-P3V $eCtxObj 'system'
-      if ($null -ne $eCtxV1) { $eCtxSystemText = [string]$eCtxV1 }
-      $eCtxV2 = Get-P3V $eCtxObj 'user'
-      if ($null -ne $eCtxV2) { $eCtxUserText = [string]$eCtxV2 }
-    } catch { $eCtxUserText = '' }
-  }
+  $eCtx = Read-RefereContextTexts -Path $ContextJsonPath
+  $eCtxUserText = [string]$eCtx.user
+  $eCtxSystemText = [string]$eCtx.system
   $eSys = Get-P3Text 'E'
   if (-not $eSys) { throw '[cr_refere_preventif] LOT 3R-1B : systeme Pass3E absent des constantes.' }
 
@@ -5707,16 +5898,27 @@ function Invoke-Pass3Refere {
   if (-not $Exec) {
     $compactFiles = @()
     if ($Pass2EDir -and (Test-Path -LiteralPath $Pass2EDir -PathType Container)) {
-      $compactFiles = @(Get-ChildItem -LiteralPath $Pass2EDir -Filter 'sujet_*_compact.json' -File -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { $_.FullName })
+      foreach ($mcE in @(Get-Pass2EMergedCompacts -Dir $Pass2EDir)) {
+        $p0 = ''
+        if (@($mcE.parts).Count -gt 0) { $p0 = [string]$mcE.parts[0].path }
+        $compactFiles = @($compactFiles) + @([pscustomobject]@{ path=$p0; compact=$mcE.compact })
+      }
     }
     if ($ESujetCompactPath -and (Test-Path -LiteralPath $ESujetCompactPath -PathType Leaf)) {
       $already = $false
-      foreach ($f0 in @($compactFiles)) { if ($f0 -ieq $ESujetCompactPath) { $already = $true } }
-      if (-not $already) { $compactFiles = @($compactFiles) + @($ESujetCompactPath) }
+      foreach ($f0 in @($compactFiles)) { if ([string]$f0.path -ieq $ESujetCompactPath) { $already = $true } }
+      if (-not $already) {
+        $explicitObj = $null
+        try { $explicitObj = (Read-P3RawText $ESujetCompactPath) | ConvertFrom-Json } catch { $explicitObj = $null }
+        $compactFiles = @($compactFiles) + @([pscustomobject]@{ path=$ESujetCompactPath; compact=$explicitObj })
+      }
     }
-    foreach ($cf in @($compactFiles)) {
-      $compact = $null
-      try { $compact = (Read-P3RawText $cf) | ConvertFrom-Json } catch { $compact = $null }
+    foreach ($cfItem in @($compactFiles)) {
+      $cf = [string]$cfItem.path
+      $compact = $cfItem.compact
+      if (($null -eq $compact) -and $cf -and (Test-Path -LiteralPath $cf -PathType Leaf)) {
+        try { $compact = (Read-P3RawText $cf) | ConvertFrom-Json } catch { $compact = $null }
+      }
       if ($null -eq $compact) { continue }
       $num = 0
       $vN = Get-P3V $compact 'numero'
@@ -6086,14 +6288,82 @@ if ($TestPass2FRetryOffline) {
   try { Remove-Item -LiteralPath $tOut -Recurse -Force -ErrorAction SilentlyContinue } catch { }
   exit 0
 }
+function Test-P3SynthesisHasMatter {
+  param($Value)
+  if ($null -eq $Value) { return $false }
+  if ($Value -is [string]) {
+    $s = ([string]$Value).Trim()
+    if (-not $s) { return $false }
+    $norm = $s.Normalize([System.Text.NormalizationForm]::FormD)
+    $norm = [regex]::Replace($norm, '\p{Mn}', '')
+    $norm = $norm.ToLowerInvariant()
+    if ($norm -match '^\s*aucun(?:e)?\s+element\b') { return $false }
+    return $true
+  }
+  if ($Value -is [System.Collections.IDictionary]) {
+    foreach ($k in @($Value.Keys)) {
+      if ([string]$k -ieq 'stats') { continue }
+      if (Test-P3SynthesisHasMatter $Value[$k]) { return $true }
+    }
+    return $false
+  }
+  if (($Value -is [System.Collections.IEnumerable]) -and -not ($Value -is [string])) {
+    foreach ($item in @($Value)) {
+      if (Test-P3SynthesisHasMatter $item) { return $true }
+    }
+    return $false
+  }
+  $props = @($Value.PSObject.Properties)
+  if ($props.Count -gt 0) {
+    foreach ($p in $props) {
+      if ([string]$p.Name -ieq 'stats') { continue }
+      if (Test-P3SynthesisHasMatter $p.Value) { return $true }
+    }
+  }
+  return $false
+}
 function Has-P3Synthese {
   param($CompactObj)
+  if ($null -eq $CompactObj) { return $false }
+  $stats = Get-P3V $CompactObj 'stats'
+  if ($null -ne $stats) {
+    $chunkCount = [int](Get-P3V $stats 'chunk_count')
+    $interventionsCount = [int](Get-P3V $stats 'interventions_count')
+    if (($chunkCount -eq 0) -and ($interventionsCount -eq 0)) { return $false }
+  }
   $v = Get-P3V $CompactObj 'synthese_intermediaire'
   if ($null -eq $v) { return $false }
-  if ($v -is [System.Collections.IDictionary] -and $v.Count -eq 0) { return $false }
-  if ($v -is [string] -and [string]::IsNullOrWhiteSpace([string]$v)) { return $false }
-  if ($v -is [System.Array] -and @($v).Count -eq 0) { return $false }
-  return $true
+  return (Test-P3SynthesisHasMatter $v)
+}
+
+function Read-RefereContextTexts {
+  <#
+    Lit le contexte refere explicitement fourni par l'appelant.
+    - chemin vide : contexte non fourni (aucune decouverte automatique) ;
+    - chemin fourni mais absent/vide/JSON invalide : erreur explicite ;
+    - aucun fallback vers contexte_general_photos.json.
+  #>
+  param([string] $Path)
+  $result = @{ provided = $false; path = ''; system = ''; user = '' }
+  if ([string]::IsNullOrWhiteSpace($Path)) { return $result }
+  $result.provided = $true
+  $result.path = $Path
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    throw ('[Read-RefereContextTexts] contexte refere explicite introuvable : ' + $Path)
+  }
+  $raw = Read-P3RawText $Path
+  if ([string]::IsNullOrWhiteSpace($raw)) {
+    throw ('[Read-RefereContextTexts] contexte refere explicite vide : ' + $Path)
+  }
+  $obj = $null
+  try { $obj = $raw | ConvertFrom-Json } catch {
+    throw ('[Read-RefereContextTexts] contexte refere explicite JSON invalide : ' + $Path)
+  }
+  $vSys = Get-P3V $obj 'system'
+  if ($null -ne $vSys) { $result.system = [string]$vSys }
+  $vUsr = Get-P3V $obj 'user'
+  if ($null -ne $vUsr) { $result.user = [string]$vUsr }
+  return $result
 }
 
 

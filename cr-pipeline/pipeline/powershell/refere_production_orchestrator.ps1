@@ -295,17 +295,9 @@ function Invoke-RefereProductionPipeline {
     $phase = 'pass3e'
     $badBudgetCount = 0
     $eRunnableCount = 0
-    $eCtxUserText = ''
-    $eCtxSystemText = ''
-    if ($ContextJsonPath -and (Test-Path -LiteralPath $ContextJsonPath -PathType Leaf)) {
-      try {
-        $eCtxObjE = (Read-P3RawText $ContextJsonPath) | ConvertFrom-Json
-        $eCtxV1 = Get-P3V $eCtxObjE 'system'
-        if ($null -ne $eCtxV1) { $eCtxSystemText = [string]$eCtxV1 }
-        $eCtxV2 = Get-P3V $eCtxObjE 'user'
-        if ($null -ne $eCtxV2) { $eCtxUserText = [string]$eCtxV2 }
-      } catch { $eCtxUserText = '' }
-    }
+    $eCtx = Read-RefereContextTexts -Path $ContextJsonPath
+    $eCtxUserText = [string]$eCtx.user
+    $eCtxSystemText = [string]$eCtx.system
     $eSysE = Get-P3Text 'E'
     if (-not $eSysE) { throw '[cr_refere_preventif] REFERE-E2E-2 : systeme Pass3E absent des constantes.' }
     $p2eDirE = [string]$Pass2ECompactsDir
@@ -334,33 +326,31 @@ function Invoke-RefereProductionPipeline {
     foreach ($snCan in @($Ctx.sujets_by_numero.Keys)) {
       $snCanI = [int]$snCan
       $canObjE = $Ctx.sujets_by_numero[$snCan]
-      $subjectUniverseE[$snCanI] = @{ numero=$snCanI; titre=[string](Get-P3V $canObjE 'titre'); localisation=[string](Get-P3V $canObjE 'localisation'); description=[string](Get-P3V $canObjE 'description'); compact_path='' }
+      $subjectUniverseE[$snCanI] = @{ numero=$snCanI; titre=[string](Get-P3V $canObjE 'titre'); localisation=[string](Get-P3V $canObjE 'localisation'); description=[string](Get-P3V $canObjE 'description'); compact_path=''; compact_obj=$null; compact_parts=@() }
     }
     foreach ($snPl in @($plannedChunkBySubject.Keys)) {
       $snPlI = [int]$snPl
       if (-not $subjectUniverseE.ContainsKey($snPlI)) {
-        $subjectUniverseE[$snPlI] = @{ numero=$snPlI; titre=''; localisation=''; description=''; compact_path='' }
+        $subjectUniverseE[$snPlI] = @{ numero=$snPlI; titre=''; localisation=''; description=''; compact_path=''; compact_obj=$null; compact_parts=@() }
       }
     }
-    $compactFilesE = @()
+    $mergedCompactsE = @()
     if ($p2eDirOkE) {
-      $compactFilesE = @(Get-ChildItem -LiteralPath $p2eDirE -Filter 'sujet_*_compact.json' -File -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { $_.FullName })
+      $mergedCompactsE = @(Get-Pass2EMergedCompacts -Dir $p2eDirE)
     }
-    foreach ($cfE in @($compactFilesE)) {
-      $numCfE = 0
-      if ($cfE -match 'sujet_(\d+)_compact\.json$') { $numCfE = [int]$Matches[1] }
-      $cfObjE = $null
-      try { $cfObjE = (Read-P3RawText $cfE) | ConvertFrom-Json } catch { $cfObjE = $null }
-      if ($null -ne $cfObjE) {
-        $vCfN = Get-P3V $cfObjE 'numero'
-        if ($null -ne $vCfN) { $numCfE = [int]$vCfN }
-      }
-      if ($numCfE -le 0) { continue }
+    foreach ($mcE in @($mergedCompactsE)) {
+      $numCfE = [int]$mcE.numero
+      $cfObjE = $mcE.compact
+      if (($numCfE -le 0) -or ($null -eq $cfObjE)) { continue }
+      $cfPathE = ''
+      if (@($mcE.parts).Count -gt 0) { $cfPathE = [string]$mcE.parts[0].path }
       if (-not $subjectUniverseE.ContainsKey($numCfE)) {
-        $subjectUniverseE[$numCfE] = @{ numero=$numCfE; titre=''; localisation=''; description=''; compact_path=$cfE }
+        $subjectUniverseE[$numCfE] = @{ numero=$numCfE; titre=''; localisation=''; description=''; compact_path=$cfPathE; compact_obj=$cfObjE; compact_parts=@($mcE.parts) }
       } else {
         $entryCfE = $subjectUniverseE[$numCfE]
-        $entryCfE.compact_path = $cfE
+        $entryCfE.compact_path = $cfPathE
+        $entryCfE.compact_obj = $cfObjE
+        $entryCfE.compact_parts = @($mcE.parts)
         $vCfT = Get-P3V $cfObjE 'titre'
         if (-not [string]$entryCfE.titre -and $null -ne $vCfT) { $entryCfE.titre = [string]$vCfT }
         $vCfL = Get-P3V $cfObjE 'localisation'
@@ -376,7 +366,9 @@ function Invoke-RefereProductionPipeline {
       $subjEntryE = $subjectUniverseE[$numE]
       $compactPathE = [string]$subjEntryE.compact_path
       $compactE = $null
-      if ($compactPathE -and (Test-Path -LiteralPath $compactPathE -PathType Leaf)) {
+      if ($null -ne $subjEntryE.compact_obj) {
+        $compactE = $subjEntryE.compact_obj
+      } elseif ($compactPathE -and (Test-Path -LiteralPath $compactPathE -PathType Leaf)) {
         try { $compactE = (Read-P3RawText $compactPathE) | ConvertFrom-Json } catch { $compactE = $null }
       }
       $titreE = [string]$subjEntryE.titre
