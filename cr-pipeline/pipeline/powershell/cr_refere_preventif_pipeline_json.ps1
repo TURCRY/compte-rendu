@@ -1959,6 +1959,7 @@ function Build-Pass2B2FRank1Material {
     segments_units         = @($segUnits)
     photo_units            = @($photoInUnits)
   }
+  $material['validation'] = Test-Pass2B2FRank1MaterialIntegrity -Material $material -Ctx $Ctx
   return $material
 }
 
@@ -2172,6 +2173,7 @@ function Write-Pass2B2FArtifacts {
     subjects_with_photos = @($Material.subjects_with_photos)
     total_input_units = [int]$Material.total_input_units
     units = @($Material.units)
+    validation = $Material.validation
   }
   Write-CrJsonAtomic -Path $materialFile -Obj $materialDoc
   Add-CrOutputFile $materialFile
@@ -2252,6 +2254,7 @@ function Write-Pass2B2FArtifacts {
     per_batch = @($perBatch)
     oversized_units = @($Pack.oversized)
     checks = $Checks
+    validation = $Material.validation
     output_path = $materialFile
     merge_strategy = 'merge deterministe Merge-MeetingBatchObjects (schema global reunion) etendu aux champs specialises ; consolide les sorties des batches Pass2B_2F vers refere_global_meeting.json. Execute futur (hors LOT 2B2F-1).'
   }
@@ -3236,6 +3239,7 @@ function Invoke-Pass2B2FDryRun {
     photo_units_equal_expected = ([int]$material.photo_units_count -eq [int]$ExpectedAffected)
     excluded_skipped_equal_expected = ([int]$material.excluded_skipped -eq [int]$ExpectedExcluded)
     no_duplicate_photo = (@($material.duplicate_photo_ids).Count -eq 0)
+    rank1_integrity_ok = [bool]$material.validation.ok
     general_segments_present = ([int]$material.general_segments_count -gt 0)
     totals_coherent = ([int]$material.total_input_units -eq ([int]$material.general_segments_count + [int]$material.photo_units_count))
     expected_affected = [int]$ExpectedAffected
@@ -3277,6 +3281,7 @@ function Invoke-Pass2B2FDryRun {
       manifest = $manifestFile
       alias = $ModelAlias
       budget = $histBudget
+      validation = $material.validation
     }
     material = $material
     pack = $pack
@@ -3766,6 +3771,387 @@ function Resolve-Pass2FModelRoute {
 # Consigne technique ajoutee UNIQUEMENT au 2e appel (retry). Aucune demande de
 # "reparer une position precise" ; le modele reproduit sa reponse en JSON strict.
 $script:Pass2FRetryInstruction = "LA REPONSE PRECEDENTE N'ETAIT PAS UN JSON SYNTACTIQUEMENT VALIDE. REPRODUIS LA REPONSE POUR LES MEMES DONNEES, EXCLUSIVEMENT EN JSON STRICT CONFORME AU SCHEMA DEMANDE. AUCUN MARKDOWN NI TEXTE HORS JSON."
+function Add-Pass2FValidationIssue {
+  param(
+    [System.Collections.ArrayList] $Issues,
+    [string] $Code,
+    [string] $Message,
+    [hashtable] $Details = @{}
+  )
+  [void]$Issues.Add([ordered]@{ code=$Code; message=$Message; details=$Details })
+}
+
+function Get-Pass2FArrayValue {
+  param($Value)
+  if ($null -eq $Value) { return @() }
+  return @($Value)
+}
+
+function New-PhotoRefIndex {
+  param(
+    [object[]] $Photos,
+    [hashtable] $Assignments = @{}
+  )
+  $idx = @{}
+  if ($null -eq $Assignments) { $Assignments = @{} }
+  $assignByBase = @{}
+  foreach ($k in @($Assignments.Keys)) {
+    $assignByBase[(New-PhotoKey ([string]$k))] = $Assignments[$k]
+  }
+  foreach ($ph in @($Photos)) {
+    if ($null -eq $ph) { continue }
+    $rel = Get-CrPropString -Obj $ph -Name 'photo_rel_native'
+    $disp = Get-CrPropString -Obj $ph -Name 'photo'
+    if (-not $rel) { $rel = $disp }
+    if (-not $rel) { continue }
+    $asg = $null
+    if ($Assignments.ContainsKey($rel)) { $asg = $Assignments[$rel] }
+    else {
+      $bk = New-PhotoKey $rel
+      if ($assignByBase.ContainsKey($bk)) { $asg = $assignByBase[$bk] }
+    }
+    $entry = @{
+      photo_rel_native = $rel
+      photo_display    = $disp
+      assignment       = $asg
+    }
+    foreach ($alias in @($rel, $disp, (New-PhotoKey $rel), (New-PhotoKey $disp))) {
+      if ([string]::IsNullOrWhiteSpace([string]$alias)) { continue }
+      if (-not $idx.ContainsKey([string]$alias)) { $idx[[string]$alias] = $entry }
+    }
+  }
+  return $idx
+}
+
+function Resolve-PhotoRefIndex {
+  param([hashtable] $Index, [string] $Ref)
+  if ([string]::IsNullOrWhiteSpace($Ref)) { return $null }
+  $r = $Ref.Trim()
+  if ($Index.ContainsKey($r)) { return $Index[$r] }
+  $k = New-PhotoKey $r
+  if ($Index.ContainsKey($k)) { return $Index[$k] }
+  return $null
+}
+
+function Add-Pass2FPhotoRefIssue {
+  param(
+    [System.Collections.ArrayList] $Issues,
+    [string] $Ref,
+    [string] $Path,
+    [hashtable] $PhotoIndex,
+    [hashtable] $ChunkPhotoIndex,
+    [int] $ExpectedSubject
+  )
+  if ([string]::IsNullOrWhiteSpace($Ref)) {
+    Add-Pass2FValidationIssue -Issues $Issues -Code 'photo_ref_vide' -Message 'Reference photo vide.' -Details @{ path=$Path }
+    return $null
+  }
+  $resolved = Resolve-PhotoRefIndex -Index $PhotoIndex -Ref $Ref
+  if ($null -eq $resolved) {
+    Add-Pass2FValidationIssue -Issues $Issues -Code 'photo_inconnue' -Message 'Reference photo absente du referentiel de la captation.' -Details @{ path=$Path; photo=$Ref }
+    return $null
+  }
+  $canon = [string]$resolved.photo_rel_native
+  $asg = $resolved.assignment
+  if ($null -eq $asg) {
+    Add-Pass2FValidationIssue -Issues $Issues -Code 'photo_sans_affectation' -Message 'Photo sans affectation humaine.' -Details @{ path=$Path; photo=$canon }
+  } elseif ([string]$asg.status -eq 'exclue') {
+    Add-Pass2FValidationIssue -Issues $Issues -Code 'photo_exclue' -Message 'Photo explicitement exclue citee dans une sortie.' -Details @{ path=$Path; photo=$canon }
+  } elseif ([string]$asg.status -ne 'affectee') {
+    Add-Pass2FValidationIssue -Issues $Issues -Code 'photo_non_affectee' -Message 'Photo non affectee citee dans une sortie.' -Details @{ path=$Path; photo=$canon; status=[string]$asg.status }
+  } elseif ([int]$asg.subject_numero -le 0) {
+    Add-Pass2FValidationIssue -Issues $Issues -Code 'photo_sujet_invalide' -Message 'Affectation humaine sans numero de sujet valide.' -Details @{ path=$Path; photo=$canon }
+  } elseif ([int]$asg.subject_numero -ne $ExpectedSubject) {
+    Add-Pass2FValidationIssue -Issues $Issues -Code 'photo_mauvais_sujet_humain' -Message 'Photo affectee a un autre sujet humain que le sujet du chunk.' -Details @{ path=$Path; photo=$canon; sujet_photo=[int]$asg.subject_numero; sujet_attendu=$ExpectedSubject }
+  }
+  if (-not $ChunkPhotoIndex.ContainsKey($canon) -and -not $ChunkPhotoIndex.ContainsKey((New-PhotoKey $canon))) {
+    Add-Pass2FValidationIssue -Issues $Issues -Code 'photo_hors_lot' -Message 'Photo citee hors du chunk Pass2F courant.' -Details @{ path=$Path; photo=$canon }
+  }
+  return $canon
+}
+
+function Add-Pass2FAsrRefIssue {
+  param(
+    [System.Collections.ArrayList] $Issues,
+    [int] $RowNumber,
+    [string] $Path,
+    [hashtable] $GlobalAsr,
+    [hashtable] $ChunkAsr
+  )
+  if ($RowNumber -le 0) { return }
+  if (-not $GlobalAsr.ContainsKey($RowNumber)) {
+    Add-Pass2FValidationIssue -Issues $Issues -Code 'asr_row_inconnue' -Message 'Reference ASR absente de la captation.' -Details @{ path=$Path; row=$RowNumber }
+  } elseif (-not $ChunkAsr.ContainsKey($RowNumber)) {
+    Add-Pass2FValidationIssue -Issues $Issues -Code 'asr_row_hors_contexte' -Message 'Reference ASR existante mais absente du contexte du chunk.' -Details @{ path=$Path; row=$RowNumber }
+  }
+}
+
+function ConvertTo-AsrRowNumber {
+  param($Value)
+  if ($null -eq $Value) { return $null }
+  $s = ([string]$Value).Trim()
+  if ($s -match '(?i)^\[?ROW\s*(\d+)\]?$') { return [int]$Matches[1] }
+  if ($s -match '^\d+$') { return [int]$s }
+  return $null
+}
+
+function Get-AsrRowCitationsFromText {
+  param([string] $Text)
+  $out = New-Object System.Collections.ArrayList
+  if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+  foreach ($m in [regex]::Matches($Text, '\[ROW\s+(\d+)\]')) { [void]$out.Add([int]$m.Groups[1].Value) }
+  return @($out)
+}
+
+function Test-Pass2FOutputContract {
+  param(
+    [object] $Parsed,
+    [hashtable] $Chunk,
+    [hashtable] $Plan,
+    [hashtable] $SourceContext,
+    [switch] $AllowValidationNotConfigured
+  )
+  $issues = New-Object System.Collections.ArrayList
+  $warnings = New-Object System.Collections.ArrayList
+  $expectedSubject = 0
+  if ($null -ne $Plan) { try { $expectedSubject = [int]$Plan.numero } catch { $expectedSubject = 0 } }
+  if ($expectedSubject -le 0) {
+    Add-Pass2FValidationIssue -Issues $issues -Code 'sujet_attendu_invalide' -Message 'Plan sans numero de sujet valide.' -Details @{}
+  }
+  if ($null -eq $SourceContext) {
+    $unconfiguredErrors = @()
+    $unconfiguredWarnings = @()
+    if ($AllowValidationNotConfigured) {
+      $unconfiguredWarnings = @(@{ code='validation_not_configured'; message='Mode test hors ligne explicite : controle humain non execute.' })
+    } else {
+      $unconfiguredErrors = @(@{ code='validation_not_configured'; message='SourceContext absent : validation effective impossible hors test hors ligne.' })
+    }
+    return @{
+      ok = (@($unconfiguredErrors).Count -eq 0)
+      status = 'not_configured'
+      errors = @($unconfiguredErrors)
+      warnings = @($unconfiguredWarnings)
+      counts = [ordered]@{ expected_subject=$expectedSubject; photo_contexts=0; expected_photos=0; cited_photos=0; cited_asr_rows=0 }
+    }
+  }
+
+  $photos = @(Get-Pass2FArrayValue (Get-CrProp -Obj $SourceContext -Name 'photos'))
+  $assignments = Get-CrProp -Obj $SourceContext -Name 'assignments'
+  if ($null -eq $assignments) { $assignments = @{} }
+  $globalAsr = @{}
+  foreach ($r in @(Get-Pass2FArrayValue (Get-CrProp -Obj $SourceContext -Name 'asr_rows'))) {
+    $n = ConvertTo-AsrRowNumber (Get-CrProp -Obj $r -Name 'idx')
+    if ($null -ne $n) { $globalAsr[[int]$n] = $true }
+  }
+  $photoIndex = New-PhotoRefIndex -Photos $photos -Assignments $assignments
+
+  $chunkPhotos = New-Object System.Collections.ArrayList
+  $chunkPhotoIndex = @{}
+  $chunkAsr = @{}
+  $chunkData = Get-CrProp -Obj $Chunk -Name 'data'
+  foreach ($u in @(Get-Pass2FArrayValue (Get-CrProp -Obj $chunkData -Name 'sequence_documentaire'))) {
+    $kind = Get-CrPropString -Obj $u -Name 'kind'
+    if ($kind -eq 'photo') {
+      $rel = Get-CrPropString -Obj $u -Name 'photo_rel_native'
+      $disp = Get-CrPropString -Obj $u -Name 'photo'
+      if (-not $rel) { $rel = $disp }
+      $cu = @{ photo_rel_native=$rel; photo=$disp; subject_numero=(Get-CrPropInt -Obj $u -Name 'subject_numero'); assignment=$null }
+      $global = Resolve-PhotoRefIndex -Index $photoIndex -Ref $rel
+      if ($null -ne $global) { $cu.assignment = $global.assignment }
+      [void]$chunkPhotos.Add($cu)
+      foreach ($alias in @($rel, $disp, (New-PhotoKey $rel), (New-PhotoKey $disp))) {
+        if ([string]::IsNullOrWhiteSpace([string]$alias)) { continue }
+        if (-not $chunkPhotoIndex.ContainsKey([string]$alias)) { $chunkPhotoIndex[[string]$alias] = $cu }
+      }
+    }
+    $asrObj = Get-CrProp -Obj $u -Name 'asr'
+    foreach ($rv in @(Get-Pass2FArrayValue (Get-CrProp -Obj $asrObj -Name 'rows'))) {
+      $rn = ConvertTo-AsrRowNumber $rv
+      if ($null -ne $rn) { $chunkAsr[[int]$rn] = $true }
+    }
+  }
+
+  foreach ($cu in @($chunkPhotos)) {
+    $rel = [string]$cu.photo_rel_native
+    $asg = $cu.assignment
+    if ($null -eq $asg) {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'photo_sans_affectation_entree' -Message 'Photo presente dans le chunk sans affectation humaine.' -Details @{ photo=$rel }
+    } elseif ([string]$asg.status -eq 'exclue') {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'photo_exclue_entree' -Message 'Photo exclue presente dans le chunk Pass2F.' -Details @{ photo=$rel }
+    } elseif ([string]$asg.status -ne 'affectee') {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'photo_non_affectee_entree' -Message 'Photo non affectee presente dans le chunk Pass2F.' -Details @{ photo=$rel; status=[string]$asg.status }
+    } elseif ([int]$asg.subject_numero -ne [int]$cu.subject_numero) {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'photo_mauvais_sujet_entree' -Message 'Sujet humain du chunk different de l affectation.' -Details @{ photo=$rel; sujet_chunk=[int]$cu.subject_numero; sujet_photo=[int]$asg.subject_numero }
+    }
+    if ([int]$cu.subject_numero -le 0) {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'photo_sujet_absent_entree' -Message 'Unite photo sans numero de sujet.' -Details @{ photo=$rel }
+    }
+  }
+
+  $sourcePass = Get-CrPropString -Obj $Parsed -Name 'source_pass'
+  if ($sourcePass -ne '2F') {
+    Add-Pass2FValidationIssue -Issues $issues -Code 'source_pass_invalide' -Message 'source_pass doit valoir 2F.' -Details @{ observe=$sourcePass }
+  }
+  $sv = Get-CrProp -Obj $Parsed -Name 'schema_version'
+  if ($null -eq $sv -or [string]$sv -ne '1') {
+    Add-Pass2FValidationIssue -Issues $issues -Code 'schema_version_invalide' -Message 'schema_version doit valoir 1.' -Details @{ observe=[string]$sv }
+  }
+  $observedSubject = $null
+  $subjRaw = Get-CrProp -Obj $Parsed -Name 'subject_numero'
+  if ($null -eq $subjRaw -or [string]::IsNullOrWhiteSpace([string]$subjRaw)) {
+    Add-Pass2FValidationIssue -Issues $issues -Code 'subject_repond_absent' -Message 'subject_numero absent de la sortie.' -Details @{}
+  } else {
+    try { $observedSubject = [int]$subjRaw } catch { $observedSubject = $null }
+    if ($null -eq $observedSubject) {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'subject_repond_invalide' -Message 'subject_numero non entier.' -Details @{ observe=[string]$subjRaw }
+    } elseif ($observedSubject -ne $expectedSubject) {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'subject_repond_invalide' -Message 'subject_numero different du sujet demande.' -Details @{ observe=$observedSubject; attendu=$expectedSubject }
+    }
+  }
+
+  $points = @(Get-Pass2FArrayValue (Get-CrProp -Obj $Parsed -Name 'points_documentes'))
+  $photoContexts = @(Get-Pass2FArrayValue (Get-CrProp -Obj $Parsed -Name 'photo_contexts'))
+  $seenPhotoContexts = @{}
+  $citedPhotos = New-Object System.Collections.ArrayList
+  foreach ($pc in @($photoContexts)) {
+    $ref = Get-CrPropString -Obj $pc -Name 'photo'
+    $canon = Add-Pass2FPhotoRefIssue -Issues $issues -Ref $ref -Path 'photo_contexts' -PhotoIndex $photoIndex -ChunkPhotoIndex $chunkPhotoIndex -ExpectedSubject $expectedSubject
+    if ($null -eq $canon) { continue }
+    if ($seenPhotoContexts.ContainsKey($canon)) {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'photo_context_duplique' -Message 'Plusieurs photo_contexts pour la meme photo.' -Details @{ photo=$canon }
+    } else { $seenPhotoContexts[$canon] = $true }
+    [void]$citedPhotos.Add($canon)
+    $texts = @()
+    $t1 = Get-CrPropString -Obj $pc -Name 'apport_contextuel'
+    if ($t1) { $texts += $t1 }
+    foreach ($x in @(Get-Pass2FArrayValue (Get-CrProp -Obj $pc -Name 'elements_oraux_associes'))) {
+      if ($null -ne $x) { $texts += [string]$x }
+    }
+    foreach ($txt in @($texts)) {
+      foreach ($rn in @(Get-AsrRowCitationsFromText $txt)) {
+        Add-Pass2FAsrRefIssue -Issues $issues -RowNumber $rn -Path 'photo_contexts.texte' -GlobalAsr $globalAsr -ChunkAsr $chunkAsr
+      }
+    }
+  }
+  foreach ($cu in @($chunkPhotos)) {
+    $canon = [string]$cu.photo_rel_native
+    if (-not $seenPhotoContexts.ContainsKey($canon)) {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'photo_context_absente' -Message 'Aucune entree photo_contexts pour une photo du chunk.' -Details @{ photo=$canon }
+    }
+  }
+
+  $citedAsr = New-Object System.Collections.ArrayList
+  for ($pi = 0; $pi -lt @($points).Count; $pi++) {
+    $pt = @($points)[$pi]
+    $path = 'points_documentes[' + [string]$pi + ']'
+    foreach ($ref in @(Get-Pass2FArrayValue (Get-CrProp -Obj $pt -Name 'photos'))) {
+      $canon = Add-Pass2FPhotoRefIssue -Issues $issues -Ref ([string]$ref) -Path ($path + '.photos') -PhotoIndex $photoIndex -ChunkPhotoIndex $chunkPhotoIndex -ExpectedSubject $expectedSubject
+      if ($null -ne $canon) { [void]$citedPhotos.Add($canon) }
+    }
+    foreach ($rv in @(Get-Pass2FArrayValue (Get-CrProp -Obj $pt -Name 'asr_rows'))) {
+      $rn = ConvertTo-AsrRowNumber $rv
+      if ($null -eq $rn) {
+        Add-Pass2FValidationIssue -Issues $issues -Code 'asr_ref_invalide' -Message 'Reference ASR non numerique.' -Details @{ path=($path + '.asr_rows'); valeur=[string]$rv }
+      } else {
+        [void]$citedAsr.Add([int]$rn)
+        Add-Pass2FAsrRefIssue -Issues $issues -RowNumber $rn -Path ($path + '.asr_rows') -GlobalAsr $globalAsr -ChunkAsr $chunkAsr
+      }
+    }
+    $texte = Get-CrPropString -Obj $pt -Name 'texte'
+    foreach ($rn in @(Get-AsrRowCitationsFromText $texte)) {
+      [void]$citedAsr.Add([int]$rn)
+      Add-Pass2FAsrRefIssue -Issues $issues -RowNumber $rn -Path ($path + '.texte') -GlobalAsr $globalAsr -ChunkAsr $chunkAsr
+    }
+  }
+  $synth = Get-CrPropString -Obj $Parsed -Name 'synthese_intermediaire'
+  foreach ($rn in @(Get-AsrRowCitationsFromText $synth)) {
+    [void]$citedAsr.Add([int]$rn)
+    Add-Pass2FAsrRefIssue -Issues $issues -RowNumber $rn -Path 'synthese_intermediaire' -GlobalAsr $globalAsr -ChunkAsr $chunkAsr
+  }
+
+  return @{
+    ok = (@($issues).Count -eq 0)
+    status = $(if (@($issues).Count -eq 0) { 'ok' } else { 'failed' })
+    errors = @($issues)
+    warnings = @($warnings)
+    counts = [ordered]@{
+      expected_subject = $expectedSubject
+      observed_subject = $observedSubject
+      photo_contexts = @($photoContexts).Count
+      expected_photos = @($chunkPhotos).Count
+      cited_photos = @($citedPhotos | Select-Object -Unique).Count
+      cited_asr_rows = @($citedAsr | Select-Object -Unique).Count
+    }
+  }
+}
+
+function Test-Pass2B2FRank1MaterialIntegrity {
+  param(
+    [hashtable] $Material,
+    [hashtable] $Ctx
+  )
+  $issues = New-Object System.Collections.ArrayList
+  $photos = @(Get-Pass2FArrayValue (Get-CrProp -Obj $Ctx -Name 'photos'))
+  $assignments = Get-CrProp -Obj $Ctx -Name 'assignments'
+  if ($null -eq $assignments) { $assignments = @{} }
+  $photoIndex = New-PhotoRefIndex -Photos $photos -Assignments $assignments
+  $globalAsr = @{}
+  foreach ($r in @(Get-Pass2FArrayValue (Get-CrProp -Obj $Ctx -Name 'asr_rows'))) {
+    $n = ConvertTo-AsrRowNumber (Get-CrProp -Obj $r -Name 'idx')
+    if ($null -ne $n) { $globalAsr[[int]$n] = $true }
+  }
+  $seen = @{}
+  $units = @(Get-Pass2FArrayValue (Get-CrProp -Obj $Material -Name 'photo_units'))
+  foreach ($u in @($units)) {
+    $rel = Get-CrPropString -Obj $u -Name 'photo_id'
+    if (-not $rel) {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'photo_ref_vide' -Message 'Unite photo sans photo_id.' -Details @{}
+      continue
+    }
+    $resolved = Resolve-PhotoRefIndex -Index $photoIndex -Ref $rel
+    if ($null -eq $resolved) {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'photo_inconnue' -Message 'photo_id absent du referentiel de la captation.' -Details @{ photo=$rel }
+      continue
+    }
+    $canon = [string]$resolved.photo_rel_native
+    if ($seen.ContainsKey($canon)) {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'photo_dupliquee' -Message 'Plusieurs unites photo pour la meme photo.' -Details @{ photo=$canon }
+    } else { $seen[$canon] = $true }
+    $asg = $resolved.assignment
+    $unitSubject = Get-CrPropInt -Obj $u -Name 'subject_numero'
+    if ($null -eq $asg) {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'photo_sans_affectation' -Message 'Unite photo sans affectation humaine.' -Details @{ photo=$canon }
+    } elseif ([string]$asg.status -eq 'exclue') {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'photo_exclue' -Message 'Unite photo pour une photo exclue.' -Details @{ photo=$canon }
+    } elseif ([string]$asg.status -ne 'affectee') {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'photo_non_affectee' -Message 'Unite photo pour une photo non affectee.' -Details @{ photo=$canon; status=[string]$asg.status }
+    } elseif ([int]$asg.subject_numero -le 0) {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'photo_sujet_invalide' -Message 'Affectation humaine sans sujet valide.' -Details @{ photo=$canon }
+    } elseif ([int]$asg.subject_numero -ne $unitSubject) {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'photo_mauvais_sujet_humain' -Message 'Sujet de l unite photo different de l affectation humaine.' -Details @{ photo=$canon; sujet_unite=$unitSubject; sujet_photo=[int]$asg.subject_numero }
+    }
+    if ($unitSubject -le 0) {
+      Add-Pass2FValidationIssue -Issues $issues -Code 'photo_sujet_absent' -Message 'Unite photo sans sujet.' -Details @{ photo=$canon }
+    }
+    $asrObj = Get-CrProp -Obj $u -Name 'asr_context'
+    foreach ($rv in @(Get-Pass2FArrayValue (Get-CrProp -Obj $asrObj -Name 'rows'))) {
+      $rn = ConvertTo-AsrRowNumber $rv
+      if ($null -eq $rn) {
+        Add-Pass2FValidationIssue -Issues $issues -Code 'asr_ref_invalide' -Message 'Reference ASR non numerique dans une unite photo.' -Details @{ photo=$canon; valeur=[string]$rv }
+      } elseif (-not $globalAsr.ContainsKey([int]$rn)) {
+        Add-Pass2FValidationIssue -Issues $issues -Code 'asr_row_inconnue' -Message 'Reference ASR absente de la captation.' -Details @{ photo=$canon; row=$rn }
+      }
+    }
+  }
+  return @{
+    ok = (@($issues).Count -eq 0)
+    status = $(if (@($issues).Count -eq 0) { 'ok' } else { 'failed' })
+    errors = @($issues)
+    photo_units_count = @($units).Count
+    distinct_photos_count = @($seen.Keys).Count
+  }
+}
+
 function Invoke-Pass2FChunkAndRecord {
   param(
     [hashtable] $Chunk,
@@ -3774,8 +4160,24 @@ function Invoke-Pass2FChunkAndRecord {
     [int]       $MaxTokens,
     [double]    $Temperature,
     [string]    $AliasLogique = "",
-    [string[]]  $OfflineRawResponses = @()
+    [string[]]  $OfflineRawResponses = @(),
+    [hashtable] $SourceContext = $null,
+    [switch]    $OfflineTest,
+    [switch]    $AllowValidationNotConfigured
   )
+  $offlineMode = (@($OfflineRawResponses).Count -gt 0)
+  if ($OfflineTest -and -not $offlineMode) {
+    throw '[REFERE-E2E-3E] -OfflineTest exige -OfflineRawResponses : aucun mode test implicite.'
+  }
+  if ($offlineMode -and -not $OfflineTest) {
+    throw '[REFERE-E2E-3E] -OfflineRawResponses exige -OfflineTest explicite.'
+  }
+  if ($AllowValidationNotConfigured -and -not $OfflineTest) {
+    throw '[REFERE-E2E-3E] -AllowValidationNotConfigured est reserve au mode hors ligne explicite.'
+  }
+  if ($null -eq $SourceContext -and -not ($OfflineTest -and $AllowValidationNotConfigured)) {
+    throw '[REFERE-E2E-3E] SourceContext obligatoire : aucune sortie Pass2F ne peut etre validee sans referentiel humain.'
+  }
   $n3 = '{0:D3}' -f ([int]$Plan.numero)
   $ci = [int]$Chunk.chunk_index
   $n2 = '{0:D2}' -f $ci
@@ -3849,6 +4251,13 @@ function Invoke-Pass2FChunkAndRecord {
     output_budget_ok = [bool]$Chunk.output_budget_ok
     split_reason = [string]$Chunk.split_reason
     enforce_required = [bool]$Chunk.enforce_required
+    contract_ok = $false
+    validation_ok = $false
+    validation_status = 'not_run'
+    validation_errors = @()
+    validation_warnings = @()
+    validation_counts = @{}
+    validation_file = ''
   }
   $photosList = New-Object System.Collections.ArrayList
   foreach ($u in @($Chunk.data.sequence_documentaire)) {
@@ -3926,6 +4335,21 @@ function Invoke-Pass2FChunkAndRecord {
           Add-CrOutputFile $parsedFile
           $entry.parsed_file = $parsedFile
           if ($null -ne $parsed.subject_numero) { $entry.subject_repond = [int]$parsed.subject_numero }
+          $validation = Test-Pass2FOutputContract -Parsed $parsed -Chunk $Chunk -Plan $Plan -SourceContext $SourceContext -AllowValidationNotConfigured:$AllowValidationNotConfigured
+          $entry.validation_ok = [bool]$validation.ok
+          $entry.validation_status = [string]$validation.status
+          $entry.validation_errors = @($validation.errors)
+          $entry.validation_warnings = @($validation.warnings)
+          $entry.validation_counts = $validation.counts
+          $entry.contract_ok = [bool]$validation.ok
+          $validationFile = Join-Path $parsedDir ($tag + '_validation.json')
+          $validation['response_file'] = [IO.Path]::GetFileName($parsedFile)
+          try { $validation['response_sha256'] = (Get-FileHash -LiteralPath $parsedFile -Algorithm SHA256).Hash.ToLowerInvariant() } catch { $validation['response_sha256'] = '' }
+          $validation['validator'] = 'Test-Pass2FOutputContract'
+          $validation['validated_at_utc'] = [DateTime]::UtcNow.ToString('o')
+          Write-CrJsonAtomic -Path $validationFile -Obj $validation
+          Add-CrOutputFile $validationFile
+          $entry.validation_file = $validationFile
         }
       } catch {
         $entry.parse_error = $_.Exception.Message
@@ -3973,6 +4397,182 @@ function Invoke-Pass2FChunkAndRecord {
   }
   $entry.echo_ratio = Measure-EchoRatio -Text $lastRaw -Reference $message
   return $entry
+}
+function Test-Pass2FArtifactRevalidation {
+  param(
+    [string] $Path,
+    [hashtable] $SourceContext = $null
+  )
+  $errors = New-Object System.Collections.ArrayList
+  if ($null -eq $SourceContext) {
+    Add-Pass2FValidationIssue -Issues $errors -Code 'validation_not_configured' -Message 'SourceContext absent : revalidation historique impossible.' -Details @{}
+    return @{ ok=$false; status='not_configured'; errors=@($errors); warnings=@(); counts=@{} }
+  }
+  if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    Add-Pass2FValidationIssue -Issues $errors -Code 'response_absente' -Message 'Fichier de reponse Pass2F absent.' -Details @{ path=[string]$Path }
+    return @{ ok=$false; status='failed'; errors=@($errors); warnings=@(); counts=@{} }
+  }
+  $responseName = [IO.Path]::GetFileNameWithoutExtension($Path)
+  $tag = $responseName -replace '_response$', ''
+  $parsedDir = [IO.Path]::GetDirectoryName($Path)
+  $outDir = [IO.Path]::GetDirectoryName($parsedDir)
+  $inputPath = Join-Path (Join-Path $outDir 'inputs') ($tag + '_input.json')
+  if (-not (Test-Path -LiteralPath $inputPath -PathType Leaf)) {
+    Add-Pass2FValidationIssue -Issues $errors -Code 'input_absent' -Message 'Artefact input indispensable a la revalidation absent.' -Details @{ path=$inputPath }
+    return @{ ok=$false; status='failed'; errors=@($errors); warnings=@(); counts=@{} }
+  }
+  $inputObj = $null
+  $parsed = $null
+  try { $inputObj = ([IO.File]::ReadAllText($inputPath) | ConvertFrom-Json) } catch { $inputObj = $null }
+  try { $parsed = ([IO.File]::ReadAllText($Path) | ConvertFrom-Json) } catch { $parsed = $null }
+  if ($null -eq $inputObj) {
+    Add-Pass2FValidationIssue -Issues $errors -Code 'input_illisible' -Message 'Artefact input JSON illisible.' -Details @{ path=$inputPath }
+  }
+  if ($null -eq $parsed) {
+    Add-Pass2FValidationIssue -Issues $errors -Code 'response_illisible' -Message 'Reponse Pass2F JSON illisible.' -Details @{ path=$Path }
+  }
+  if (@($errors).Count -gt 0) { return @{ ok=$false; status='failed'; errors=@($errors); warnings=@(); counts=@{} } }
+  $data = Get-CrProp -Obj $inputObj -Name 'data'
+  $sujet = Get-CrProp -Obj $inputObj -Name 'sujet_cible'
+  $plan = @{
+    numero = [int](Get-CrPropInt -Obj $sujet -Name 'numero')
+    titre = Get-CrPropString -Obj $sujet -Name 'titre'
+    localisation = Get-CrPropString -Obj $sujet -Name 'localisation'
+    description = Get-CrPropString -Obj $sujet -Name 'description'
+    budget = Get-CrProp -Obj $inputObj -Name 'budget'
+  }
+  $units = @(Get-Pass2FArrayValue (Get-CrProp -Obj $data -Name 'sequence_documentaire'))
+  $chunk = @{
+    chunk_index = [int](Get-CrPropInt -Obj $inputObj -Name 'chunk_index')
+    chunk_total = [int](Get-CrPropInt -Obj $inputObj -Name 'chunk_total')
+    photos_count = [int](Get-CrPropInt -Obj $inputObj -Name 'photos_count')
+    units_count = @($units).Count
+    split_reason = Get-CrPropString -Obj $inputObj -Name 'split_reason'
+    enforce_required = $false
+    data = $data
+  }
+  return (Test-Pass2FOutputContract -Parsed $parsed -Chunk $chunk -Plan $plan -SourceContext $SourceContext)
+}
+function Test-Pass2FResponseArtifact {
+  param(
+    [string] $Path,
+    [hashtable] $SourceContext = $null
+  )
+  $errors = New-Object System.Collections.ArrayList
+  $result = @{
+    ok = $false
+    status = 'failed'
+    response_file = [string]$Path
+    validation_file = ''
+    validation_mode = ''
+    response_sha256 = ''
+    errors = @()
+    warnings = @()
+    counts = @{}
+  }
+  if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    Add-Pass2FValidationIssue -Issues $errors -Code 'response_absente' -Message 'Fichier de reponse Pass2F absent.' -Details @{ path=[string]$Path }
+    $result.errors = @($errors)
+    return $result
+  }
+  try { $result.response_sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() } catch { $result.response_sha256 = '' }
+  $responseName = [IO.Path]::GetFileNameWithoutExtension($Path)
+  $tag = $responseName -replace '_response$', ''
+  $validationPath = Join-Path ([IO.Path]::GetDirectoryName($Path)) ($tag + '_validation.json')
+  $result.validation_file = $validationPath
+  if (Test-Path -LiteralPath $validationPath -PathType Leaf) {
+    $validationObj = $null
+    try { $validationObj = ([IO.File]::ReadAllText($validationPath) | ConvertFrom-Json) } catch { $validationObj = $null }
+    if ($null -eq $validationObj) {
+      Add-Pass2FValidationIssue -Issues $errors -Code 'validation_artifact_illisible' -Message 'Artefact de validation Pass2F illisible.' -Details @{ path=$validationPath }
+      $result.errors = @($errors)
+      return $result
+    }
+    $validationStatus = Get-CrPropString -Obj $validationObj -Name 'status'
+    $validationOk = [bool](Get-CrProp -Obj $validationObj -Name 'ok')
+    $result.status = $validationStatus
+    if ($validationStatus -eq 'not_configured') {
+      Add-Pass2FValidationIssue -Issues $errors -Code 'validation_not_configured_publiee' -Message 'Une validation not_configured ne peut jamais alimenter Pass3E.' -Details @{ path=$validationPath }
+    }
+    if (-not $validationOk -or ($validationStatus -ne 'ok' -and $validationStatus -ne '')) {
+      Add-Pass2FValidationIssue -Issues $errors -Code 'validation_artifact_non_ok' -Message 'Le chunk a ete rejete par la validation enregistree.' -Details @{ path=$validationPath; status=$validationStatus }
+      $ve = @(Get-Pass2FArrayValue (Get-CrProp -Obj $validationObj -Name 'errors'))
+      foreach ($e0 in @($ve)) {
+        $c0 = Get-CrPropString -Obj $e0 -Name 'code'
+        Add-Pass2FValidationIssue -Issues $errors -Code ('validation_source_' + $c0) -Message 'Diagnostic anterieur conserve.' -Details @{ path=$validationPath; original_code=$c0 }
+      }
+    }
+    if (@($errors).Count -eq 0) {
+      $validatedHash = Get-CrPropString -Obj $validationObj -Name 'response_sha256'
+      if ($validatedHash) {
+        if ($validatedHash.ToLowerInvariant() -ne $result.response_sha256) {
+          Add-Pass2FValidationIssue -Issues $errors -Code 'validation_response_hash_mismatch' -Message 'La validation ne correspond pas au fichier de reponse courant.' -Details @{ path=$Path; attendu=$validatedHash; observe=$result.response_sha256 }
+        } else {
+          $result.ok = $true
+          $result.status = 'ok'
+          $result.validation_mode = 'validation_artifact_hash'
+          $result.counts = Get-CrProp -Obj $validationObj -Name 'counts'
+          return $result
+        }
+      } else {
+        $reval = Test-Pass2FArtifactRevalidation -Path $Path -SourceContext $SourceContext
+        if ([bool]$reval.ok) {
+          $result.ok = $true
+          $result.status = 'ok'
+          $result.validation_mode = 'revalidated_legacy_without_hash'
+          $result.errors = @($reval.errors)
+          $result.warnings = @($reval.warnings)
+          $result.counts = $reval.counts
+          return $result
+        }
+        if ($null -eq $SourceContext) {
+          $result.ok = $true
+          $result.status = 'ok'
+          $result.validation_mode = 'legacy_validation_artifact'
+          $result.warnings = @(@{ code='validation_artifact_legacy_without_hash'; message='Validation historique acceptee sans empreinte de reponse.' })
+          return $result
+        }
+        $result.errors = @($reval.errors)
+        $result.warnings = @($reval.warnings)
+        $result.validation_mode = 'legacy_revalidation_failed'
+        return $result
+      }
+    }
+  } else {
+    $reval = Test-Pass2FArtifactRevalidation -Path $Path -SourceContext $SourceContext
+    if ([bool]$reval.ok) {
+      $result.ok = $true
+      $result.status = 'ok'
+      $result.validation_mode = 'revalidated_missing_artifact'
+      $result.errors = @($reval.errors)
+      $result.warnings = @($reval.warnings)
+      $result.counts = $reval.counts
+      return $result
+    }
+    $result.errors = @($reval.errors)
+    $result.warnings = @($reval.warnings)
+    $result.validation_mode = 'missing_artifact_revalidation_failed'
+  }
+  if (@($errors).Count -gt 0) { $result.errors = @($errors) ; $result.ok = $false }
+  return $result
+}
+function Assert-P3EChunkPathsPublishable {
+  param(
+    [string[]] $Paths,
+    [hashtable] $SourceContext = $null
+  )
+  $rejected = New-Object System.Collections.ArrayList
+  foreach ($p in @($Paths)) {
+    $state = Test-Pass2FResponseArtifact -Path $p -SourceContext $SourceContext
+    if (-not [bool]$state.ok) {
+      $codes = @($state.errors | ForEach-Object { [string]$_.code }) -join ','
+      [void]$rejected.Add(([IO.Path]::GetFileName($p) + ' [status=' + [string]$state.status + '; codes=' + $codes + ']'))
+    }
+  }
+  if (@($rejected).Count -gt 0) {
+    throw ('[cr_refere_preventif] Pass3E : sortie(s) Pass2F non publiable(s), injection refusee : ' + (@($rejected) -join ' | '))
+  }
+  return @($Paths)
 }
 # ============================================================================
 # Section 6 - Orchestration principale (DryRun 2F-6C2B / ExecuteLlm controle 2F-6C2C)
@@ -5703,7 +6303,19 @@ function Resolve-P3EChunkPaths {
   param([int]$Subject, [string]$Pass2FOutDir, [string[]]$ExplicitPaths)
   if (@($ExplicitPaths).Count -gt 0) {
     $out = New-Object System.Collections.ArrayList
-    foreach ($x in @($ExplicitPaths)) { if ($x -and (Test-Path -LiteralPath $x -PathType Leaf)) { [void]$out.Add($x) } }
+    $seenExplicit = @{}
+    foreach ($x in @($ExplicitPaths)) {
+      if ([string]::IsNullOrWhiteSpace([string]$x)) { continue }
+      if (-not (Test-Path -LiteralPath $x -PathType Leaf)) {
+        throw ('[cr_refere_preventif] Pass3E : chemin Pass2F explicite introuvable (' + [string]$x + ') - aucune omission silencieuse.')
+      }
+      $fullX = [IO.Path]::GetFullPath([string]$x)
+      if ($seenExplicit.ContainsKey($fullX)) {
+        throw ('[cr_refere_preventif] Pass3E : chemin Pass2F explicite duplique (' + $fullX + ') - injection refusee.')
+      }
+      $seenExplicit[$fullX] = $true
+      [void]$out.Add([string]$x)
+    }
     return @($out | Sort-Object)
   }
   if ($Subject -le 0 -or -not $Pass2FOutDir) { return @() }
@@ -5725,7 +6337,10 @@ function Get-P3V {
   return $null
 }
 function Get-P3EUserText {
-  param($CompactObj, [int]$SubjectNumero, [string[]]$ChunkPaths, [switch]$Pass2EAbsent)
+  param($CompactObj, [int]$SubjectNumero, [string[]]$ChunkPaths, [switch]$Pass2EAbsent, [hashtable]$SourceContext = $null)
+  if (@($ChunkPaths).Count -gt 0) {
+    $ChunkPaths = @(Assert-P3EChunkPathsPublishable -Paths @($ChunkPaths) -SourceContext $SourceContext)
+  }
   $num = 0
   $titre = ''
   $localisation = ''
@@ -5990,7 +6605,7 @@ function Invoke-Pass3Refere {
       if ($null -ne $vN) { $num = [int]$vN }
       if ($num -le 0) { continue }
       $chunkPaths = @(Resolve-P3EChunkPaths -Subject $num -Pass2FOutDir $Pass2FOutDir -ExplicitPaths @($EChunkPaths))
-      $usrE = Get-P3EUserText -CompactObj $compact -SubjectNumero $num -ChunkPaths @($chunkPaths)
+      $usrE = Get-P3EUserText -CompactObj $compact -SubjectNumero $num -ChunkPaths @($chunkPaths) -SourceContext $Ctx
       if (-not [string]::IsNullOrWhiteSpace($eCtxUserText)) { $usrE = 'Consignes generales du dossier (champ user, contraignantes) :' + "`n" + $eCtxUserText + "`n`n" + $usrE }
       $diagE = Get-P3BudgetDiag -Alias ([string]$aliasMap['E']) -SysText $eSys -UsrText $usrE
       $ePromptDir = Join-Path $p3Root 'prompts'
@@ -6068,7 +6683,7 @@ function Invoke-Pass3Refere {
         $statusAll = 'pass2e_insufficient'
       } else {
         $chunkPaths = @(Resolve-P3EChunkPaths -Subject $ESubject -Pass2FOutDir $Pass2FOutDir -ExplicitPaths @($EChunkPaths))
-        $usrE = Get-P3EUserText -CompactObj $compact -SubjectNumero $ESubject -ChunkPaths @($chunkPaths)
+        $usrE = Get-P3EUserText -CompactObj $compact -SubjectNumero $ESubject -ChunkPaths @($chunkPaths) -SourceContext $Ctx
       if (-not [string]::IsNullOrWhiteSpace($eCtxUserText)) { $usrE = 'Consignes generales du dossier (champ user, contraignantes) :' + "`n" + $eCtxUserText + "`n`n" + $usrE }
         $diagE = Get-P3BudgetDiag -Alias ([string]$aliasMap['E']) -SysText $eSys -UsrText $usrE
         $eRowT = [ordered]@{
@@ -6278,7 +6893,8 @@ if ($TestPass2FRetryOffline) {
     $script:AdapterAlias = $RouteModel
     $ch = E2E3E-NewChunk -Numero 20 -ChunkIndex 1 -Message ('prompt ' + $CaseName)
     $pl = E2E3E-NewPlan -Numero 20
-    $e = Invoke-Pass2FChunkAndRecord -Chunk $ch -Plan $pl -OutDir $outCase -MaxTokens 1800 -Temperature 0.2 -AliasLogique $AliasLogique -OfflineRawResponses @($OfflineRaws)
+    $offlineCtx = @{ photos=@(); assignments=@{}; asr_rows=@() }
+    $e = Invoke-Pass2FChunkAndRecord -Chunk $ch -Plan $pl -OutDir $outCase -MaxTokens 1800 -Temperature 0.2 -AliasLogique $AliasLogique -OfflineRawResponses @($OfflineRaws) -OfflineTest -SourceContext $offlineCtx
     return $e
   }
 
@@ -6458,7 +7074,8 @@ function Invoke-Pass3RefereResume {
     [string] $ApiBase,
     [string] $ApiKey,
     [string] $LotLabel,
-    [string] $OutSubdir
+    [string] $OutSubdir,
+    [hashtable] $SourceContext = $null
   )
   $script:P3LotLabel = $(if ($LotLabel) { [string]$LotLabel } else { '3R-1D' })
   $script:P3Exec = [bool]$Exec
@@ -6632,6 +7249,10 @@ function Invoke-Pass3RefereResume {
   if ($null -eq $compactObj) { throw ('[cr_refere_preventif] LOT 3R-1D : compact Pass2E sujet ' + $subjectNum + ' JSON invalide - STOP.') }
   if (-not (Has-P3Synthese $compactObj)) { throw ('[cr_refere_preventif] LOT 3R-1D : compact Pass2E sujet ' + $subjectNum + ' sans synthese_intermediaire - PASS2E_INSUFFICIENT (STOP).') }
   # --- Verification : les seuls chunks actuels du sujet = ceux fournis ---
+  $missingChunkPaths = @($chunkPaths | Where-Object { $_ -and (-not (Test-Path -LiteralPath $_ -PathType Leaf)) })
+  if (@($missingChunkPaths).Count -gt 0) {
+    throw ('[cr_refere_preventif] LOT 3R-1D : chunks Pass2F sujet ' + $subjectNum + ' introuvables (' + (@($missingChunkPaths) -join ',') + ') - STOP.')
+  }
   $explicit = @($chunkPaths | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) })
   if (@($explicit).Count -lt 1) { throw ('[cr_refere_preventif] LOT 3R-1D : chunks Pass2F sujet ' + $subjectNum + ' absents - STOP.') }
   $chunkPathsSorted = @($explicit | Sort-Object { [IO.Path]::GetFileName($_) })
@@ -6661,7 +7282,7 @@ function Invoke-Pass3RefereResume {
     throw ('[cr_refere_preventif] LOT 3R-1D : sujet 20 doit avoir exactement 3 chunks actuels (08/09/10), trouve=' + $totalChunksFound + ' - STOP.')
   }
   Write-CrInfo ('Pass3E sujet ' + $subjectNum + ' : chunks fournis=' + @($chunkPathsSorted).Count + ' (ordre croissant) total_actuel=' + $totalChunksFound)
-  $usrE = Get-P3EUserText -CompactObj $compactObj -SubjectNumero $subjectNum -ChunkPaths @($chunkPathsSorted)
+  $usrE = Get-P3EUserText -CompactObj $compactObj -SubjectNumero $subjectNum -ChunkPaths @($chunkPathsSorted) -SourceContext $SourceContext
   if (-not [string]::IsNullOrWhiteSpace($ctxUserText)) { $usrE = 'Consignes generales du dossier (contexte_general_compte_rendu.json - champ user, contraignantes) :' + "`n" + $ctxUserText + "`n`n" + $usrE }
   $diagE = Get-P3BudgetDiag -Alias $aliasE -SysText $sysE -UsrText $usrE
   Write-CrInfo ('Pass3E budget : final_tokens_est=' + [int]$diagE.final_input_tokens_est + ' available=' + [int]$diagE.available_input_tokens + ' fits=' + [bool]$diagE.fits)
@@ -6979,12 +7600,16 @@ try {
             }
             Write-CrInfo ('appel pass2f_local : sujet ' + $snInt + ' chunk ' + $ciSel + '/' + $plan.chunk_count + ' unites=' + $chSel.units_count + ' tokens_est=' + $chSel.prompt_tokens_est)
             Add-CrLogLine ('llm_call_start sujet=' + $snInt + ' chunk=' + $ciSel)
-            $callEntry = Invoke-Pass2FChunkAndRecord -Chunk $chSel -Plan $plan -OutDir $OutDirMain -MaxTokens $MaxOutputTokens -Temperature 0.2 -AliasLogique $ModelPass2F
+            $callEntry = Invoke-Pass2FChunkAndRecord -Chunk $chSel -Plan $plan -OutDir $OutDirMain -MaxTokens $MaxOutputTokens -Temperature 0.2 -AliasLogique $ModelPass2F -SourceContext $CtxMain
             $chunksInvoked++
             $llmCallsLog += [int]$callEntry.actual_llm_calls
             $httpCallsLog += [int]$callEntry.actual_http_calls
             [void]$script:llmEntries.Add($callEntry)
-            Add-CrLogLine ('llm_call_end sujet=' + $snInt + ' chunk=' + $ciSel + ' error=' + $(if ($callEntry.error) { 'yes' } else { 'no' }))
+            Add-CrLogLine ('llm_call_end sujet=' + $snInt + ' chunk=' + $ciSel + ' error=' + $(if ($callEntry.error) { 'yes' } else { 'no' }) + ' validation=' + [string]$callEntry.validation_status)
+            if (-not [bool]$callEntry.validation_ok) {
+              $vErr3 = @($callEntry.validation_errors | ForEach-Object { [string]$_.code }) -join ','
+              throw ('[cr_refere_preventif] Pass2F sujet ' + $snInt + ' chunk ' + $ciSel + ' invalide (validation=' + [string]$callEntry.validation_status + ' erreurs=' + $vErr3 + ') - STOP.')
+            }
           }
         }
       }
@@ -7282,6 +7907,10 @@ try {
     Write-CrInfo $msg2
     Add-CrLogLine $msg2
     Write-CrInfo ('Pass2B_2F manifest : ' + [string]$pass2b2fSummary.manifest)
+    if (-not [bool]$pass2b2fSummary.ok) {
+      $vErr2 = @($pass2b2fSummary.validation.errors | ForEach-Object { [string]$_.code }) -join ','
+      throw ('[cr_refere_preventif] Pass2B_2F material invalide (validation=' + [string]$pass2b2fSummary.validation.status + ' erreurs=' + $vErr2 + ') - STOP avant batch.')
+    }
     if ($pass2b2fExecuteMode) {
       if ($Pass2B2FRunComplete) {
         $rcLotStr = $Pass2B2FLotLabel
@@ -7400,7 +8029,7 @@ try {
     $rLot = [string]$Pass3RefereLotLabel
     if (-not $rLot) { $rLot = '3R-1D' }
     Write-CrInfo ('Pass3 refere RESUME LOT ' + $rLot + ' : mode=' + $(if ($rPlan) { 'PLAN-ONLY (aucun appel)' } else { 'EXECUTE (D puis E, max 2 appels)' }) + ' request=' + $rReqPath)
-    $resumeRes = Invoke-Pass3RefereResume -OutDirMain $OutDirMain -RequestJsonPath $rReqPath -Exec:(-not $rPlan) -ApiBase $ApiBase -ApiKey $ApiKey -LotLabel $rLot -OutSubdir $Pass3RefereOutSubdir
+    $resumeRes = Invoke-Pass3RefereResume -OutDirMain $OutDirMain -RequestJsonPath $rReqPath -Exec:(-not $rPlan) -ApiBase $ApiBase -ApiKey $ApiKey -LotLabel $rLot -OutSubdir $Pass3RefereOutSubdir -SourceContext $CtxMain
     $resumeSum = $resumeRes.summary
     $totals['pass3refere_resume'] = @{
       lot = $rLot

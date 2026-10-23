@@ -136,14 +136,15 @@ function Invoke-RefereProductionPipeline {
         foreach ($chP in @($planP.chunks)) {
           $chunkEntryCount++
           Write-CrInfo ('[E2E-2 EXEC] Pass2F sujet ' + $snInt + ' chunk ' + [int]$chP.chunk_index + '/' + $nChunks + ' (' + $chunkEntryCount + ')')
-          $e = Invoke-Pass2FChunkAndRecord -Chunk $chP -Plan $planP -OutDir $OutDir -MaxTokens $MaxTokensPass2F -Temperature 0.2 -AliasLogique $ModelPass2F
+          $e = Invoke-Pass2FChunkAndRecord -Chunk $chP -Plan $planP -OutDir $OutDir -MaxTokens $MaxTokensPass2F -Temperature 0.2 -AliasLogique $ModelPass2F -SourceContext $Ctx
           $llmTotal += [int]$e.actual_llm_calls
           $httpTotal += [int]$e.actual_http_calls
           if ($null -eq $script:llmEntries) { $script:llmEntries = New-Object System.Collections.ArrayList }
           [void]$script:llmEntries.Add($e)
           Add-RefereProgressCalls -Llm ([int]$e.actual_llm_calls) -Http ([int]$e.actual_http_calls)
-          if ($e.error -or (-not [bool]$e.json_parse_ok) -or [bool]$e.truncated_or_invalid_response -or ([string]$e.finish_reason -eq 'length')) {
-            throw ('[cr_refere_preventif] REFERE-E2E-2 : Pass2F ' + [string]$e.tag + ' invalide (json_parse_ok=' + [bool]$e.json_parse_ok + ' finish=' + ([string]$e.finish_reason) + ' error=' + ([string]$e.error) + ') - aucun retry, STOP.')
+          if ($e.error -or (-not [bool]$e.json_parse_ok) -or [bool]$e.truncated_or_invalid_response -or ([string]$e.finish_reason -eq 'length') -or (-not [bool]$e.validation_ok)) {
+            $vErr = @($e.validation_errors | ForEach-Object { [string]$_.code }) -join ','
+            throw ('[cr_refere_preventif] REFERE-E2E-2 : Pass2F ' + [string]$e.tag + ' invalide (json_parse_ok=' + [bool]$e.json_parse_ok + ' finish=' + ([string]$e.finish_reason) + ' validation=' + [string]$e.validation_status + ' erreurs=' + $vErr + ' error=' + [string]$e.error + ') - aucun retry, STOP.')
           }
         }
       }
@@ -169,6 +170,10 @@ function Invoke-RefereProductionPipeline {
     $segDirP = [System.IO.Path]::GetFullPath($segDirP)
     Write-CrInfo ('[E2E-2 ' + $mode + '] Pass2B_2F DryRun segments_dir=' + $segDirP)
     $p2b = Invoke-Pass2B2FDryRun -Ctx $Ctx -SegmentsDir $segDirP -OutDir $OutDir -ModelAlias $ModelPass2B2F -ExpectedAffected $photosAffectees -ExpectedExcluded $photosExclues -StartedAt $StartedAt -MaxBatchChars $MaxBatchChars -MaxBatchTokens $MaxBatchTokens
+    if (-not [bool]$p2b.summary.ok) {
+      $vErr2 = @($p2b.summary.validation.errors | ForEach-Object { [string]$_.code }) -join ','
+      throw ('[cr_refere_preventif] REFERE-E2E-2 : Pass2B_2F material invalide (validation=' + [string]$p2b.summary.validation.status + ' erreurs=' + $vErr2 + ') - STOP avant batch.')
+    }
     $batchesCount = 0
     if ($null -ne $p2b.pack) { $batchesCount = @($p2b.pack.batches).Count }
     if ($batchesCount -le 0) { $batchesCount = [int]$p2b.summary.batches_count }
@@ -410,7 +415,7 @@ function Invoke-RefereProductionPipeline {
         # flag -Pass2EAbsent pour annoncer l absence de synthese Pass2E.
         $compactUsrE = [pscustomobject]@{ numero=$numE; titre=$titreE; localisation=$locE; description=$descE }
       }
-      $usrE = Get-P3EUserText -CompactObj $compactUsrE -SubjectNumero $numE -ChunkPaths @($chunkPathsE) -Pass2EAbsent:($pass2eAbsentE)
+      $usrE = Get-P3EUserText -CompactObj $compactUsrE -SubjectNumero $numE -ChunkPaths @($chunkPathsE) -Pass2EAbsent:($pass2eAbsentE) -SourceContext $Ctx
       if (-not [string]::IsNullOrWhiteSpace($eCtxUserText)) { $usrE = 'Consignes generales du dossier (champ user, contraignantes) :' + "`n" + $eCtxUserText + "`n`n" + $usrE }
       $diagE = Get-P3BudgetDiag -Alias ([string]$aliasMap3['E']) -SysText $eSysE -UsrText $usrE
       $budgetModeE = 'none'
