@@ -7,6 +7,7 @@ import argparse
 import csv
 import hashlib
 import json
+import logging
 import re
 import shutil
 import tempfile
@@ -27,9 +28,12 @@ from pass3f_provenance import (
     stable_id,
     write_json_deterministic,
 )
+from photo_context_resolver import SourceSelection, resolve_photo_context
 
 
-ADAPTER_VERSION = "pass3f.refere-adapter.v1"
+ADAPTER_VERSION = "pass3f.refere-adapter.v2"
+PHOTO_ASR_WINDOW_SECONDS = 30.0
+_LOGGER = logging.getLogger("pass3f.refere_adapter")
 _ROW_RE = re.compile(r"\[ROW\s+(\d+)\]")
 _PHOTO_CONTEXT_RE = re.compile(r"^/photo_contexts/(\d+)(?:/|$)")
 
@@ -49,6 +53,22 @@ class RefereSources:
     affaires_root: Path
     id_affaire: str
     id_captation: str
+
+
+class RefereAdapterConsistencyError(ValueError):
+    """Raised when photo sources contradict the legacy refere material."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        diagnostics: Iterable[dict[str, Any]] = (),
+    ):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.diagnostics = tuple(dict(item) for item in diagnostics)
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -271,6 +291,322 @@ def _photo_rows(path: Path) -> dict[str, dict[str, str]]:
     return result
 
 
+def _photos_batch_csv(path: Path) -> Path | None:
+    candidate = path.with_name("photos_batch.csv")
+    if candidate.is_file() and candidate.absolute() != path.absolute():
+        return candidate
+    return None
+
+
+def _cited_asr_evidence_ids(
+    assignments: list[dict[str, Any]],
+    material_photos: dict[str, dict[str, Any]],
+    row_to_evidence: dict[int, list[str]],
+) -> set[str]:
+    cited: set[str] = set()
+    problems: list[dict[str, Any]] = []
+    for assignment in assignments:
+        if assignment.get("status") != "affectee":
+            continue
+        photo_rel = str(assignment["photo_rel_native"]).replace("\\", "/")
+        material = material_photos.get(photo_rel)
+        if material is None:
+            continue
+        for raw_row in (material.get("asr_context") or {}).get("rows") or []:
+            text = str(raw_row).strip()
+            if not text.isdigit() or int(text) <= 0:
+                problems.append({
+                    "code": "invalid_asr_context_row",
+                    "severity": "error",
+                    "message": "Pass2B_2F material cites an invalid ASR row reference",
+                    "photo_id": photo_rel,
+                    "context_id": text,
+                })
+                continue
+            row_ref = int(text)
+            evidence_ids = row_to_evidence.get(row_ref) or []
+            if not evidence_ids:
+                problems.append({
+                    "code": "unknown_asr_context_reference",
+                    "severity": "error",
+                    "message": "Pass2B_2F material cites an ASR row absent from Pass3F evidence",
+                    "photo_id": photo_rel,
+                    "row_ref": row_ref,
+                })
+                continue
+            cited.update(evidence_ids)
+    if problems:
+        raise RefereAdapterConsistencyError(
+            "unknown_asr_context_reference",
+            "Pass2B_2F photo contexts contain ASR references that cannot be resolved",
+            diagnostics=problems,
+        )
+    return cited
+
+
+def _resolver_asr_items(
+    registry: dict[str, Any],
+    cited_evidence_ids: set[str],
+) -> list[dict[str, Any]]:
+    """Build start-time anchors without asserting an unknown ASR duration."""
+
+    evidence_by_id = {
+        item["evidence_occurrence_id"]: item for item in registry["evidence"]
+    }
+    missing = sorted(cited_evidence_ids - set(evidence_by_id))
+    if missing:
+        raise RefereAdapterConsistencyError(
+            "unknown_asr_context_reference",
+            "cited ASR evidence identifiers are absent from Pass3F evidence",
+            diagnostics=[
+                {
+                    "code": "unknown_asr_context_reference",
+                    "severity": "error",
+                    "message": "cited ASR evidence identifier is absent",
+                    "context_id": evidence_id,
+                }
+                for evidence_id in missing
+            ],
+        )
+
+    items: list[dict[str, Any]] = []
+    problems: list[dict[str, Any]] = []
+    for evidence_id in sorted(cited_evidence_ids):
+        evidence = evidence_by_id[evidence_id]
+        raw_subjects = evidence.get("pass1_subjects") or []
+        if isinstance(raw_subjects, (str, bytes)):
+            raw_subjects = [raw_subjects]
+        subject_numeros: list[int] = []
+        invalid_subject = False
+        for raw_subject in raw_subjects:
+            text = str(raw_subject).strip()
+            if not text.isdigit() or int(text) <= 0:
+                problems.append({
+                    "code": "invalid_asr_subject",
+                    "severity": "error",
+                    "message": "cited ASR evidence has a non-numeric subject identifier",
+                    "context_id": evidence_id,
+                })
+                invalid_subject = True
+                break
+            subject_numeros.append(int(text))
+        if invalid_subject or not subject_numeros:
+            continue
+        known_start = str(evidence.get("timecode") or "").strip()
+        if not known_start:
+            problems.append({
+                "code": "asr_evidence_without_timecode",
+                "severity": "error",
+                "message": "cited ASR evidence has no temporal anchor",
+                "context_id": evidence_id,
+            })
+            continue
+        items.append({
+            "evidence_id": evidence_id,
+            "row_ref": evidence.get("row_ref"),
+            "start_sec": known_start,
+            "end_sec": known_start,
+            "subject_numeros": sorted(set(subject_numeros)),
+            "timecode": known_start,
+        })
+    if problems:
+        raise RefereAdapterConsistencyError(
+            "invalid_cited_asr_context",
+            "cited ASR evidence cannot be represented safely",
+            diagnostics=problems,
+        )
+    return items
+
+
+def _journal_nonblocking_diagnostics(diagnostics: Iterable[dict[str, Any]]) -> None:
+    summary = sorted({
+        (
+            str(item.get("code") or ""),
+            str(item.get("severity") or ""),
+            str(item.get("photo_id") or ""),
+            str(item.get("row_ref") or ""),
+            str(item.get("context_id") or ""),
+        )
+        for item in diagnostics
+    })
+    if not summary:
+        return
+    _LOGGER.warning(
+        "photo context resolver non-blocking diagnostics: %s",
+        json.dumps([
+            {
+                "code": code,
+                "severity": severity,
+                "photo_id": photo_id,
+                "row_ref": row_ref,
+                "context_id": context_id,
+            }
+            for code, severity, photo_id, row_ref, context_id in summary
+        ], ensure_ascii=False, sort_keys=True),
+    )
+
+
+def _attach_photo_context(
+    registry: dict[str, Any],
+    sources: RefereSources,
+    assignments: list[dict[str, Any]],
+    material_photos: dict[str, dict[str, Any]],
+    photo_evidence: dict[str, dict[str, Any]],
+    row_to_evidence: dict[int, list[str]],
+) -> dict[str, Any]:
+    cited_evidence_ids = _cited_asr_evidence_ids(
+        assignments, material_photos, row_to_evidence
+    )
+    asr_items = _resolver_asr_items(registry, cited_evidence_ids)
+    batch_csv = _photos_batch_csv(sources.photos_csv)
+    bundle = resolve_photo_context(
+        SourceSelection(
+            photos_csv=sources.photos_csv,
+            assignments_json=sources.assignments_json,
+            photos_batch_csv=batch_csv,
+        ),
+        asr_context=asr_items,
+        asr_window_seconds=PHOTO_ASR_WINDOW_SECONDS,
+    )
+
+    diagnostics = list(bundle.get("diagnostics") or [])
+    blocking = [
+        item for item in diagnostics
+        if item.get("severity") == "error"
+        and item.get("code") != "photo_without_assignment"
+    ]
+    blocking.extend(
+        item for item in diagnostics
+        if str(item.get("code") or "").startswith("invalid_asr_")
+        or item.get("code") == "conflicting_asr_context_item"
+    )
+    if blocking:
+        raise RefereAdapterConsistencyError(
+            "photo_context_resolver_consistency_error",
+            "photo context resolution found blocking provenance contradictions",
+            diagnostics=blocking,
+        )
+    blocking_objects = {id(item) for item in blocking}
+    _journal_nonblocking_diagnostics(
+        item for item in diagnostics if id(item) not in blocking_objects
+    )
+
+    records = {
+        str(item["photo_id"]): item for item in bundle.get("photos") or []
+    }
+    assigned_ids = {
+        photo_id for photo_id, item in records.items()
+        if (item.get("assignment") or {}).get("status") == "assigned"
+    }
+    adapter_ids = set(photo_evidence)
+    if assigned_ids != adapter_ids:
+        raise RefereAdapterConsistencyError(
+            "photo_assignment_scope_mismatch",
+            "photo resolver and legacy adapter do not expose the same assigned photos",
+            diagnostics=[
+                {
+                    "code": "photo_assignment_scope_mismatch",
+                    "severity": "error",
+                    "message": "assigned photo set differs",
+                    "photo_id": photo_id,
+                }
+                for photo_id in sorted(assigned_ids ^ adapter_ids)
+            ],
+        )
+
+    component_ids: set[str] = set()
+    for photo_id, evidence in photo_evidence.items():
+        record = records[photo_id]
+        scope = record["subject_scope"]
+        human_subject = evidence["photo"]["human_subject_numero"]
+        if scope.get("photo_subject_numero") != human_subject:
+            raise RefereAdapterConsistencyError(
+                "photo_subject_scope_mismatch",
+                "resolved photo subject differs from the human assignment",
+                diagnostics=[{
+                    "code": "photo_subject_scope_mismatch",
+                    "severity": "error",
+                    "message": "photo subject differs from human_subject_numero",
+                    "photo_id": photo_id,
+                }],
+            )
+        components = list(record.get("content_components") or [])
+        if any(item.get("photo_id") != photo_id for item in components):
+            raise RefereAdapterConsistencyError(
+                "photo_component_scope_mismatch",
+                "a resolver component is attached to a different photo",
+                diagnostics=[{
+                    "code": "photo_component_scope_mismatch",
+                    "severity": "error",
+                    "message": "component photo_id differs from the evidence photo",
+                    "photo_id": photo_id,
+                }],
+            )
+        for component_id in (item["component_id"] for item in components):
+            if component_id in component_ids:
+                raise RefereAdapterConsistencyError(
+                    "photo_component_id_collision",
+                    "resolver component identifiers are not unique",
+                    diagnostics=[{
+                        "code": "photo_component_id_collision",
+                        "severity": "error",
+                        "message": "duplicate photo component identifier",
+                        "context_id": component_id,
+                    }],
+                )
+            component_ids.add(component_id)
+        evidence["photo"].update({
+            "subject_scope": scope,
+            "assignment": record["assignment"],
+            "content_components": components,
+            "asr_context": record["asr_context"],
+        })
+
+    exclusions = list(bundle.get("photo_exclusions") or [])
+    excluded_ids = {str(item["photo_id"]) for item in exclusions}
+    declared_excluded_ids = {
+        str(item["photo_rel_native"]).replace("\\", "/")
+        for item in assignments
+        if item.get("status") == "exclue"
+    }
+    missing_exclusions = declared_excluded_ids - excluded_ids
+    if missing_exclusions:
+        raise RefereAdapterConsistencyError(
+            "excluded_photo_missing_from_resolution",
+            "a human exclusion is absent from resolved photo exclusions",
+            diagnostics=[{
+                "code": "excluded_photo_missing_from_resolution",
+                "severity": "error",
+                "message": "excluded photo was not represented in photo_exclusions",
+                "photo_id": photo_id,
+            } for photo_id in sorted(missing_exclusions)],
+        )
+    if excluded_ids & adapter_ids:
+        raise RefereAdapterConsistencyError(
+            "excluded_photo_published",
+            "an excluded photo is also exposed as assigned evidence",
+            diagnostics=[{
+                "code": "excluded_photo_published",
+                "severity": "error",
+                "message": "excluded photo is present in assigned evidence",
+                "photo_id": photo_id,
+            } for photo_id in sorted(excluded_ids & adapter_ids)],
+        )
+    existing_exclusions = registry.get("photo_exclusions")
+    if existing_exclusions and existing_exclusions != exclusions:
+        raise RefereAdapterConsistencyError(
+            "photo_exclusions_conflict",
+            "the registry already contains different photo exclusions",
+            diagnostics=[{
+                "code": "photo_exclusions_conflict",
+                "severity": "error",
+                "message": "existing photo exclusions differ from resolved exclusions",
+            }],
+        )
+    registry["photo_exclusions"] = exclusions
+    return bundle
+
+
 def _photo_text(material: dict[str, Any], row: dict[str, str]) -> str:
     values = []
     for key in (
@@ -470,6 +806,9 @@ def _actual_input_hashes(sources: RefereSources) -> dict[str, str]:
         "refere/refere_global_by_sujet.json": sources.refere_global_by_sujet,
         "refere/generalist_global.json": sources.generalist_run / "global.json",
     }
+    batch_csv = _photos_batch_csv(sources.photos_csv)
+    if batch_csv is not None:
+        files[f"refere/{batch_csv.name}"] = batch_csv
     for path in sorted(sources.pass3e_dir.glob("*.json")):
         files[f"refere/pass3_refere/sujets/{path.name}"] = path
     for path in sorted(sources.pass2f_dir.rglob("*.json")):
@@ -550,6 +889,10 @@ def build_refere_registry(sources: RefereSources) -> dict[str, Any]:
             raise ValueError("photo evidence occurrence identity collision")
         occurrence_ids.add(item["evidence_occurrence_id"])
         registry["evidence"].append(item)
+    _attach_photo_context(
+        registry, sources, assignments, material_photos, photo_evidence,
+        row_to_evidence,
+    )
     _add_photo_fragment_links(registry, sources, photo_evidence)
     registry["evidence"].sort(key=lambda item: item["evidence_occurrence_id"])
     actual_hashes = _actual_input_hashes(sources)
@@ -558,6 +901,12 @@ def build_refere_registry(sources: RefereSources) -> dict[str, Any]:
         "pipeline_kind": "refere", "inputs": registry["run"]["input_hashes"]
     })
     registry["run"]["adapter"] = ADAPTER_VERSION
+    photo_components = [
+        component
+        for item in registry["evidence"]
+        if item.get("evidence_kind") == "photo"
+        for component in (item.get("photo") or {}).get("content_components") or []
+    ]
     registry["stats"].update({
         "photo_evidence_count": len(photo_evidence),
         "human_subject_assignment_count": len(photo_evidence),
@@ -569,6 +918,27 @@ def build_refere_registry(sources: RefereSources) -> dict[str, Any]:
             value.startswith("pass3_refere/")
             for value in normalization["description_sources"].values()
         ),
+        "photo_component_count": len(photo_components),
+        "photo_component_validated_count": sum(
+            item.get("validation_status") == "validated"
+            for item in photo_components
+        ),
+        "photo_component_unvalidated_count": sum(
+            item.get("validation_status") == "unvalidated"
+            for item in photo_components
+        ),
+        "photo_component_unknown_count": sum(
+            item.get("validation_status") == "unknown"
+            for item in photo_components
+        ),
+        "photo_asr_context_count": sum(
+            (item.get("photo") or {}).get("asr_context", {}).get("link_status")
+            in {"verified", "candidate"}
+            for item in registry["evidence"]
+            if item.get("evidence_kind") == "photo"
+        ),
+        "photo_exclusion_record_count": len(registry.get("photo_exclusions") or []),
+        "context_snapshot_count": len(registry.get("context_snapshots") or []),
     })
     recompute_registry_stats(registry)
     return registry
