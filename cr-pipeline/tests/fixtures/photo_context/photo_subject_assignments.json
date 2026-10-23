@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "assignments": [
+    {
+      "photo_rel_native": "JPG/A.jpg",
+      "status": "affectee",
+      "subject_numero": 6
+    },
+    {
+      "photo_rel_native": "JPG/B.jpg",
+      "status": "exclue",
+      "subject_numero": null
+    },
+    {
+      "photo_rel_native": "JPG/C.jpg",
+      "status": "non_affectee",
+      "subject_numero": null
+    },
+    {
+      "photo_rel_native": "JPG/D.jpg",
+      "status": "affectee",
+      "subject_numero": 6
+    },
+    {
+      "photo_rel_native": "JPG/MANQUANTE.jpg",
+      "status": "affectee",
+      "subject_numero": 6
+    }
+  ]
+}

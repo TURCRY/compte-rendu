@@ -1,0 +1,3 @@
+photo_rel_native;nom_fichier_image;description_vlm_batch;libelle_propose_batch;commentaire_propose_batch
+JPG/A.jpg;A.jpg;Description VLM batch synthetique.;Libelle batch;Commentaire batch synthetique.
+JPG/X.jpg;X.jpg;Photo absente de la source principale.;Libelle ignore;Commentaire ignore

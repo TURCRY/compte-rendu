@@ -1,0 +1,6 @@
+photo_rel_native;nom_fichier_image;horodatage_photo;t_audio;description_vlm_ui;libelle_propose_ui;commentaire_propose_ui;dictee_asr_text;annotation_validee
+JPG/A.jpg;A.jpg;02/01/2030 10:00:00;100.25;Facade synthetique Alpha.;Portail;Portail metallique;Photo prise depuis la rue.;1
+JPG/B.jpg;B.jpg;02/01/2030 10:02:30;150;Image synthetique exclue.;Arriere-cour;;;0
+JPG/C.jpg;C.jpg;02/01/2030 10:05:00;300;Cour synthetique sans sujet.;;Commentaire neutre;;1
+JPG/D.jpg;D.jpg;02/01/2030 10:03:20;200;Vue synthetique du portail.;Portail secondaire;;;0
+JPG/E.jpg;E.jpg;02/01/2030 10:06:40;400;Photo synthetique sans affectation.;;;;0
