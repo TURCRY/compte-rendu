@@ -1,0 +1,46 @@
+{
+  "schema": "pass3f.provenance.v2",
+  "run": {
+    "run_id": "run:6e197bf820a008b5ae99dd4a633c168ca4efdba838a6f99756e59caa76fd49fa",
+    "pipeline_kind": "refere",
+    "input_hashes": {}
+  },
+  "subjects": [
+    {
+      "subject_id": "6",
+      "numero": 6,
+      "title": "Sujet historique",
+      "location": "",
+      "description": "Description historique",
+      "identities": [],
+      "truncation": {
+        "status": "none",
+        "stage": "2E",
+        "scope": "subject",
+        "source_file": "",
+        "source_hash": "",
+        "details": "fixture",
+        "event_refs": []
+      }
+    }
+  ],
+  "evidence": [],
+  "truncation_events": [],
+  "derived_fragments": [],
+  "stats": {
+    "subject_count": 1,
+    "evidence_count": 0,
+    "evidence_occurrence_count": 0,
+    "evidence_content_count": 0,
+    "legacy_evidence_collision_id_count": 0,
+    "derived_fragment_count": 0,
+    "verified_link_count": 0,
+    "candidate_link_count": 0,
+    "unresolved_fragment_count": 0,
+    "confirmed_truncation_subject_count": 0,
+    "confirmed_truncation_fragment_count": 0,
+    "possible_truncation_fragment_count": 0,
+    "unknown_truncation_fragment_count": 0,
+    "truncation_event_count": 0
+  }
+}

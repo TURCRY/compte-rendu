@@ -1,0 +1,331 @@
+{
+  "schema": "pass3f.provenance.v2",
+  "run": {
+    "run_id": "run:88dd2d60738a317b7ba44a3bf3f9a8ab34262e843565a1c54a780047a58472c5",
+    "pipeline_kind": "refere",
+    "input_hashes": {
+      "photos_csv": "355777a854ddebbc09e7a9eac3707fc7e1604ff0463a7e6b0066ecb755c56e92",
+      "asr_csv": "7faff1353c42ec2e6c7ab73b36163a6c19dcee64782834081b1461719d46758f"
+    }
+  },
+  "subjects": [
+    {
+      "subject_id": "6",
+      "numero": 6,
+      "title": "Sujet 6",
+      "location": "",
+      "description": "Sujet photographique et editorial.",
+      "identities": [],
+      "truncation": {
+        "status": "none",
+        "stage": "2E",
+        "scope": "subject",
+        "source_file": "",
+        "source_hash": "",
+        "details": "fixture",
+        "event_refs": []
+      }
+    },
+    {
+      "subject_id": "11",
+      "numero": 11,
+      "title": "Sujet 11",
+      "location": "",
+      "description": "Sujet ASR voisin.",
+      "identities": [],
+      "truncation": {
+        "status": "none",
+        "stage": "2E",
+        "scope": "subject",
+        "source_file": "",
+        "source_hash": "",
+        "details": "fixture",
+        "event_refs": []
+      }
+    }
+  ],
+  "evidence": [
+    {
+      "evidence_occurrence_id": "evidence-occurrence:15512379d2dfe76e71195ef8533c1a0927bbd8b4f5e27202c30e2e4b0706d92f",
+      "evidence_content_id": "evidence-content:15512379d2dfe76e71195ef8533c1a0927bbd8b4f5e27202c30e2e4b0706d92f",
+      "identity_algorithm": "pass3f.evidence-occurrence.v2",
+      "source_artifact": "asr.csv",
+      "source_hash": "7faff1353c42ec2e6c7ab73b36163a6c19dcee64782834081b1461719d46758f",
+      "source_pointers": [
+        "/1"
+      ],
+      "segment_id": "segment-11",
+      "row_ref": 2,
+      "timecode": "10:03:20",
+      "speaker": "Participant",
+      "exact_text": "Propos relevant du sujet 11.",
+      "exact_text_sha256": "92f521a41b66a780fdf15f4391d46f876044f9ecdc65bb5af62be7e98587511e",
+      "legacy_evidence_id": "evidence:15512379d2dfe76e71195ef8533c1a0927bbd8b4f5e27202c30e2e4b0706d92f",
+      "legacy_evidence_id_collision": false,
+      "legacy_evidence_id_occurrence_count": 1,
+      "pass1_subjects": [
+        "11"
+      ],
+      "projection_classification": "specifique",
+      "reported_subject_count": 1,
+      "evidence_kind": "asr"
+    },
+    {
+      "evidence_occurrence_id": "evidence-occurrence:ccd1e815a64e6b7dfdda2a008cfc255526d727a6449b14f44e646657d8f42aec",
+      "evidence_content_id": "evidence-content:ccd1e815a64e6b7dfdda2a008cfc255526d727a6449b14f44e646657d8f42aec",
+      "identity_algorithm": "pass3f.photo-occurrence.v1",
+      "source_artifact": "photos.csv",
+      "source_hash": "355777a854ddebbc09e7a9eac3707fc7e1604ff0463a7e6b0066ecb755c56e92",
+      "source_pointers": [
+        "/0"
+      ],
+      "segment_id": "",
+      "row_ref": null,
+      "timecode": "10:04:03",
+      "speaker": "",
+      "exact_text": "IMG_0062.jpg",
+      "exact_text_sha256": "fca7f5cccb658fca8419982a8a2a3c24c012b806d4a43a5c69006cec678485d4",
+      "legacy_evidence_id": "evidence:ccd1e815a64e6b7dfdda2a008cfc255526d727a6449b14f44e646657d8f42aec",
+      "legacy_evidence_id_collision": false,
+      "legacy_evidence_id_occurrence_count": 1,
+      "pass1_subjects": [
+        "6"
+      ],
+      "projection_classification": "photo",
+      "reported_subject_count": 1,
+      "evidence_kind": "photo",
+      "photo": {
+        "photo_rel_native": "J58/photos/IMG_0062.jpg",
+        "photo_display": "IMG_0062.jpg",
+        "timestamp_hms": "10:04:03",
+        "chrono_sec": 36243,
+        "photo_sha256": "b0988a1aab0856ce2b0d86f9ac5edc74313b4111e0c4373557d59df50547767c",
+        "metadata_sources": [
+          "photos.csv"
+        ],
+        "human_subject_numero": 6,
+        "pass2f_source_artifacts": [],
+        "context_asr_evidence_ids": [
+          "evidence-occurrence:15512379d2dfe76e71195ef8533c1a0927bbd8b4f5e27202c30e2e4b0706d92f"
+        ],
+        "subject_scope": {
+          "photo_subject_numero": 6,
+          "asr_subject_numeros": [
+            11
+          ],
+          "editorial_subject_numero": 6
+        },
+        "assignment": {
+          "assignment_id": "photo-assignment:fca7f5cccb658fca8419982a8a2a3c24c012b806d4a43a5c69006cec678485d4",
+          "status": "assigned",
+          "authority": "human",
+          "record_origin": "ui",
+          "validation_status": "unknown",
+          "source_file": "annotations_photos.csv",
+          "source_field": "sujet"
+        },
+        "file_status": {
+          "exists": true,
+          "metadata_status": "complete",
+          "sha256": "b0988a1aab0856ce2b0d86f9ac5edc74313b4111e0c4373557d59df50547767c",
+          "size_bytes": 512663,
+          "mime_type": "image/jpeg"
+        },
+        "content_components": [
+          {
+            "component_id": "photo-component:61ee6d67bc9a1745648954bf0632b22ff4dda2fec3202bfb4c802afc184dd283",
+            "photo_id": "J58/photos/IMG_0062.jpg",
+            "content_kind": "human_assignment",
+            "text": "6",
+            "source_file": "annotations_photos.csv",
+            "source_field": "sujet",
+            "origin": "ui",
+            "validation_status": "unknown",
+            "validation_reason": "affectation enregistree par UI, validation humaine par champ non demontree"
+          },
+          {
+            "component_id": "photo-component:b78dd8623c424d4559c4d987b7b91a1fa42c66e73786000f1a2e0a266a6dd6d4",
+            "photo_id": "J58/photos/IMG_0062.jpg",
+            "content_kind": "factual_metadata",
+            "text": "IMG_0062.jpg",
+            "source_file": "photos.csv",
+            "source_field": "photo_fichier",
+            "origin": "source",
+            "validation_status": "unknown"
+          },
+          {
+            "component_id": "photo-component:762b5fbae156011138831833efd21104216e0d0523476ce737989dceb5df8165",
+            "photo_id": "J58/photos/IMG_0062.jpg",
+            "content_kind": "vlm_description",
+            "text": "Facade et portail visibles sur la photographie.",
+            "source_file": "vision_cache.json",
+            "source_field": "description",
+            "origin": "pipeline",
+            "validation_status": "unvalidated",
+            "validation_reason": "description VLM non validee humainement"
+          },
+          {
+            "component_id": "photo-component:63334e05cb6eaee8dc6037422a734613ac20a89fc0525998d7f3db46415ec263",
+            "photo_id": "J58/photos/IMG_0062.jpg",
+            "content_kind": "annotation_label",
+            "text": "Portail",
+            "source_file": "annotations_photos.csv",
+            "source_field": "libelle",
+            "origin": "ui",
+            "validation_status": "unknown",
+            "validation_reason": "annotation_validee=1 ne vaut pas validation humaine par champ"
+          }
+        ],
+        "asr_context": {
+          "evidence_occurrence_ids": [
+            "evidence-occurrence:15512379d2dfe76e71195ef8533c1a0927bbd8b4f5e27202c30e2e4b0706d92f"
+          ],
+          "asr_subject_numeros": [
+            11
+          ],
+          "link_status": "candidate",
+          "method": "photo_time_window",
+          "score": 0.62,
+          "rule_id": "photo-time-window-30s",
+          "window_start_sec": 36213,
+          "window_end_sec": 36273
+        }
+      }
+    }
+  ],
+  "truncation_events": [],
+  "derived_fragments": [
+    {
+      "fragment_id": "fragment:8a207a54a5dd4c8153f33a173da32f5c06d942a758d525b601b1544a24f96ca7",
+      "stage": "3E",
+      "subject_id": "6",
+      "field_path": "/synthese_echanges/0",
+      "text": "La photographie montre le portail evoque dans les propos voisins, sans attribution automatique du sujet ASR.",
+      "source_artifact": "pass3E_sujets/sujet_006_synthese.json",
+      "links": [
+        {
+          "evidence_occurrence_id": "evidence-occurrence:15512379d2dfe76e71195ef8533c1a0927bbd8b4f5e27202c30e2e4b0706d92f",
+          "link_status": "candidate",
+          "method": "token_overlap",
+          "score": 0.55
+        }
+      ],
+      "truncation": {
+        "status": "none",
+        "stage": "2E",
+        "scope": "subject",
+        "source_file": "",
+        "source_hash": "",
+        "details": "fixture",
+        "event_refs": []
+      },
+      "representation_type": "publishable_text_unit",
+      "structure_algorithm": "pass3f.fragment-structure.v1",
+      "subject_scope": {
+        "photo_subject_numero": 6,
+        "asr_subject_numeros": [
+          11
+        ],
+        "editorial_subject_numero": 6
+      },
+      "generation": {
+        "generation_id": "generation:8a207a54a5dd4c8153f33a173da32f5c06d942a758d525b601b1544a24f96ca7",
+        "kind": "llm",
+        "generator": "pass3e",
+        "model_alias": "test-model",
+        "prompt_artifact": "prompts/pass3E_sujet_006.json",
+        "prompt_sha256": "cf07194ee232eb531e15f690000d19846dea69cf05504782658afcfacb9228a2",
+        "input_sha256": "c7f4b1358733c1a2046bcbf2cffbcd02a1ccdbb83730cbeeb0c1a0a8741cd7c6",
+        "output_sha256": "e0ee8bb50685e05fa0f47ed04203ae953fdfd055f5bd2892ea186504254f8c3a",
+        "parent_component_ids": [
+          "photo-component:762b5fbae156011138831833efd21104216e0d0523476ce737989dceb5df8165"
+        ],
+        "rule_id": "rédaction contextuelle photo distincte",
+        "validation_status": "unvalidated",
+        "created_at": "2026-10-23T09:00:00+02:00"
+      }
+    }
+  ],
+  "photo_exclusions": [
+    {
+      "exclusion_id": "photo-exclusion:214739e9e8268221bd0cad968237d210651aa3136adb3ec9edd8da91e99f1976",
+      "photo_id": "J58/photos/IMG_0099.jpg",
+      "reason_code": "human_exclusion",
+      "reason_text": "Photographie exclue par affectation humaine.",
+      "source_file": "annotations_photos.csv",
+      "source_field": "exclue",
+      "validation_status": "validated",
+      "provenance_fingerprint": "3108a1c1e75e45f0b607f8e625ed0a75975f0bcb449ed4f8395921f2366be1c5"
+    }
+  ],
+  "context_snapshots": [
+    {
+      "snapshot_id": "context-snapshot:17396a936ca31f0f0534c400a731dac1812dc4dd60c0cc485e55899fd19d923b",
+      "pipeline_kind": "refere",
+      "subject_scope": {
+        "photo_subject_numero": 6,
+        "asr_subject_numeros": [
+          11
+        ],
+        "editorial_subject_numero": 6
+      },
+      "included_photo_ids": [
+        "J58/photos/IMG_0062.jpg"
+      ],
+      "photo_exclusion_ids": [
+        "photo-exclusion:214739e9e8268221bd0cad968237d210651aa3136adb3ec9edd8da91e99f1976"
+      ],
+      "evidence_occurrence_ids": [
+        "evidence-occurrence:ccd1e815a64e6b7dfdda2a008cfc255526d727a6449b14f44e646657d8f42aec",
+        "evidence-occurrence:15512379d2dfe76e71195ef8533c1a0927bbd8b4f5e27202c30e2e4b0706d92f"
+      ],
+      "component_ids": [
+        "photo-component:61ee6d67bc9a1745648954bf0632b22ff4dda2fec3202bfb4c802afc184dd283",
+        "photo-component:b78dd8623c424d4559c4d987b7b91a1fa42c66e73786000f1a2e0a266a6dd6d4",
+        "photo-component:762b5fbae156011138831833efd21104216e0d0523476ce737989dceb5df8165",
+        "photo-component:63334e05cb6eaee8dc6037422a734613ac20a89fc0525998d7f3db46415ec263"
+      ],
+      "selection_rule_ids": [
+        "human_assignment",
+        "photo_time_window_30s"
+      ],
+      "source_hashes": {
+        "photos_csv": "355777a854ddebbc09e7a9eac3707fc7e1604ff0463a7e6b0066ecb755c56e92",
+        "asr_csv": "7faff1353c42ec2e6c7ab73b36163a6c19dcee64782834081b1461719d46758f"
+      },
+      "context_sha256": "c7f4b1358733c1a2046bcbf2cffbcd02a1ccdbb83730cbeeb0c1a0a8741cd7c6",
+      "prompt_artifact": "prompts/pass3E_sujet_006.json",
+      "prompt_sha256": "cf07194ee232eb531e15f690000d19846dea69cf05504782658afcfacb9228a2",
+      "system_text_sha256": "bbc5e661e106c6dcd8dc6dd186454c2fcba3c710fb4d8e71a60c93eaf077f073",
+      "user_text_sha256": "04f8996da763b7a969b1028ee3007569eaf3a635486ddab211d512c85b9df8fb",
+      "text_copy_embedded": false,
+      "created_at": "2026-10-23T09:00:00+02:00"
+    }
+  ],
+  "stats": {
+    "subject_count": 2,
+    "evidence_count": 2,
+    "evidence_occurrence_count": 2,
+    "evidence_content_count": 2,
+    "legacy_evidence_collision_id_count": 0,
+    "derived_fragment_count": 1,
+    "verified_link_count": 0,
+    "candidate_link_count": 1,
+    "unresolved_fragment_count": 0,
+    "confirmed_truncation_subject_count": 0,
+    "confirmed_truncation_fragment_count": 0,
+    "possible_truncation_fragment_count": 0,
+    "unknown_truncation_fragment_count": 0,
+    "truncation_event_count": 0,
+    "photo_evidence_count": 1,
+    "human_subject_assignment_count": 1,
+    "excluded_photo_count": 1,
+    "photo_component_count": 4,
+    "photo_component_validated_count": 0,
+    "photo_component_unvalidated_count": 1,
+    "photo_component_unknown_count": 3,
+    "photo_asr_context_count": 1,
+    "photo_exclusion_record_count": 1,
+    "context_snapshot_count": 1
+  }
+}
