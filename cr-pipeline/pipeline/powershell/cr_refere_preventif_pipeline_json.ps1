@@ -1493,6 +1493,24 @@ function New-ChunkPlanForSubject {
 # est reprise par provenance [REUSE cr_reunion_point_mumerotes_pipeline_json.ps1].
 # ============================================================================
 
+function Test-Pass2B2FLegacySubjectMap {
+  param($Value)
+  if ($null -eq $Value) { return $false }
+  $keys = @()
+  if ($Value -is [System.Collections.IDictionary]) {
+    $keys = @($Value.Keys)
+  } elseif (($Value -is [System.Collections.IEnumerable]) -and -not ($Value -is [string])) {
+    return $false
+  } else {
+    $keys = @($Value.PSObject.Properties.Name)
+  }
+  if ($keys.Count -eq 0) { return $false }
+  foreach ($key in $keys) {
+    if ([string]$key -notmatch '^\s*\d+\s*$') { return $false }
+  }
+  return $true
+}
+
 function ConvertTo-Pass2B2FCompactSegment {
   <#
     [REUSE cr_reunion_point_mumerotes_pipeline_json.ps1:4830-4893]
@@ -1514,22 +1532,69 @@ function ConvertTo-Pass2B2FCompactSegment {
   $ev = Get-CrProp -Obj $Segment -Name 'end_sec'
   if ($null -ne $ev) { try { $endSec = [double]$ev } catch { $endSec = 0.0 } }
   $sujetsObj = Get-CrProp -Obj $Segment -Name 'sujets'
-  if ($null -eq $sujetsObj) {
+  $sujetsIsLegacyMap = Test-Pass2B2FLegacySubjectMap -Value $sujetsObj
+  $sujetsUsable = $false
+  if ($null -ne $sujetsObj) {
+    if ($sujetsObj -is [System.Collections.IDictionary]) {
+      $sujetsUsable = ($sujetsObj.Count -gt 0)
+    } elseif (($sujetsObj -is [System.Collections.IEnumerable]) -and -not ($sujetsObj -is [string])) {
+      $sujetsUsable = (@($sujetsObj).Count -gt 0)
+    } else {
+      $sujetsUsable = $true
+    }
+  }
+  if (-not $sujetsUsable) {
     $la = Get-CrProp -Obj $Segment -Name 'llm_analysis'
-    if ($null -ne $la) { $sujetsObj = Get-CrProp -Obj $la -Name 'sujets' }
+    if ($null -ne $la) {
+      $laSujets = Get-CrProp -Obj $la -Name 'sujets'
+      if ($null -ne $laSujets) {
+        $sujetsIsLegacyMap = Test-Pass2B2FLegacySubjectMap -Value $laSujets
+        if ($sujetsIsLegacyMap) {
+          $sujetsObj = $laSujets
+        } else {
+          # Un tableau a un seul element est deroule par le pipeline PowerShell.
+          # Le wrapper explicite conserve sa nature de tableau de sujets.
+          $sujetsObj = @($laSujets)
+        }
+      }
+    }
   }
   $sujetNums = New-Object System.Collections.Generic.List[string]
   $points    = New-Object System.Collections.Generic.List[object]
   if ($null -ne $sujetsObj) {
     $pairs = @()
-    if ($sujetsObj -is [System.Collections.IDictionary]) {
+    if ($sujetsIsLegacyMap -and ($sujetsObj -is [System.Collections.IDictionary])) {
       foreach ($e in $sujetsObj.GetEnumerator()) {
-        $pairs += @{ Numero = [string]$e.Key; Items = $e.Value }
+        $itemsVal = Get-CrProp -Obj $e.Value -Name 'interventions'
+        if ($null -eq $itemsVal) { $itemsVal = $e.Value }
+        $pairs += @{ Numero = [string]$e.Key; Items = $itemsVal }
+      }
+    } elseif ($sujetsIsLegacyMap) {
+      foreach ($pr in $sujetsObj.PSObject.Properties) {
+        $itemsVal = Get-CrProp -Obj $pr.Value -Name 'interventions'
+        if ($null -eq $itemsVal) { $itemsVal = $pr.Value }
+        $pairs += @{ Numero = [string]$pr.Name; Items = $itemsVal }
+      }
+    } elseif (($sujetsObj -is [System.Collections.IEnumerable]) -and -not ($sujetsObj -is [string])) {
+      foreach ($item in @($sujetsObj)) {
+        $num = Get-CrPropString -Obj $item -Name 'numero'
+        if (-not $num) {
+          $t = Get-CrPropString -Obj $item -Name 'titre'
+          if ($t -match '^\s*(\d+)\b') { $num = [string]$Matches[1] }
+        }
+        $itemsVal = Get-CrProp -Obj $item -Name 'interventions'
+        if ($null -eq $itemsVal) { $itemsVal = $item }
+        $pairs += @{ Numero = [string]$num; Items = $itemsVal }
       }
     } else {
-      foreach ($pr in $sujetsObj.PSObject.Properties) {
-        $pairs += @{ Numero = [string]$pr.Name; Items = $pr.Value }
+      $num = Get-CrPropString -Obj $sujetsObj -Name 'numero'
+      if (-not $num) {
+        $t = Get-CrPropString -Obj $sujetsObj -Name 'titre'
+        if ($t -match '^\s*(\d+)\b') { $num = [string]$Matches[1] }
       }
+      $itemsVal = Get-CrProp -Obj $sujetsObj -Name 'interventions'
+      if ($null -eq $itemsVal) { $itemsVal = $sujetsObj }
+      $pairs += @{ Numero = [string]$num; Items = $itemsVal }
     }
     foreach ($pair in @($pairs)) {
       if (-not [string]::IsNullOrWhiteSpace([string]$pair.Numero)) {
